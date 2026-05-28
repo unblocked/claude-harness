@@ -29,7 +29,7 @@ bun start -- --repo /path/to/repo --task "implement feature X"
 |------|-------------|---------|
 | `--repo <path>` | Path to target git repository | *required* |
 | `--task <string>` | Task description for the agent | *required* |
-| `--model <model>` | Model for Claude to use | `sonnet` |
+| `--model <model>` | Model for Claude to use | `opus` |
 | `--timeout <seconds>` | Max seconds per arm | `3600` |
 | `--branch <name>` | Branch to base worktrees on | current HEAD |
 | `--keep-worktrees` | Don't clean up worktrees after run | `false` |
@@ -47,7 +47,7 @@ bun start -- --repo /path/to/repo --task "implement feature X"
 bun start -- \
   --repo ~/code/my-project \
   --task 'Add rate limiting to the /api/users endpoint following existing patterns' \
-  --model claude-opus-4-7 \
+  --model claude-opus-4-8 \
   --branch main \
   --keep-worktrees
 ```
