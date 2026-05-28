@@ -19,7 +19,7 @@ program
   .description("A/B comparison: Claude Code agent with vs without Unblocked context")
   .requiredOption("--repo <path>", "Path to target git repository")
   .requiredOption("--task <string>", "Task description for the agent")
-  .option("--model <model>", "Model for Claude to use", "sonnet")
+  .option("--model <model>", "Model for Claude to use", "opus")
   .option("--timeout <seconds>", "Max seconds per arm", "3600")
   .option("--branch <name>", "Branch to base worktree on (default: current HEAD)")
   .option("--keep-worktrees", "Don't clean up worktrees after run", false)
