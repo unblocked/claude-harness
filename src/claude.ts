@@ -2,7 +2,7 @@ import { spawn, execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { randomBytes } from "node:crypto";
+
 import type { Condition, RunResult, TokenUsage, ToolCall } from "./types.ts";
 import { log } from "./util.ts";
 
@@ -26,12 +26,10 @@ interface ParsedStream {
 }
 
 function parseToolName(name: string): { isMcp: boolean; mcpServer?: string } {
-  // mcp__server__tool format
   if (name.startsWith("mcp__")) {
     const parts = name.split("__");
     return { isMcp: true, mcpServer: parts[1] };
   }
-  // server::tool format
   if (name.includes("::")) {
     return { isMcp: true, mcpServer: name.split("::")[0] };
   }
@@ -96,8 +94,7 @@ export function parseStreamJson(jsonl: string): ParsedStream {
 }
 
 function isUnblockedTool(name: string): boolean {
-  const lower = name.toLowerCase();
-  return lower.includes("unblocked");
+  return name.toLowerCase().includes("unblocked");
 }
 
 function isUnblockedCliCall(name: string, args: Record<string, unknown>): boolean {
@@ -129,48 +126,23 @@ export function removeWorktree(repoPath: string, name: string): void {
   }
 }
 
-function findUnblockedBinary(): string {
-  try {
-    return execSync("which unblocked", { stdio: "pipe" }).toString().trim();
-  } catch {
-    const defaultPath = path.join(os.homedir(), ".unblocked", "bin", "unblocked");
-    if (fs.existsSync(defaultPath)) return defaultPath;
-    return "unblocked";
-  }
-}
-
-export function buildMcpConfig(): string {
-  const unblockedBin = findUnblockedBinary();
-  const config = {
-    mcpServers: {
-      unblocked: {
-        command: unblockedBin,
-        args: ["--mcp", "--autoupdate", "--client", "mcpClaudeCode"],
-      },
-    },
-  };
-  const tmpPath = path.join(os.tmpdir(), `claude-harness-mcp-${randomBytes(4).toString("hex")}.json`);
-  fs.writeFileSync(tmpPath, JSON.stringify(config));
-  return tmpPath;
-}
+const UNBLOCKED_MCP_TOOLS = [
+  "mcp__unblocked__context_research",
+  "mcp__unblocked__context_get_urls",
+  "mcp__unblocked__context_get_rules",
+  "mcp__unblocked__submit_feedback",
+];
 
 export async function runClaude(opts: {
   prompt: string;
-  repoPath: string;
+  worktreePath: string;
   model: string;
-  branch: string;
   condition: Condition;
   timeoutMs: number;
   outDir: string;
-  mcpConfigPath?: string;
+  blockUnblocked: boolean;
 }): Promise<RunResult> {
-  const suffix = randomBytes(4).toString("hex");
-  const wtName = `${opts.condition}-${suffix}`;
   const jsonlPath = path.join(opts.outDir, `${opts.condition}.jsonl`);
-
-  log(`[${opts.condition}] Creating worktree: ${wtName}`);
-  const wtPath = createWorktree(opts.repoPath, wtName, opts.branch);
-  log(`[${opts.condition}] Worktree at: ${wtPath}`);
 
   const args = [
     "-p",
@@ -178,24 +150,24 @@ export async function runClaude(opts: {
     "--verbose",
     "--dangerously-skip-permissions",
     "--model", opts.model,
-    "--disable-slash-commands",
   ];
 
-  if (opts.mcpConfigPath) {
-    args.push("--strict-mcp-config", "--mcp-config", opts.mcpConfigPath);
-  } else {
-    args.push("--strict-mcp-config");
+  if (opts.blockUnblocked) {
+    for (const tool of UNBLOCKED_MCP_TOOLS) {
+      args.push("--disallowed-tools", tool);
+    }
+    args.push("--disallowed-tools", "Bash(unblocked *)");
   }
-
-  args.push(opts.prompt);
 
   const started = Date.now();
 
   const result = await new Promise<{ exitCode: number | null; timedOut: boolean }>((resolve, reject) => {
     const p = spawn(BINARY, args, {
-      cwd: wtPath,
-      stdio: ["ignore", "pipe", "pipe"],
+      cwd: opts.worktreePath,
+      stdio: ["pipe", "pipe", "pipe"],
     });
+
+    p.stdin.end(opts.prompt);
 
     const out = fs.createWriteStream(jsonlPath);
     let partial = "";
@@ -210,12 +182,12 @@ export async function runClaude(opts: {
     const unblockedDeadline = opts.condition === "unblocked"
       ? setTimeout(() => {
           if (!unblockedCallSeen && !killed) {
-            log(`[${tag}] ⛔ Unblocked not called within 60s — killing run`);
+            log(`[${tag}] ⛔ Unblocked not called within 120s — killing run`);
             killed = true;
             p.kill("SIGTERM");
             setTimeout(() => p.kill("SIGKILL"), 5_000);
           }
-        }, 60_000)
+        }, 120_000)
       : null;
 
     p.stdout.on("data", (chunk: Buffer) => {
@@ -255,6 +227,9 @@ export async function runClaude(opts: {
                 } else if (toolName === "Write") {
                   const fp = (input.file_path as string) ?? "";
                   label = `Write: ...${fp.slice(-60)}`;
+                } else if (toolName === "Skill") {
+                  const skill = (input.skill as string) ?? (input.name as string) ?? "";
+                  label = `Skill: ${skill}`;
                 } else {
                   const { isMcp, mcpServer } = parseToolName(toolName);
                   if (isMcp) {
@@ -327,7 +302,7 @@ export async function runClaude(opts: {
     exitCode: result.exitCode,
     timedOut: result.timedOut,
     jsonlPath,
-    worktreePath: wtPath,
+    worktreePath: opts.worktreePath,
     totalCostUsd: parsed.totalCostUsd,
   };
 }

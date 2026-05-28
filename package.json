@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "A/B comparison: Claude Code agent with vs without Unblocked context",
   "type": "module",
-  "private": true,
+  "license": "MIT",
   "scripts": {
     "start": "bun src/index.ts",
     "typecheck": "bunx tsc --noEmit",

@@ -1,10 +1,11 @@
 import { execSync, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { ArmResult, ComparisonResult, Condition, Config, DiffStats, UnblockedCall } from "./types.ts";
-import { runClaude, buildMcpConfig, removeWorktree, worktreePath } from "./claude.ts";
+import { runClaude, createWorktree, removeWorktree } from "./claude.ts";
 import { printReport, writeJsonResult, writeHtmlReport } from "./report.ts";
-import { estimateCost, formatCost, formatDuration, log, totalTokens } from "./util.ts";
+import { estimateCost, formatCost, formatDuration, log } from "./util.ts";
 
 function captureDiff(cwd: string): string {
   try {
@@ -71,30 +72,39 @@ function extractUnblockedCalls(toolCalls: { name: string; args: Record<string, u
   return calls;
 }
 
-const BASELINE_NUDGE = `IMPORTANT: Do NOT use any Unblocked tools, skills, or CLI commands. Do NOT call context_research, context_get_urls, or any tool with "unblocked" in its name. Do NOT run the "unblocked" CLI binary. You may use all other tools.
+const BASELINE_NUDGE = `IMPORTANT: Do NOT use any Unblocked tools, skills, or CLI commands. Do NOT call context_research, context_get_urls, or any tool with "unblocked" in its name. Do NOT run the "unblocked" CLI binary. You may use all other tools, MCP servers, plugins, and skills.
 
 TASK:
 `;
 
-const UNBLOCKED_MCP_NUDGE = `IMPORTANT: Before doing anything else, use the Unblocked MCP tools to gather context for this task.
+const UNBLOCKED_MCP_NUDGE = `IMPORTANT: Before doing anything else, call the Unblocked context_research MCP tool with a detailed query describing the task (effort: low). This is your FIRST action.
 
-1. FIRST, call the context_research MCP tool with a detailed query describing the task (effort: low)
-2. If context_research surfaces specific URLs (PRs, docs, issues), call context_get_urls with those URLs
-3. THEN use the gathered context to inform your implementation — follow the patterns, conventions, and approaches you discovered.
+After that initial call, there are points in your planning and implementation flow where additional calls to context_research would be useful (always effort: low):
+- After planning: check for operational risks, previous incidents, deployment gotchas, or rejected approaches related to your plan
+- Before implementing unfamiliar patterns: verify conventions and team decisions
 
-TASK:
-`;
+If you need to expand on something context_research surfaced, use context_get_urls to fetch additional detail.
 
-const UNBLOCKED_CLI_NUDGE = `IMPORTANT: Before doing anything else, use the Unblocked CLI to gather context for this task.
-
-1. FIRST, run: unblocked context-research --effort low --query "<detailed query describing the task>"
-2. If context-research surfaces specific URLs (PRs, docs, issues), run: unblocked context-get-urls --url "<url>"
-3. THEN use the gathered context to inform your implementation — follow the patterns, conventions, and approaches you discovered.
+You may also use all other tools, MCP servers, plugins, and skills as needed.
 
 TASK:
 `;
 
-async function runArm(config: Config, condition: Condition, outDir: string, mcpConfigPath?: string): Promise<ArmResult> {
+const UNBLOCKED_CLI_NUDGE = `IMPORTANT: Before doing anything else, run the Unblocked CLI to research this task. This is your FIRST action:
+unblocked context-research --effort low --query "<detailed query describing the task>"
+
+After that initial call, continue using context-research throughout the task (always --effort low):
+- After planning: check for operational risks, previous incidents, deployment gotchas, or rejected approaches related to your plan
+- Before implementing unfamiliar patterns: verify conventions and team decisions
+
+If you need to expand on something context-research surfaced, use context-get-urls to fetch additional detail.
+
+You may also use all other tools, MCP servers, plugins, and skills as needed.
+
+TASK:
+`;
+
+async function runArm(config: Config, condition: Condition, outDir: string): Promise<ArmResult> {
   let nudge: string;
   if (condition === "baseline") {
     nudge = BASELINE_NUDGE;
@@ -105,20 +115,26 @@ async function runArm(config: Config, condition: Condition, outDir: string, mcpC
   }
   const prompt = nudge + config.task;
 
+  const suffix = randomBytes(4).toString("hex");
+  const wtName = `${condition}-${suffix}`;
+
+  log(`[${condition}] Creating worktree: ${wtName}`);
+  const wtPath = createWorktree(config.repo, wtName, config.branch);
+  log(`[${condition}] Worktree at: ${wtPath}`);
+
   log(`[${condition}] Running Claude Code...`);
   const runResult = await runClaude({
     prompt,
-    repoPath: config.repo,
+    worktreePath: wtPath,
     model: config.model,
-    branch: config.branch,
     condition,
     timeoutMs: config.timeoutSeconds * 1000,
     outDir,
-    mcpConfigPath: condition === "unblocked" && !config.cliMode ? mcpConfigPath : undefined,
+    blockUnblocked: condition === "baseline",
   });
   log(`[${condition}] Done: ${formatDuration(runResult.durationMs)}, ${runResult.assistantTurns} turns, exit=${runResult.exitCode}${runResult.timedOut ? " (TIMED OUT)" : ""}`);
 
-  const diff = captureDiff(runResult.worktreePath);
+  const diff = captureDiff(wtPath);
   const diffStats = parseDiffStats(diff);
   log(`[${condition}] Diff: ${diffStats.filesChanged} files, +${diffStats.linesAdded} -${diffStats.linesRemoved}`);
 
@@ -129,7 +145,7 @@ async function runArm(config: Config, condition: Condition, outDir: string, mcpC
 
   const cost = runResult.totalCostUsd ?? estimateCost(config.model, runResult.tokenUsage);
 
-  return { condition, run: runResult, diff, diffStats, unblockedCalls, estimatedCost: cost };
+  return { condition, run: { ...runResult, worktreePath: wtPath }, diff, diffStats, unblockedCalls, estimatedCost: cost };
 }
 
 export async function run(config: Config): Promise<ComparisonResult> {
@@ -142,18 +158,14 @@ export async function run(config: Config): Promise<ComparisonResult> {
   fs.mkdirSync(baselineDir, { recursive: true });
   fs.mkdirSync(unblockedDir, { recursive: true });
 
-  let mcpConfigPath: string | undefined;
-  if (!config.cliMode) {
-    mcpConfigPath = buildMcpConfig();
-    log(`MCP config written to: ${mcpConfigPath}`);
-  }
-
   let baseline: ArmResult;
   let unblocked: ArmResult;
 
   try {
-    baseline = await runArm(config, "baseline", baselineDir, mcpConfigPath);
-    unblocked = await runArm(config, "unblocked", unblockedDir, mcpConfigPath);
+    [baseline, unblocked] = await Promise.all([
+      runArm(config, "baseline", baselineDir),
+      runArm(config, "unblocked", unblockedDir),
+    ]);
   } finally {
     if (!config.keepWorktrees) {
       log("Cleaning up worktrees...");
@@ -165,9 +177,6 @@ export async function run(config: Config): Promise<ComparisonResult> {
         const wtName = path.basename(unblocked.run.worktreePath);
         removeWorktree(config.repo, wtName);
       }
-    }
-    if (mcpConfigPath) {
-      try { fs.unlinkSync(mcpConfigPath); } catch {}
     }
   }
 
@@ -191,7 +200,10 @@ export async function run(config: Config): Promise<ComparisonResult> {
   log(`Total time: ${formatDuration(result.totalDurationMs)}`);
   log(`Total cost: ${formatCost(result.totalEstimatedCost)}`);
 
-  try { execSync(`open "${htmlPath}"`); } catch {}
+  try {
+    const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+    execSync(`${opener} "${htmlPath}"`);
+  } catch {}
 
   return result;
 }

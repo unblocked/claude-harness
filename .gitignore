@@ -3,3 +3,5 @@ results/
 dist/
 .idea/
 *.tsbuildinfo
+.DS_Store
+.env

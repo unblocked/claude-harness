@@ -201,9 +201,9 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     --border: #2a2a3a;
     --text: #e4e4ed;
     --text-muted: #8888a0;
-    --accent: #d97706;
-    --accent-light: #fbbf24;
-    --accent-glow: rgba(217, 119, 6, 0.15);
+    --accent: #3b82f6;
+    --accent-light: #93c5fd;
+    --accent-glow: rgba(59, 130, 246, 0.15);
     --green: #22c55e;
     --green-bg: rgba(34, 197, 94, 0.1);
     --red: #ef4444;
@@ -251,7 +251,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   .brand-tag {
     display: inline-block;
     background: var(--accent-glow);
-    border: 1px solid rgba(217, 119, 6, 0.3);
+    border: 1px solid rgba(59, 130, 246, 0.3);
     border-radius: 6px;
     padding: 2px 10px;
     font-size: 12px;
@@ -301,6 +301,9 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   }
   .hero-card.positive::before {
     background: linear-gradient(90deg, var(--green), #4ade80);
+  }
+  .hero-card.negative::before {
+    background: linear-gradient(90deg, var(--red), #f87171);
   }
   .hero-label {
     font-size: 13px;
@@ -365,7 +368,8 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     flex-shrink: 0;
   }
   .bar-tag.baseline { color: var(--text-muted); }
-  .bar-tag.unblocked { color: var(--accent-light); }
+  .bar-tag.better { color: var(--green); }
+  .bar-tag.worse { color: var(--red); }
   .bar-track {
     flex: 1;
     height: 28px;
@@ -386,7 +390,8 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     transition: width 0.6s ease;
   }
   .bar-fill.baseline { background: rgba(136, 136, 160, 0.25); color: var(--text-muted); }
-  .bar-fill.unblocked { background: rgba(217, 119, 6, 0.3); color: var(--accent-light); }
+  .bar-fill.better { background: rgba(34, 197, 94, 0.3); color: var(--green); }
+  .bar-fill.worse { background: rgba(239, 68, 68, 0.3); color: var(--red); }
 
   .arm-section {
     background: var(--surface);
@@ -442,13 +447,13 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   .tool-table th { text-align: left; padding: 10px 16px; font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
   .tool-table td { padding: 10px 16px; border-bottom: 1px solid rgba(42, 42, 58, 0.5); }
   .tool-table tr:last-child td { border-bottom: none; }
-  .highlight-row td { background: rgba(217, 119, 6, 0.08); font-weight: 600; }
+  .highlight-row td { background: rgba(59, 130, 246, 0.08); font-weight: 600; }
   .tool-table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
 
   .unblocked-grid { display: flex; flex-direction: column; gap: 8px; }
   .unblocked-card {
     background: var(--surface);
-    border: 1px solid rgba(217, 119, 6, 0.3);
+    border: 1px solid rgba(59, 130, 246, 0.3);
     border-radius: 10px;
     padding: 12px 16px;
     display: flex;
@@ -459,7 +464,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     font-size: 13px; font-weight: 700;
     color: var(--accent-light);
     background: var(--accent-glow);
-    border: 1px solid rgba(217, 119, 6, 0.3);
+    border: 1px solid rgba(59, 130, 246, 0.3);
     border-radius: 4px;
     padding: 2px 8px;
     flex-shrink: 0;
@@ -542,16 +547,16 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   </div>
 
   <div class="hero-grid">
-    <div class="hero-card${u.run.durationMs < b.run.durationMs ? " positive" : ""}">
+    <div class="hero-card${u.run.durationMs < b.run.durationMs ? " positive" : " negative"}">
       <div class="hero-label">Speed</div>
-      <div class="hero-value${u.run.durationMs < b.run.durationMs ? " positive" : " neutral"}">
+      <div class="hero-value${u.run.durationMs < b.run.durationMs ? " positive" : " negative"}">
         ${pctChange(b.run.durationMs, u.run.durationMs)}
       </div>
       <div class="hero-detail">${formatDuration(b.run.durationMs)} &rarr; ${formatDuration(u.run.durationMs)}</div>
     </div>
-    <div class="hero-card${u.estimatedCost < b.estimatedCost ? " positive" : ""}">
+    <div class="hero-card${u.estimatedCost < b.estimatedCost ? " positive" : " negative"}">
       <div class="hero-label">Cost</div>
-      <div class="hero-value${u.estimatedCost < b.estimatedCost ? " positive" : " neutral"}">
+      <div class="hero-value${u.estimatedCost < b.estimatedCost ? " positive" : " negative"}">
         ${pctChange(b.estimatedCost, u.estimatedCost)}
       </div>
       <div class="hero-detail">${formatCost(b.estimatedCost)} &rarr; ${formatCost(u.estimatedCost)}</div>
@@ -568,8 +573,8 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
           <div class="bar-track"><div class="bar-fill baseline" style="width: ${barWidth(b.run.durationMs, maxTime)}%">${formatDuration(b.run.durationMs)}</div></div>
         </div>
         <div class="bar-row">
-          <span class="bar-tag unblocked">Unblocked</span>
-          <div class="bar-track"><div class="bar-fill unblocked" style="width: ${barWidth(u.run.durationMs, maxTime)}%">${formatDuration(u.run.durationMs)}</div></div>
+          <span class="bar-tag ${u.run.durationMs <= b.run.durationMs ? "better" : "worse"}">Unblocked</span>
+          <div class="bar-track"><div class="bar-fill ${u.run.durationMs <= b.run.durationMs ? "better" : "worse"}" style="width: ${barWidth(u.run.durationMs, maxTime)}%">${formatDuration(u.run.durationMs)}</div></div>
         </div>
       </div>
     </div>
@@ -581,8 +586,8 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
           <div class="bar-track"><div class="bar-fill baseline" style="width: ${barWidth(bTokens, maxTokens)}%">${formatTokens(bTokens)}</div></div>
         </div>
         <div class="bar-row">
-          <span class="bar-tag unblocked">Unblocked</span>
-          <div class="bar-track"><div class="bar-fill unblocked" style="width: ${barWidth(uTokens, maxTokens)}%">${formatTokens(uTokens)}</div></div>
+          <span class="bar-tag ${uTokens <= bTokens ? "better" : "worse"}">Unblocked</span>
+          <div class="bar-track"><div class="bar-fill ${uTokens <= bTokens ? "better" : "worse"}" style="width: ${barWidth(uTokens, maxTokens)}%">${formatTokens(uTokens)}</div></div>
         </div>
       </div>
     </div>
@@ -594,8 +599,8 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
           <div class="bar-track"><div class="bar-fill baseline" style="width: ${barWidth(b.estimatedCost, maxCost)}%">${formatCost(b.estimatedCost)}</div></div>
         </div>
         <div class="bar-row">
-          <span class="bar-tag unblocked">Unblocked</span>
-          <div class="bar-track"><div class="bar-fill unblocked" style="width: ${barWidth(u.estimatedCost, maxCost)}%">${formatCost(u.estimatedCost)}</div></div>
+          <span class="bar-tag ${u.estimatedCost <= b.estimatedCost ? "better" : "worse"}">Unblocked</span>
+          <div class="bar-track"><div class="bar-fill ${u.estimatedCost <= b.estimatedCost ? "better" : "worse"}" style="width: ${barWidth(u.estimatedCost, maxCost)}%">${formatCost(u.estimatedCost)}</div></div>
         </div>
       </div>
     </div>
@@ -622,8 +627,8 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       </div>` : `<div class="arm-tokens" style="color: var(--text-muted);">Token data unavailable</div>`}
     </div>
 
-    <div class="arm-section" style="border-color: rgba(217, 119, 6, 0.3);">
-      <div class="arm-header" style="border-bottom-color: rgba(217, 119, 6, 0.2);">
+    <div class="arm-section" style="border-color: rgba(59, 130, 246, 0.3);">
+      <div class="arm-header" style="border-bottom-color: rgba(59, 130, 246, 0.2);">
         <span class="arm-name">With Unblocked${u.run.timedOut ? ` <span style="color: var(--yellow); font-size: 12px;">(TIMED OUT)</span>` : ""}</span>
       </div>
       <div class="arm-meta">

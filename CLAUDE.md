@@ -13,7 +13,7 @@ Set `CLAUDE_BINARY` env var to override binary name (default: `claude`).
 ## Architecture
 
 - `src/claude.ts` — Spawn Claude Code CLI, parse stream-json, manage worktrees, contamination detection
-- `src/runner.ts` — Orchestrate: sequential arm execution, diff capture, comparison
+- `src/runner.ts` — Orchestrate: parallel arm execution, diff capture, comparison
 - `src/report.ts` — Console + HTML + JSON comparison reports
 - `src/util.ts` — Token pricing, formatting helpers
 - `src/types.ts` — Shared type definitions
