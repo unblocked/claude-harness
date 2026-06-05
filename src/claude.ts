@@ -8,6 +8,13 @@ import { log } from "./util.ts";
 
 const BINARY = process.env.CLAUDE_BINARY ?? "claude";
 
+interface ModelUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+}
+
 interface ContentBlock {
   type: string;
   text?: string;
@@ -77,7 +84,24 @@ export function parseStreamJson(jsonl: string): ParsedStream {
     }
 
     if (e?.type === "result") {
-      if (e.usage) {
+      if (e.modelUsage && typeof e.modelUsage === "object") {
+        const byModel: Record<string, TokenUsage> = {};
+        for (const [model, mu] of Object.entries(e.modelUsage as Record<string, ModelUsage>)) {
+          const m: TokenUsage = {
+            inputTokens: mu.inputTokens ?? 0,
+            outputTokens: mu.outputTokens ?? 0,
+            cacheReadTokens: mu.cacheReadInputTokens ?? 0,
+            cacheCreationTokens: mu.cacheCreationInputTokens ?? 0,
+          };
+          byModel[model] = m;
+          usage.inputTokens += m.inputTokens;
+          usage.outputTokens += m.outputTokens;
+          usage.cacheReadTokens += m.cacheReadTokens;
+          usage.cacheCreationTokens += m.cacheCreationTokens;
+        }
+        usage.byModel = byModel;
+      } else if (e.usage) {
+        // Fallback for transcripts without modelUsage: main model only.
         usage.inputTokens = e.usage.input_tokens ?? 0;
         usage.outputTokens = e.usage.output_tokens ?? 0;
         usage.cacheReadTokens = e.usage.cache_read_input_tokens ?? 0;
