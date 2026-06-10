@@ -56,6 +56,12 @@ function modelEntries(usage: TokenUsage): [string, TokenUsage][] {
   return Object.entries(usage.byModel ?? {});
 }
 
+// path.basename can't split Windows paths on macOS/Linux, and transcripts may
+// come from either platform.
+function repoName(repoPath: string): string {
+  return repoPath.split(/[\\/]+/).filter(Boolean).pop() ?? repoPath;
+}
+
 function pctChange(baseline: number, treatment: number): string {
   if (baseline === 0) return "N/A";
   const pct = ((treatment - baseline) / baseline) * 100;
@@ -90,7 +96,7 @@ export function printReport(result: ComparisonResult): void {
     "╔" + "═".repeat(W + 2) + "╗",
     r("  CLAUDE HARNESS — COMPARISON"),
     divider(),
-    r(`  Repo:     ${path.basename(result.repo)}`),
+    r(`  Repo:     ${repoName(result.repo)}`),
     r(`  Branch:   ${result.branch}`),
     r(`  Model:    ${result.model}`),
     r(`  Task:     ${result.task.slice(0, 60)}${result.task.length > 60 ? "..." : ""}`),
@@ -595,7 +601,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   </div>
 
   <div class="meta-grid">
-    <div class="meta-item"><span class="meta-key">Repository</span><span class="meta-val">${escapeHtml(path.basename(result.repo))}</span></div>
+    <div class="meta-item"><span class="meta-key">Repository</span><span class="meta-val">${escapeHtml(repoName(result.repo))}</span></div>
     <div class="meta-item"><span class="meta-key">Branch</span><span class="meta-val">${escapeHtml(result.branch)}</span></div>
     <div class="meta-item"><span class="meta-key">Model</span><span class="meta-val">${escapeHtml(result.model)}</span></div>
     <div class="meta-item"><span class="meta-key">Duration</span><span class="meta-val">${formatDuration(result.totalDurationMs)}</span></div>
