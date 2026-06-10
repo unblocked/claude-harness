@@ -1,8 +1,10 @@
 // Generate a comparison report from two existing stream-json transcripts.
-// Usage: bun scripts/report_from_jsonl.ts <baseline.jsonl> <unblocked.jsonl> [model] [branch] [task]
-// Repo and model are recovered from the transcript's init event; the task
-// prompt and branch are not recorded in stream-json output, so pass them as
-// arguments to preserve them in the report.
+// Usage: bun scripts/report_from_jsonl.ts <baseline.jsonl> <unblocked.jsonl> [result.json | model] [branch] [task]
+// Token usage and tool calls are always re-parsed from the transcripts. The
+// task prompt, branch, and code diffs are not recorded in stream-json output:
+// pass the run's original result.json (third argument, detected by .json
+// extension) to carry them over, or supply model/branch/task as arguments.
+// Repo and model fall back to the transcript's init event.
 import fs from "node:fs";
 import path from "node:path";
 import { parseStreamJson } from "../src/claude.ts";
@@ -52,7 +54,7 @@ function unblockedCalls(toolCalls: { name: string; args: Record<string, unknown>
   return out;
 }
 
-function arm(condition: Condition, file: string, model: string): ArmResult {
+function arm(condition: Condition, file: string, model: string, orig?: ArmResult): ArmResult {
   const jsonl = fs.readFileSync(file, "utf8");
   const parsed = parseStreamJson(jsonl);
   const run = {
@@ -71,21 +73,25 @@ function arm(condition: Condition, file: string, model: string): ArmResult {
   const cost = run.totalCostUsd ?? estimateCost(model, run.tokenUsage);
   return {
     condition, run,
-    diff: "(not captured — generated from transcript)",
-    diffStats: { filesChanged: 0, linesAdded: 0, linesRemoved: 0 },
+    diff: orig?.diff ?? "(not captured — generated from transcript)",
+    diffStats: orig?.diffStats ?? { filesChanged: 0, linesAdded: 0, linesRemoved: 0 },
     unblockedCalls: unblockedCalls(parsed.toolCalls),
     estimatedCost: cost,
   };
 }
 
-const [,, baseFile, ubFile, modelArg, branchArg, ...taskArg] = process.argv;
+const [,, baseFile, ubFile, thirdArg, branchArg, ...taskArg] = process.argv;
+const orig: ComparisonResult | undefined = thirdArg?.endsWith(".json")
+  ? JSON.parse(fs.readFileSync(thirdArg, "utf8"))
+  : undefined;
+const modelArg = orig ? undefined : thirdArg;
 const init = initInfo(fs.readFileSync(baseFile, "utf8"));
-const model = modelArg ?? init.model ?? "claude-opus-4-8";
-const branch = branchArg ?? "(not recorded in transcripts)";
-const task = taskArg.join(" ") || "(task not recorded in transcripts)";
-const repo = repoFromCwd(init.cwd) ?? "(from transcripts)";
-const baseline = arm("baseline", baseFile, model);
-const unblocked = arm("unblocked", ubFile, model);
+const model = orig?.model ?? modelArg ?? init.model ?? "claude-opus-4-8";
+const branch = orig?.branch ?? branchArg ?? "(not recorded in transcripts)";
+const task = orig?.task ?? (taskArg.join(" ") || "(task not recorded in transcripts)");
+const repo = orig?.repo ?? repoFromCwd(init.cwd) ?? "(from transcripts)";
+const baseline = arm("baseline", baseFile, model, orig?.baseline);
+const unblocked = arm("unblocked", ubFile, model, orig?.unblocked);
 
 const result: ComparisonResult = {
   repo,
