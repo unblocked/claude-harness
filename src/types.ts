@@ -12,6 +12,7 @@ export interface ToolCall {
   timestamp: number;
   isMcp: boolean;
   mcpServer?: string;
+  model?: string;
 }
 
 export interface RunResult {

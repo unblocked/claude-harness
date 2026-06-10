@@ -77,6 +77,7 @@ export function parseStreamJson(jsonl: string): ParsedStream {
             timestamp: 0,
             isMcp,
             mcpServer,
+            model: typeof e.message?.model === "string" ? e.message.model : undefined,
           });
         }
       }
