@@ -31,7 +31,7 @@ export function padLeft(str: string, width: number): string {
 }
 
 // Anthropic API per-token pricing ($/M tokens)
-interface ModelPrice { input: number; output: number; cacheRead: number; cacheWrite: number }
+export interface ModelPrice { input: number; output: number; cacheRead: number; cacheWrite: number }
 
 // Rates are only used for the cost-estimate FALLBACK (when the SDK does not
 // emit total_cost_usd / per-model costUSD). Opus 4.8 and Haiku 4.5 rates were
@@ -54,7 +54,7 @@ const PRICING: Record<string, ModelPrice> = {
 // Resolve pricing by exact id, then by model family keyword. The SDK emits
 // fully-qualified ids (e.g. "claude-haiku-4-5-20251001") that won't match the
 // table exactly, so fall back to the family before defaulting to Sonnet.
-function priceFor(model: string): ModelPrice {
+export function priceFor(model: string): ModelPrice {
   if (PRICING[model]) return PRICING[model];
   const id = model.toLowerCase();
   if (id.includes("opus")) return OPUS_PRICE;
@@ -78,7 +78,15 @@ export function totalTokens(u: TokenUsageLike): number {
   return effectiveInputTokens(u) + u.outputTokens;
 }
 
-function costAt(p: ModelPrice, u: TokenUsageLike): number {
+// Headline token metric for reports: fresh input + output only. Cache reads
+// (10% of input rate) and cache writes (125%) are billed at different rates,
+// so lumping them in makes token counts move independently of cost (e.g.
+// "more tokens but cheaper"). Reports surface each cache class separately.
+export function uncachedTokens(u: TokenUsageLike): number {
+  return u.inputTokens + u.outputTokens;
+}
+
+export function costAt(p: ModelPrice, u: TokenUsageLike): number {
   return (u.inputTokens / 1_000_000) * p.input
     + (u.outputTokens / 1_000_000) * p.output
     + (u.cacheReadTokens / 1_000_000) * p.cacheRead

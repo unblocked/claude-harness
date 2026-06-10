@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ArmResult, ComparisonResult, ToolCall } from "./types.ts";
-import { effectiveInputTokens, formatCost, formatDuration, formatTokens, padLeft, padRight, totalTokens } from "./util.ts";
+import { costAt, formatCost, formatDuration, formatTokens, padLeft, padRight, priceFor, totalTokens, uncachedTokens } from "./util.ts";
+import type { TokenUsage } from "./types.ts";
 
 const W = 78;
 
@@ -17,25 +18,42 @@ function divider(): string {
   return "╠" + "═".repeat(W + 2) + "╣";
 }
 
-function toolBreakdown(toolCalls: ToolCall[]): Record<string, number> {
-  const counts: Record<string, number> = {};
+function toolCategory(tc: ToolCall): string {
+  if (tc.isMcp) {
+    return tc.mcpServer?.toLowerCase().includes("unblocked") ? "Unblocked" : `MCP:${tc.mcpServer}`;
+  }
+  if (tc.name === "Bash") {
+    const cmd = (tc.args.command as string) ?? "";
+    if (/^unblocked\s+/.test(cmd)) return "Unblocked";
+    return "Bash";
+  }
+  return tc.name;
+}
+
+// category -> model label -> count. Calls without model info land under "".
+function toolBreakdown(toolCalls: ToolCall[]): Record<string, Record<string, number>> {
+  const counts: Record<string, Record<string, number>> = {};
   for (const tc of toolCalls) {
-    let category: string;
-    if (tc.isMcp) {
-      category = tc.mcpServer?.toLowerCase().includes("unblocked") ? "Unblocked" : `MCP:${tc.mcpServer}`;
-    } else if (tc.name === "Bash") {
-      const cmd = (tc.args.command as string) ?? "";
-      if (/^unblocked\s+/.test(cmd)) {
-        category = "Unblocked";
-      } else {
-        category = "Bash";
-      }
-    } else {
-      category = tc.name;
-    }
-    counts[category] = (counts[category] ?? 0) + 1;
+    const category = toolCategory(tc);
+    const model = tc.model ? modelLabel(tc.model) : "";
+    const byModel = counts[category] ?? {};
+    byModel[model] = (byModel[model] ?? 0) + 1;
+    counts[category] = byModel;
   }
   return counts;
+}
+
+function toolTotal(byModel: Record<string, number> | undefined): number {
+  return Object.values(byModel ?? {}).reduce((a, n) => a + n, 0);
+}
+
+// "claude-haiku-4-5-20251001" → "haiku-4-5"
+function modelLabel(id: string): string {
+  return id.replace(/^claude-/, "").replace(/-\d{8}$/, "");
+}
+
+function modelEntries(usage: TokenUsage): [string, TokenUsage][] {
+  return Object.entries(usage.byModel ?? {});
 }
 
 function pctChange(baseline: number, treatment: number): string {
@@ -46,17 +64,17 @@ function pctChange(baseline: number, treatment: number): string {
 
 function armSummary(label: string, arm: ArmResult): string[] {
   const u = arm.run.tokenUsage;
-  const total = totalTokens(u);
-  const effIn = effectiveInputTokens(u);
   const timedOut = arm.run.timedOut;
-  const tokensAvail = total > 0;
+  const tokensAvail = totalTokens(u) > 0;
   return [
     `  ${padRight(label.toUpperCase() + (timedOut ? " [TIMED OUT]" : ""), 28)}Time        Cost     Tokens   Turns`,
     `  ${"─".repeat(W - 2)}`,
-    `  ${padRight("Task", 28)}${padLeft(formatDuration(arm.run.durationMs), 10)}  ${padLeft(tokensAvail ? formatCost(arm.estimatedCost) : "N/A", 10)}  ${padLeft(tokensAvail ? formatTokens(total) : "N/A", 8)}  ${padLeft(String(arm.run.assistantTurns), 3)}`,
+    `  ${padRight("Task", 28)}${padLeft(formatDuration(arm.run.durationMs), 10)}  ${padLeft(tokensAvail ? formatCost(arm.estimatedCost) : "N/A", 10)}  ${padLeft(tokensAvail ? formatTokens(totalTokens(u)) : "N/A", 8)}  ${padLeft(String(arm.run.assistantTurns), 3)}`,
     ...(tokensAvail ? [
-      `  ${padRight("Tokens in/out", 28)}${padLeft(formatTokens(effIn), 10)} / ${padLeft(formatTokens(u.outputTokens), 10)}`,
+      `  ${padRight("Tokens in/out", 28)}${padLeft(formatTokens(u.inputTokens), 10)} / ${padLeft(formatTokens(u.outputTokens), 10)}`,
       `  ${padRight("  (cache r/w)", 28)}${padLeft(formatTokens(u.cacheReadTokens), 10)} / ${padLeft(formatTokens(u.cacheCreationTokens), 10)}`,
+      ...modelEntries(u).map(([m, mu]) =>
+        `  ${padRight(`  ${modelLabel(m)}`, 28)}${padLeft(formatTokens(uncachedTokens(mu)), 10)}  ${padLeft(formatTokens(mu.cacheReadTokens), 10)} cached  ${padLeft(formatCost(costAt(priceFor(m), mu)), 8)}`),
     ] : []),
     `  ${padRight("Tool calls", 28)}${padLeft(String(arm.run.toolCalls.length), 10)}  Unblocked: ${arm.unblockedCalls.length}`,
     `  ${padRight("Diff", 28)}${padLeft(String(arm.diffStats.filesChanged) + " files", 10)}  +${arm.diffStats.linesAdded} -${arm.diffStats.linesRemoved}`,
@@ -89,7 +107,7 @@ export function printReport(result: ComparisonResult): void {
     r("  COMPARISON"),
     r(`  ${"─".repeat(W - 2)}`),
     r(`  ${padRight("Duration", 28)}${padLeft(formatDuration(b.run.durationMs), 10)}  →  ${padLeft(formatDuration(u.run.durationMs), 10)}  (${pctChange(b.run.durationMs, u.run.durationMs)})`),
-    r(`  ${padRight("Tokens", 28)}${padLeft(formatTokens(totalTokens(b.run.tokenUsage)), 10)}  →  ${padLeft(formatTokens(totalTokens(u.run.tokenUsage)), 10)}  (${pctChange(totalTokens(b.run.tokenUsage), totalTokens(u.run.tokenUsage))})`),
+    r(`  ${padRight("Total tokens", 28)}${padLeft(formatTokens(totalTokens(b.run.tokenUsage)), 10)}  →  ${padLeft(formatTokens(totalTokens(u.run.tokenUsage)), 10)}  (${pctChange(totalTokens(b.run.tokenUsage), totalTokens(u.run.tokenUsage))})`),
     r(`  ${padRight("Est. Cost", 28)}${padLeft(formatCost(b.estimatedCost), 10)}  →  ${padLeft(formatCost(u.estimatedCost), 10)}  (${pctChange(b.estimatedCost, u.estimatedCost)})`),
     r(`  ${padRight("Tool calls", 28)}${padLeft(String(b.run.toolCalls.length), 10)}  →  ${padLeft(String(u.run.toolCalls.length), 10)}  (${pctChange(b.run.toolCalls.length, u.run.toolCalls.length)})`),
   ];
@@ -159,22 +177,36 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   const u = result.unblocked;
   const bTokens = totalTokens(b.run.tokenUsage);
   const uTokens = totalTokens(u.run.tokenUsage);
-  const bHasTokens = bTokens > 0;
-  const uHasTokens = uTokens > 0;
+  const bHasTokens = totalTokens(b.run.tokenUsage) > 0;
+  const uHasTokens = totalTokens(u.run.tokenUsage) > 0;
 
   const toolsB = toolBreakdown(b.run.toolCalls);
   const toolsU = toolBreakdown(u.run.toolCalls);
   const allTools = [...new Set([...Object.keys(toolsB), ...Object.keys(toolsU)])].sort();
 
+  const armModels = (tools: Record<string, Record<string, number>>) =>
+    new Set(Object.values(tools).flatMap(byModel => Object.keys(byModel)));
+  const bMultiModel = armModels(toolsB).size > 1;
+  const uMultiModel = armModels(toolsU).size > 1;
+
+  const toolCell = (byModel: Record<string, number> | undefined, multiModel: boolean) => {
+    const total = toolTotal(byModel);
+    if (total === 0 || !multiModel) return String(total);
+    const split = Object.entries(byModel ?? {})
+      .map(([m, n]) => `${escapeHtml(m || "unknown")} ${n}`)
+      .join(" &middot; ");
+    return `${total} <span style="color: var(--text-muted); font-size: 12px;">(${split})</span>`;
+  };
+
   const toolCompareRows = allTools.map(tool => {
-    const bCount = toolsB[tool] ?? 0;
-    const uCount = toolsU[tool] ?? 0;
+    const bCount = toolTotal(toolsB[tool]);
+    const uCount = toolTotal(toolsU[tool]);
     const isUnblocked = tool === "Unblocked";
     return `
       <tr class="${isUnblocked ? "highlight-row" : ""}">
         <td>${escapeHtml(tool)}</td>
-        <td>${bCount}</td>
-        <td>${uCount}</td>
+        <td>${toolCell(toolsB[tool], bMultiModel)}</td>
+        <td>${toolCell(toolsU[tool], uMultiModel)}</td>
         <td>${uCount - bCount >= 0 ? "+" : ""}${uCount - bCount}</td>
       </tr>`;
   }).join("");
@@ -186,6 +218,36 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   const timestamp = new Date().toLocaleString("en-US", {
     year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit",
   });
+
+  const perModelRows = (armName: string, arm: ArmResult) =>
+    modelEntries(arm.run.tokenUsage).map(([m, mu]) => `
+      <tr>
+        <td>${escapeHtml(armName)}</td>
+        <td>${escapeHtml(modelLabel(m))}</td>
+        <td>${formatTokens(mu.inputTokens)}</td>
+        <td>${formatTokens(mu.outputTokens)}</td>
+        <td>${formatTokens(mu.cacheReadTokens)}</td>
+        <td>${formatTokens(mu.cacheCreationTokens)}</td>
+        <td>${formatCost(costAt(priceFor(m), mu))}</td>
+      </tr>`).join("");
+  const modelBreakdownRows = perModelRows("Baseline", b) + perModelRows("With Unblocked", u);
+
+  const modelsUsed = [...new Set([
+    ...modelEntries(b.run.tokenUsage).map(([m]) => m),
+    ...modelEntries(u.run.tokenUsage).map(([m]) => m),
+  ])];
+  if (modelsUsed.length === 0) modelsUsed.push(result.model);
+  const pricingRows = modelsUsed.map(m => {
+    const p = priceFor(m);
+    return `
+      <tr>
+        <td>${escapeHtml(modelLabel(m))}</td>
+        <td>$${p.input.toFixed(2)}</td>
+        <td>$${p.output.toFixed(2)}</td>
+        <td>$${p.cacheRead.toFixed(2)}</td>
+        <td>$${p.cacheWrite.toFixed(2)}</td>
+      </tr>`;
+  }).join("");
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -579,7 +641,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       </div>
     </div>
     <div class="comparison-row">
-      <div class="comp-label">Tokens</div>
+      <div class="comp-label">Total Tokens</div>
       <div class="bar-group">
         <div class="bar-row">
           <span class="bar-tag baseline">Baseline</span>
@@ -616,11 +678,11 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       <div class="arm-meta">
         <div class="arm-stat"><div class="arm-stat-val">${formatDuration(b.run.durationMs)}</div><div class="arm-stat-label">Duration</div></div>
         <div class="arm-stat"><div class="arm-stat-val">${bHasTokens ? formatCost(b.estimatedCost) : "N/A"}</div><div class="arm-stat-label">Est. Cost</div></div>
-        <div class="arm-stat"><div class="arm-stat-val">${bHasTokens ? formatTokens(bTokens) : "N/A"}</div><div class="arm-stat-label">Tokens</div></div>
+        <div class="arm-stat"><div class="arm-stat-val">${bHasTokens ? formatTokens(bTokens) : "N/A"}</div><div class="arm-stat-label">Total Tokens</div></div>
         <div class="arm-stat"><div class="arm-stat-val">${b.run.assistantTurns}</div><div class="arm-stat-label">Turns</div></div>
       </div>
       ${bHasTokens ? `<div class="arm-tokens">
-        Input: <span>${formatTokens(effectiveInputTokens(b.run.tokenUsage))}</span> &nbsp;
+        Fresh Input: <span>${formatTokens(b.run.tokenUsage.inputTokens)}</span> &nbsp;
         Output: <span>${formatTokens(b.run.tokenUsage.outputTokens)}</span> &nbsp;
         Cache Read: <span>${formatTokens(b.run.tokenUsage.cacheReadTokens)}</span> &nbsp;
         Cache Write: <span>${formatTokens(b.run.tokenUsage.cacheCreationTokens)}</span>
@@ -634,15 +696,36 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       <div class="arm-meta">
         <div class="arm-stat"><div class="arm-stat-val">${formatDuration(u.run.durationMs)}</div><div class="arm-stat-label">Duration</div></div>
         <div class="arm-stat"><div class="arm-stat-val">${uHasTokens ? formatCost(u.estimatedCost) : "N/A"}</div><div class="arm-stat-label">Est. Cost</div></div>
-        <div class="arm-stat"><div class="arm-stat-val">${uHasTokens ? formatTokens(uTokens) : "N/A"}</div><div class="arm-stat-label">Tokens</div></div>
+        <div class="arm-stat"><div class="arm-stat-val">${uHasTokens ? formatTokens(uTokens) : "N/A"}</div><div class="arm-stat-label">Total Tokens</div></div>
         <div class="arm-stat"><div class="arm-stat-val">${u.run.assistantTurns}</div><div class="arm-stat-label">Turns</div></div>
       </div>
       ${uHasTokens ? `<div class="arm-tokens">
-        Input: <span>${formatTokens(effectiveInputTokens(u.run.tokenUsage))}</span> &nbsp;
+        Fresh Input: <span>${formatTokens(u.run.tokenUsage.inputTokens)}</span> &nbsp;
         Output: <span>${formatTokens(u.run.tokenUsage.outputTokens)}</span> &nbsp;
         Cache Read: <span>${formatTokens(u.run.tokenUsage.cacheReadTokens)}</span> &nbsp;
         Cache Write: <span>${formatTokens(u.run.tokenUsage.cacheCreationTokens)}</span>
       </div>` : `<div class="arm-tokens" style="color: var(--text-muted);">Token data unavailable</div>`}
+    </div>
+  </div>
+
+  ${modelBreakdownRows ? `
+  <div class="section">
+    <div class="section-title">Per-Model Breakdown</div>
+    <div class="tool-table-wrap">
+      <table class="tool-table">
+        <thead><tr><th>Arm</th><th>Model</th><th>Fresh Input</th><th>Output</th><th>Cache Read</th><th>Cache Write</th><th>Est. Cost</th></tr></thead>
+        <tbody>${modelBreakdownRows}</tbody>
+      </table>
+    </div>
+  </div>` : ""}
+
+  <div class="section">
+    <div class="section-title">Pricing &mdash; $ per million tokens</div>
+    <div class="tool-table-wrap">
+      <table class="tool-table">
+        <thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Cache Read</th><th>Cache Write</th></tr></thead>
+        <tbody>${pricingRows}</tbody>
+      </table>
     </div>
   </div>
 
