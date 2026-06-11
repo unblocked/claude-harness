@@ -37,11 +37,14 @@ export interface ModelPrice { input: number; output: number; cacheRead: number; 
 // emit total_cost_usd / per-model costUSD). Opus 4.8 and Haiku 4.5 rates were
 // verified to the cent by solving against the SDK's reported costUSD on real
 // runs. cacheRead = 0.1x input, cacheWrite = 1.25x input (standard ratios).
+const FABLE_PRICE: ModelPrice = { input: 10, output: 50, cacheRead: 1.00, cacheWrite: 12.50 };
 const OPUS_PRICE: ModelPrice = { input: 5, output: 25, cacheRead: 0.50, cacheWrite: 6.25 };
 const SONNET_PRICE: ModelPrice = { input: 3, output: 15, cacheRead: 0.30, cacheWrite: 3.75 };
 const HAIKU_PRICE: ModelPrice = { input: 1, output: 5, cacheRead: 0.10, cacheWrite: 1.25 };
 
 const PRICING: Record<string, ModelPrice> = {
+  "claude-fable-5": FABLE_PRICE,
+  "fable": FABLE_PRICE,
   "claude-opus-4-8": OPUS_PRICE,
   "opus": OPUS_PRICE,
   "claude-sonnet-4-6": SONNET_PRICE,
@@ -57,6 +60,7 @@ const PRICING: Record<string, ModelPrice> = {
 export function priceFor(model: string): ModelPrice {
   if (PRICING[model]) return PRICING[model];
   const id = model.toLowerCase();
+  if (id.includes("fable") || id.includes("mythos")) return FABLE_PRICE;
   if (id.includes("opus")) return OPUS_PRICE;
   if (id.includes("haiku")) return HAIKU_PRICE;
   if (id.includes("sonnet")) return SONNET_PRICE;
