@@ -178,21 +178,18 @@ export async function runClaude(opts: {
   ];
 
   if (opts.blockUnblocked) {
-    for (const tool of UNBLOCKED_MCP_TOOLS) {
-      args.push("--disallowed-tools", tool);
-    }
-    args.push("--disallowed-tools", "Bash(unblocked *)");
+    args.push("--disallowed-tools", ...UNBLOCKED_MCP_TOOLS, "Bash(unblocked *)");
   }
+
+  args.push("--", opts.prompt);
 
   const started = Date.now();
 
   const result = await new Promise<{ exitCode: number | null; timedOut: boolean }>((resolve, reject) => {
     const p = spawn(BINARY, args, {
       cwd: opts.worktreePath,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["ignore", "pipe", "pipe"],
     });
-
-    p.stdin.end(opts.prompt);
 
     const out = fs.createWriteStream(jsonlPath);
     let partial = "";
