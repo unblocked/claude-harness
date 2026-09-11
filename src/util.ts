@@ -17,6 +17,12 @@ export function formatTokens(n: number): string {
   return n.toString();
 }
 
+export function formatDiffSummary(d: { filesChanged: number; linesAdded: number; linesRemoved: number; commits: number; truncated?: boolean }): string {
+  const commits = d.commits ? `, ${d.commits} commit${d.commits === 1 ? "" : "s"} by agent` : "";
+  const trunc = d.truncated ? ", diff text truncated" : "";
+  return `${d.filesChanged} files, +${d.linesAdded} -${d.linesRemoved}${commits}${trunc}`;
+}
+
 export function log(message: string): void {
   const timestamp = new Date().toLocaleTimeString();
   process.stderr.write(`[${timestamp}] ${message}\n`);

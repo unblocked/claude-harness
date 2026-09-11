@@ -1,10 +1,11 @@
-import { spawn, execSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
 import type { Condition, RunResult, TokenUsage, ToolCall } from "./types.ts";
 import { log } from "./util.ts";
+import { git, tryGit } from "./git.ts";
 
 const BINARY = process.env.CLAUDE_BINARY ?? "claude";
 
@@ -21,6 +22,7 @@ interface ContentBlock {
   id?: string;
   name?: string;
   input?: Record<string, unknown>;
+  tool_use_id?: string;
 }
 
 interface ParsedStream {
@@ -52,14 +54,31 @@ export function parseStreamJson(jsonl: string): ParsedStream {
 
   const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
   const toolCalls: ToolCall[] = [];
+  // tool_use id -> the ToolCall awaiting its tool_result, so we can attribute wall time.
+  const pending = new Map<string, ToolCall>();
   let assistantTurns = 0;
   let finalResponse = "";
   let sessionId: string | undefined;
   let totalCostUsd: number | null = null;
 
   for (const e of events) {
+    const eventMs = typeof e?.timestamp === "string" ? Date.parse(e.timestamp) : NaN;
+
     if (e?.type === "system" && e?.subtype === "init") {
       sessionId = e.session_id;
+    }
+
+    // Tool results come back as user messages; close out the matching tool_use.
+    if (e?.type === "user" && Array.isArray(e.message?.content)) {
+      for (const block of e.message.content as ContentBlock[]) {
+        if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") continue;
+        const call = pending.get(block.tool_use_id);
+        if (!call) continue;
+        pending.delete(block.tool_use_id);
+        if (!Number.isNaN(eventMs) && call.timestamp > 0) {
+          call.durationMs = Math.max(0, eventMs - call.timestamp);
+        }
+      }
     }
 
     if (e?.type === "assistant") {
@@ -71,14 +90,17 @@ export function parseStreamJson(jsonl: string): ParsedStream {
         }
         if (block.type === "tool_use" && block.name) {
           const { isMcp, mcpServer } = parseToolName(block.name);
-          toolCalls.push({
+          const call: ToolCall = {
             name: block.name,
             args: block.input ?? {},
-            timestamp: 0,
+            timestamp: Number.isNaN(eventMs) ? 0 : eventMs,
             isMcp,
             mcpServer,
             model: typeof e.message?.model === "string" ? e.message.model : undefined,
-          });
+            nested: typeof e.parent_tool_use_id === "string" ? true : undefined,
+          };
+          toolCalls.push(call);
+          if (block.id) pending.set(block.id, call);
         }
       }
       if (e.session_id) sessionId = e.session_id;
@@ -135,19 +157,52 @@ export function worktreePath(repoPath: string, name: string): string {
   return path.join(WORKTREE_BASE, repoName, name);
 }
 
-export function createWorktree(repoPath: string, name: string, branch: string): string {
+export function createWorktree(repoPath: string, name: string, branch: string): { path: string; baseSha: string } {
   const wtPath = worktreePath(repoPath, name);
   fs.mkdirSync(path.dirname(wtPath), { recursive: true });
-  execSync(`git worktree add --detach "${wtPath}" "${branch}"`, { cwd: repoPath, stdio: "pipe" });
-  return wtPath;
+  git(repoPath, ["worktree", "add", "--detach", wtPath, branch]);
+  const baseSha = git(wtPath, ["rev-parse", "HEAD"]).trim();
+  return { path: wtPath, baseSha };
 }
 
-export function removeWorktree(repoPath: string, name: string): void {
+// Branch names the worktree's HEAD ever pointed at, from its own reflog
+// ("checkout: moving from A to B"). Read before the worktree is removed, since
+// the reflog goes with it. Only the agent could have moved this HEAD, so this
+// is the set of branches it touched — nothing the user did elsewhere is here.
+function branchesVisitedByWorktree(wtPath: string): Set<string> {
+  const visited = new Set<string>();
+  const out = tryGit(wtPath, ["reflog", "show", "--format=%gs", "HEAD"], "reading worktree reflog for cleanup");
+  for (const line of (out ?? "").split("\n")) {
+    const m = line.match(/^checkout: moving from (\S+) to (\S+)$/);
+    if (m) { visited.add(m[1]); visited.add(m[2]); }
+  }
+  return visited;
+}
+
+// Removes the worktree, then any branch the agent created in it: a branch that
+// did not exist when the run started AND that this worktree's HEAD actually
+// checked out. Both conditions are required, so a branch the user made in their
+// own checkout while the run was in progress is never touched, and neither is
+// a pre-existing branch the agent merely looked at. Runs after the diff is
+// captured. Not called under --keep-worktrees.
+export function removeWorktree(repoPath: string, name: string, refsBefore: Map<string, string> | null): void {
   const wtPath = worktreePath(repoPath, name);
-  try {
-    execSync(`git worktree remove --force "${wtPath}"`, { cwd: repoPath, stdio: "pipe" });
-  } catch {
-    try { execSync("git worktree prune", { cwd: repoPath, stdio: "pipe" }); } catch {}
+  const visited = fs.existsSync(wtPath) ? branchesVisitedByWorktree(wtPath) : new Set<string>();
+
+  if (tryGit(repoPath, ["worktree", "remove", "--force", wtPath], `removing worktree ${name}`) === null) {
+    tryGit(repoPath, ["worktree", "prune"], "pruning worktrees");
+  }
+
+  if (!refsBefore) {
+    log(`Skipping branch cleanup for ${name}: no ref snapshot from run start`);
+    return;
+  }
+  for (const b of visited) {
+    if (refsBefore.has(`refs/heads/${b}`)) continue; // existed before the run: not ours to delete
+    if (tryGit(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${b}`], `checking branch ${b}`) === null) continue; // not a local branch (detached sha, or already gone)
+    if (tryGit(repoPath, ["branch", "-D", b], `deleting agent-created branch ${b}`) !== null) {
+      log(`Deleted agent-created branch: ${b}`);
+    }
   }
 }
 

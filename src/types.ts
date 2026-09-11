@@ -10,6 +10,11 @@ export interface ToolCall {
   name: string;
   args: Record<string, unknown>;
   timestamp: number;
+  // Wall time from tool_use to its tool_result; undefined if no result was seen.
+  durationMs?: number;
+  // Issued by a subagent (the event carried parent_tool_use_id). Counted as a
+  // call, but excluded from tool-time so it isn't summed on top of the parent.
+  nested?: boolean;
   isMcp: boolean;
   mcpServer?: string;
   model?: string;
@@ -38,6 +43,11 @@ export interface DiffStats {
   filesChanged: number;
   linesAdded: number;
   linesRemoved: number;
+  // Commits the agent made on top of the worktree base. The diff is taken
+  // against the base commit, so committed work is included either way.
+  commits: number;
+  // True when the diff text was too large to keep; the counts above still hold.
+  truncated?: boolean;
 }
 
 export type Condition = "baseline" | "unblocked";

@@ -74,7 +74,7 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
   return {
     condition, run,
     diff: orig?.diff ?? "(not captured — generated from transcript)",
-    diffStats: orig?.diffStats ?? { filesChanged: 0, linesAdded: 0, linesRemoved: 0 },
+    diffStats: orig?.diffStats ?? { filesChanged: 0, linesAdded: 0, linesRemoved: 0, commits: 0 },
     unblockedCalls: unblockedCalls(parsed.toolCalls),
     estimatedCost: cost,
   };

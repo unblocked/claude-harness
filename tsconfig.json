@@ -11,8 +11,8 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "outDir": "dist",
-    "rootDir": "src",
+    "rootDir": ".",
     "types": ["bun"]
   },
-  "include": ["src"]
+  "include": ["src", "scripts"]
 }

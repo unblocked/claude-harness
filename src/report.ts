@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ArmResult, ComparisonResult, ToolCall } from "./types.ts";
-import { costAt, formatCost, formatDuration, formatTokens, padLeft, padRight, priceFor, totalTokens, uncachedTokens } from "./util.ts";
+import { costAt, formatCost, formatDiffSummary, formatDuration, formatTokens, padLeft, padRight, priceFor, totalTokens, uncachedTokens } from "./util.ts";
 import type { TokenUsage } from "./types.ts";
 
 const W = 78;
@@ -18,6 +18,27 @@ function divider(): string {
   return "╠" + "═".repeat(W + 2) + "╣";
 }
 
+// Shell commands that write files. Agents sometimes bypass Edit/Write and
+// patch code through `python3 - <<'PY' ... write_text(...)`, `cat > f <<EOF`,
+// `sed -i`, etc.; without this, such an arm shows "Edit: 0" beside a real diff.
+// Deliberately narrow: an earlier, looser version matched `2>/dev/null` and
+// `=>` inside grep patterns and flagged ~125 read-only commands across the
+// saved transcripts. This one flags 16 of 701, all genuine.
+const BASH_WRITE_RE = new RegExp([
+  String.raw`(?:^|[\s;&|(])cat\s*>{1,2}\s*[^\s&|;>]+\s*<<`,                                                  // cat > file <<EOF
+  String.raw`(?:python3?|ruby|node|perl)\s+-\s*<<[\s\S]*?(?:write_text\(|\.write\(|open\([^)]*["'][wa]|writeFileSync|File\.write|IO\.write)`, // inline script that writes
+  String.raw`\bsed\s+(?:-[a-zA-Z]*\s+)*-i\b`,                                                               // sed -i
+  String.raw`\bperl\s+-p?i\b`,
+  String.raw`\btee\s+(?:-a\s+)?(?!/dev/)[\w./-]+`,                                                          // tee file
+  String.raw`\bgit\s+apply\b`,
+  String.raw`(?:^|[\s;&|])patch\s+(?:-p\d\s+)?[<\w]`,
+  String.raw`(?:^|[^\w<>=&$])>{1,2}\s*(?!/dev/|&)['"]?[\w./~-]+`,                                             // echo x > file; not 2>, =>, >&, /dev/null
+].join("|"), "m");
+
+function bashWritesFiles(cmd: string): boolean {
+  return BASH_WRITE_RE.test(cmd);
+}
+
 function toolCategory(tc: ToolCall): string {
   if (tc.isMcp) {
     return tc.mcpServer?.toLowerCase().includes("unblocked") ? "Unblocked" : `MCP:${tc.mcpServer}`;
@@ -25,10 +46,72 @@ function toolCategory(tc: ToolCall): string {
   if (tc.name === "Bash") {
     const cmd = (tc.args.command as string) ?? "";
     if (/^unblocked\s+/.test(cmd)) return "Unblocked";
-    return "Bash";
+    return bashWritesFiles(cmd) ? "Bash (writes files)" : "Bash";
   }
   return tc.name;
 }
+
+// Wall time covered by the given calls, as a union of their intervals: two
+// parallel 30s calls are 30s of tool time, not 60s. Calls issued by subagents
+// are skipped — the parent Agent call's interval already spans them.
+function unionMs(calls: ToolCall[]): number {
+  const spans = calls
+    .filter(tc => !tc.nested && tc.timestamp > 0 && (tc.durationMs ?? 0) > 0)
+    .map(tc => [tc.timestamp, tc.timestamp + (tc.durationMs as number)] as [number, number])
+    .sort((a, b) => a[0] - b[0]);
+  let total = 0, curStart = -1, curEnd = -1;
+  for (const [s, e] of spans) {
+    if (s > curEnd) { if (curEnd > curStart) total += curEnd - curStart; curStart = s; curEnd = e; }
+    else if (e > curEnd) curEnd = e;
+  }
+  if (curEnd > curStart) total += curEnd - curStart;
+  return total;
+}
+
+export function toolTimeMs(arm: ArmResult): number {
+  return unionMs(arm.run.toolCalls);
+}
+
+function hasTiming(arm: ArmResult): boolean {
+  return arm.run.toolCalls.some(tc => (tc.durationMs ?? 0) > 0);
+}
+
+// Files the agent changed without ever calling Edit/Write: everything went
+// through shell commands (heredocs, sed, git). Worth a note next to the tool
+// counts, where "Edit: 0" would otherwise read as "did nothing".
+function shellOnlyEdits(arm: ArmResult): boolean {
+  const editors = arm.run.toolCalls.filter(tc => ["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(tc.name)).length;
+  return arm.diffStats.filesChanged > 0 && editors === 0;
+}
+
+// category -> wall time across that category's calls (ms), overlap-free.
+function toolTimeBreakdown(toolCalls: ToolCall[]): Record<string, number> {
+  const byCat: Record<string, ToolCall[]> = {};
+  for (const tc of toolCalls) (byCat[toolCategory(tc)] ??= []).push(tc);
+  return Object.fromEntries(Object.entries(byCat).map(([c, calls]) => [c, unionMs(calls)]));
+}
+
+function modelTimeMs(arm: ArmResult): number {
+  return Math.max(0, arm.run.durationMs - toolTimeMs(arm));
+}
+
+// Unblocked calls are left out: they have their own section, and this list is
+// meant to show where the *rest* of the wall time went (tests, CI, shell).
+function slowestTools(toolCalls: ToolCall[], n: number): ToolCall[] {
+  return [...toolCalls]
+    .filter(tc => (tc.durationMs ?? 0) > 0 && toolCategory(tc) !== "Unblocked")
+    .sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0))
+    .slice(0, n);
+}
+
+function toolLabel(tc: ToolCall): string {
+  if (tc.name === "Bash") return `Bash: ${((tc.args.command as string) ?? "").replace(/\s+/g, " ").slice(0, 90)}`;
+  if (tc.isMcp) return `${toolCategory(tc)}: ${((tc.args.query as string) ?? (tc.args.url as string) ?? "").slice(0, 80)}`;
+  const fp = (tc.args.file_path as string) ?? "";
+  return fp ? `${tc.name}: ...${fp.slice(-60)}` : tc.name;
+}
+
+
 
 // category -> model label -> count. Calls without model info land under "".
 function toolBreakdown(toolCalls: ToolCall[]): Record<string, Record<string, number>> {
@@ -73,17 +156,20 @@ function armSummary(label: string, arm: ArmResult): string[] {
   const timedOut = arm.run.timedOut;
   const tokensAvail = totalTokens(u) > 0;
   return [
-    `  ${padRight(label.toUpperCase() + (timedOut ? " [TIMED OUT]" : ""), 28)}Time        Cost     Tokens   Turns`,
+    `  ${padRight(label.toUpperCase() + (timedOut ? " [TIMED OUT]" : ""), 28)}Time        Cost     Output   Turns`,
     `  ${"─".repeat(W - 2)}`,
-    `  ${padRight("Task", 28)}${padLeft(formatDuration(arm.run.durationMs), 10)}  ${padLeft(tokensAvail ? formatCost(arm.estimatedCost) : "N/A", 10)}  ${padLeft(tokensAvail ? formatTokens(totalTokens(u)) : "N/A", 8)}  ${padLeft(String(arm.run.assistantTurns), 3)}`,
+    `  ${padRight("Task", 28)}${padLeft(formatDuration(arm.run.durationMs), 10)}  ${padLeft(tokensAvail ? formatCost(arm.estimatedCost) : "N/A", 10)}  ${padLeft(tokensAvail ? formatTokens(u.outputTokens) : "N/A", 8)}  ${padLeft(String(arm.run.assistantTurns), 3)}`,
+    ...(hasTiming(arm) ? [
+      `  ${padRight("  model / tools", 28)}${padLeft(formatDuration(modelTimeMs(arm)), 10)} / ${padLeft(formatDuration(toolTimeMs(arm)), 10)}`,
+    ] : []),
     ...(tokensAvail ? [
       `  ${padRight("Tokens in/out", 28)}${padLeft(formatTokens(u.inputTokens), 10)} / ${padLeft(formatTokens(u.outputTokens), 10)}`,
       `  ${padRight("  (cache r/w)", 28)}${padLeft(formatTokens(u.cacheReadTokens), 10)} / ${padLeft(formatTokens(u.cacheCreationTokens), 10)}`,
       ...modelEntries(u).map(([m, mu]) =>
         `  ${padRight(`  ${modelLabel(m)}`, 28)}${padLeft(formatTokens(uncachedTokens(mu)), 10)}  ${padLeft(formatTokens(mu.cacheReadTokens), 10)} cached  ${padLeft(formatCost(costAt(priceFor(m), mu)), 8)}`),
     ] : []),
-    `  ${padRight("Tool calls", 28)}${padLeft(String(arm.run.toolCalls.length), 10)}  Unblocked: ${arm.unblockedCalls.length}`,
-    `  ${padRight("Diff", 28)}${padLeft(String(arm.diffStats.filesChanged) + " files", 10)}  +${arm.diffStats.linesAdded} -${arm.diffStats.linesRemoved}`,
+    `  ${padRight("Tool calls", 28)}${padLeft(String(arm.run.toolCalls.length), 10)}  Unblocked: ${arm.unblockedCalls.length}${shellOnlyEdits(arm) ? "  (all edits via shell)" : ""}`,
+    `  ${padRight("Diff", 28)}${formatDiffSummary(arm.diffStats)}`,
   ];
 }
 
@@ -113,7 +199,13 @@ export function printReport(result: ComparisonResult): void {
     r("  COMPARISON"),
     r(`  ${"─".repeat(W - 2)}`),
     r(`  ${padRight("Duration", 28)}${padLeft(formatDuration(b.run.durationMs), 10)}  →  ${padLeft(formatDuration(u.run.durationMs), 10)}  (${pctChange(b.run.durationMs, u.run.durationMs)})`),
-    r(`  ${padRight("Total tokens", 28)}${padLeft(formatTokens(totalTokens(b.run.tokenUsage)), 10)}  →  ${padLeft(formatTokens(totalTokens(u.run.tokenUsage)), 10)}  (${pctChange(totalTokens(b.run.tokenUsage), totalTokens(u.run.tokenUsage))})`),
+    ...(hasTiming(b) || hasTiming(u) ? [
+      r(`  ${padRight("  model time", 28)}${padLeft(formatDuration(modelTimeMs(b)), 10)}  →  ${padLeft(formatDuration(modelTimeMs(u)), 10)}  (${pctChange(modelTimeMs(b), modelTimeMs(u))})`),
+      r(`  ${padRight("  tool time (tests, CI…)", 28)}${padLeft(formatDuration(toolTimeMs(b)), 10)}  →  ${padLeft(formatDuration(toolTimeMs(u)), 10)}  (${pctChange(toolTimeMs(b), toolTimeMs(u))})`),
+    ] : []),
+    r(`  ${padRight("Output tokens", 28)}${padLeft(formatTokens(b.run.tokenUsage.outputTokens), 10)}  →  ${padLeft(formatTokens(u.run.tokenUsage.outputTokens), 10)}  (${pctChange(b.run.tokenUsage.outputTokens, u.run.tokenUsage.outputTokens)})`),
+    r(`  ${padRight("Cache-read tokens", 28)}${padLeft(formatTokens(b.run.tokenUsage.cacheReadTokens), 10)}  →  ${padLeft(formatTokens(u.run.tokenUsage.cacheReadTokens), 10)}  (${pctChange(b.run.tokenUsage.cacheReadTokens, u.run.tokenUsage.cacheReadTokens)})`),
+    r(`  ${padRight("Total tokens (all classes)", 28)}${padLeft(formatTokens(totalTokens(b.run.tokenUsage)), 10)}  →  ${padLeft(formatTokens(totalTokens(u.run.tokenUsage)), 10)}  (${pctChange(totalTokens(b.run.tokenUsage), totalTokens(u.run.tokenUsage))})`),
     r(`  ${padRight("Est. Cost", 28)}${padLeft(formatCost(b.estimatedCost), 10)}  →  ${padLeft(formatCost(u.estimatedCost), 10)}  (${pctChange(b.estimatedCost, u.estimatedCost)})`),
     r(`  ${padRight("Tool calls", 28)}${padLeft(String(b.run.toolCalls.length), 10)}  →  ${padLeft(String(u.run.toolCalls.length), 10)}  (${pctChange(b.run.toolCalls.length, u.run.toolCalls.length)})`),
   ];
@@ -160,7 +252,7 @@ function escapeHtml(text: string): string {
 }
 
 function formatDiff(diff: string): string {
-  if (!diff || diff === "(no changes)" || diff === "(failed to capture diff)") {
+  if (!diff || diff.startsWith("(")) {
     return `<span style="color: var(--text-muted)">${escapeHtml(diff)}</span>`;
   }
   return diff.split("\n").map(line => {
@@ -188,7 +280,11 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
 
   const toolsB = toolBreakdown(b.run.toolCalls);
   const toolsU = toolBreakdown(u.run.toolCalls);
+  const timeB = toolTimeBreakdown(b.run.toolCalls);
+  const timeU = toolTimeBreakdown(u.run.toolCalls);
   const allTools = [...new Set([...Object.keys(toolsB), ...Object.keys(toolsU)])].sort();
+  const hasToolTiming = hasTiming(b) || hasTiming(u);
+  const timeCell = (ms: number | undefined) => ms ? formatDuration(ms) : `<span style="color: var(--text-muted)">–</span>`;
 
   const armModels = (tools: Record<string, Record<string, number>>) =>
     new Set(Object.values(tools).flatMap(byModel => Object.keys(byModel)));
@@ -214,12 +310,73 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
         <td>${toolCell(toolsB[tool], bMultiModel)}</td>
         <td>${toolCell(toolsU[tool], uMultiModel)}</td>
         <td>${uCount - bCount >= 0 ? "+" : ""}${uCount - bCount}</td>
+        ${hasToolTiming ? `<td>${timeCell(timeB[tool])}</td><td>${timeCell(timeU[tool])}</td>` : ""}
       </tr>`;
   }).join("");
+
+  const armCard = (label: string, arm: ArmResult, accent: boolean) => {
+    const t = arm.run.tokenUsage;
+    const has = totalTokens(t) > 0;
+    return `
+    <div class="arm-section"${accent ? ` style="border-color: rgba(59, 130, 246, 0.3);"` : ""}>
+      <div class="arm-header"${accent ? ` style="border-bottom-color: rgba(59, 130, 246, 0.2);"` : ""}>
+        <span class="arm-name">${escapeHtml(label)}${arm.run.timedOut ? ` <span style="color: var(--yellow); font-size: 12px;">(TIMED OUT)</span>` : ""}</span>
+      </div>
+      <div class="arm-meta">
+        <div class="arm-stat"><div class="arm-stat-val">${formatDuration(arm.run.durationMs)}</div><div class="arm-stat-label">Duration</div></div>
+        <div class="arm-stat"><div class="arm-stat-val">${has ? formatCost(arm.estimatedCost) : "N/A"}</div><div class="arm-stat-label">Est. Cost</div></div>
+        <div class="arm-stat"><div class="arm-stat-val">${has ? formatTokens(t.outputTokens) : "N/A"}</div><div class="arm-stat-label">Output Tokens</div></div>
+        <div class="arm-stat"><div class="arm-stat-val">${arm.run.assistantTurns}</div><div class="arm-stat-label">Turns</div></div>
+      </div>
+      ${has ? `<div class="arm-tokens">
+        Fresh Input: <span>${formatTokens(t.inputTokens)}</span> &nbsp;
+        Output: <span>${formatTokens(t.outputTokens)}</span> &nbsp;
+        Cache Read: <span>${formatTokens(t.cacheReadTokens)}</span> &nbsp;
+        Cache Write: <span>${formatTokens(t.cacheCreationTokens)}</span> &nbsp;
+        Total: <span>${formatTokens(totalTokens(t))}</span>
+      </div>` : `<div class="arm-tokens" style="color: var(--text-muted);">Token data unavailable</div>`}
+      <div class="arm-tokens">
+        ${hasTiming(arm) ? `Model time: <span>${formatDuration(modelTimeMs(arm))}</span> &nbsp; Tool time: <span>${formatDuration(toolTimeMs(arm))}</span> &nbsp;` : ""}
+        Diff: <span>${escapeHtml(formatDiffSummary(arm.diffStats))}</span>
+      </div>
+    </div>`;
+  };
+
+  const slowestRows = (arm: ArmResult) => slowestTools(arm.run.toolCalls, 5).map(tc => `
+      <tr>
+        <td>${formatDuration(tc.durationMs ?? 0)}</td>
+        <td style="font-family: 'SF Mono', 'Fira Code', Consolas, monospace; font-size: 12px;">${escapeHtml(toolLabel(tc))}</td>
+      </tr>`).join("");
 
   const maxTime = Math.max(b.run.durationMs, u.run.durationMs, 1);
   const maxCost = Math.max(b.estimatedCost, u.estimatedCost, 0.0001);
   const maxTokens = Math.max(bTokens, uTokens, 1);
+  const bOut = b.run.tokenUsage.outputTokens, uOut = u.run.tokenUsage.outputTokens;
+  const bCache = b.run.tokenUsage.cacheReadTokens, uCache = u.run.tokenUsage.cacheReadTokens;
+  const maxOut = Math.max(bOut, uOut, 1);
+  const maxCache = Math.max(bCache, uCache, 1);
+  const bModelMs = modelTimeMs(b), uModelMs = modelTimeMs(u);
+  const bToolMs = toolTimeMs(b), uToolMs = toolTimeMs(u);
+
+  // One head-to-head bar pair. Lower is better for every metric shown, so the
+  // Unblocked bar is green when it is at or below baseline.
+  const barPair = (label: string, bVal: number, uVal: number, max: number, fmt: (n: number) => string, note = "") => {
+    const better = uVal <= bVal;
+    return `
+    <div class="comparison-row">
+      <div class="comp-label">${label}${note ? `<div class="comp-note">${note}</div>` : ""}</div>
+      <div class="bar-group">
+        <div class="bar-row">
+          <span class="bar-tag baseline">Baseline</span>
+          <div class="bar-track"><div class="bar-fill baseline" style="width: ${barWidth(bVal, max)}%">${fmt(bVal)}</div></div>
+        </div>
+        <div class="bar-row">
+          <span class="bar-tag ${better ? "better" : "worse"}">Unblocked</span>
+          <div class="bar-track"><div class="bar-fill ${better ? "better" : "worse"}" style="width: ${barWidth(uVal, max)}%">${fmt(uVal)}</div></div>
+        </div>
+      </div>
+    </div>`;
+  };
 
   const timestamp = new Date().toLocaleString("en-US", {
     year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit",
@@ -422,6 +579,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     color: var(--text-muted);
     text-align: right;
   }
+  .comp-note { font-size: 11px; color: var(--text-muted); opacity: 0.7; line-height: 1.3; }
   .bar-group { display: flex; flex-direction: column; gap: 6px; }
   .bar-row {
     display: flex;
@@ -633,85 +791,20 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
 
   <div class="section">
     <div class="section-title">Head-to-Head</div>
-    <div class="comparison-row">
-      <div class="comp-label">Duration</div>
-      <div class="bar-group">
-        <div class="bar-row">
-          <span class="bar-tag baseline">Baseline</span>
-          <div class="bar-track"><div class="bar-fill baseline" style="width: ${barWidth(b.run.durationMs, maxTime)}%">${formatDuration(b.run.durationMs)}</div></div>
-        </div>
-        <div class="bar-row">
-          <span class="bar-tag ${u.run.durationMs <= b.run.durationMs ? "better" : "worse"}">Unblocked</span>
-          <div class="bar-track"><div class="bar-fill ${u.run.durationMs <= b.run.durationMs ? "better" : "worse"}" style="width: ${barWidth(u.run.durationMs, maxTime)}%">${formatDuration(u.run.durationMs)}</div></div>
-        </div>
-      </div>
-    </div>
-    <div class="comparison-row">
-      <div class="comp-label">Total Tokens</div>
-      <div class="bar-group">
-        <div class="bar-row">
-          <span class="bar-tag baseline">Baseline</span>
-          <div class="bar-track"><div class="bar-fill baseline" style="width: ${barWidth(bTokens, maxTokens)}%">${formatTokens(bTokens)}</div></div>
-        </div>
-        <div class="bar-row">
-          <span class="bar-tag ${uTokens <= bTokens ? "better" : "worse"}">Unblocked</span>
-          <div class="bar-track"><div class="bar-fill ${uTokens <= bTokens ? "better" : "worse"}" style="width: ${barWidth(uTokens, maxTokens)}%">${formatTokens(uTokens)}</div></div>
-        </div>
-      </div>
-    </div>
-    <div class="comparison-row">
-      <div class="comp-label">Est. Cost</div>
-      <div class="bar-group">
-        <div class="bar-row">
-          <span class="bar-tag baseline">Baseline</span>
-          <div class="bar-track"><div class="bar-fill baseline" style="width: ${barWidth(b.estimatedCost, maxCost)}%">${formatCost(b.estimatedCost)}</div></div>
-        </div>
-        <div class="bar-row">
-          <span class="bar-tag ${u.estimatedCost <= b.estimatedCost ? "better" : "worse"}">Unblocked</span>
-          <div class="bar-track"><div class="bar-fill ${u.estimatedCost <= b.estimatedCost ? "better" : "worse"}" style="width: ${barWidth(u.estimatedCost, maxCost)}%">${formatCost(u.estimatedCost)}</div></div>
-        </div>
-      </div>
-    </div>
+    ${barPair("Duration", b.run.durationMs, u.run.durationMs, maxTime, formatDuration)}
+    ${hasToolTiming ? barPair("Model time", bModelMs, uModelMs, maxTime, formatDuration, "thinking + generation") : ""}
+    ${hasToolTiming ? barPair("Tool time", bToolMs, uToolMs, maxTime, formatDuration, "tests, CI, MCP, shell") : ""}
+    ${barPair("Est. Cost", b.estimatedCost, u.estimatedCost, maxCost, formatCost)}
+    ${barPair("Output tokens", bOut, uOut, maxOut, formatTokens, "what the model wrote")}
+    ${barPair("Cache-read tokens", bCache, uCache, maxCache, formatTokens, "context re-read per turn; 2% of output price")}
+    ${barPair("Total tokens", bTokens, uTokens, maxTokens, formatTokens, "all classes summed — not cost-proportional")}
   </div>
 
   <div class="section">
     <div class="section-title">Arm Details</div>
 
-    <div class="arm-section">
-      <div class="arm-header">
-        <span class="arm-name">Baseline${b.run.timedOut ? ` <span style="color: var(--yellow); font-size: 12px;">(TIMED OUT)</span>` : ""}</span>
-      </div>
-      <div class="arm-meta">
-        <div class="arm-stat"><div class="arm-stat-val">${formatDuration(b.run.durationMs)}</div><div class="arm-stat-label">Duration</div></div>
-        <div class="arm-stat"><div class="arm-stat-val">${bHasTokens ? formatCost(b.estimatedCost) : "N/A"}</div><div class="arm-stat-label">Est. Cost</div></div>
-        <div class="arm-stat"><div class="arm-stat-val">${bHasTokens ? formatTokens(bTokens) : "N/A"}</div><div class="arm-stat-label">Total Tokens</div></div>
-        <div class="arm-stat"><div class="arm-stat-val">${b.run.assistantTurns}</div><div class="arm-stat-label">Turns</div></div>
-      </div>
-      ${bHasTokens ? `<div class="arm-tokens">
-        Fresh Input: <span>${formatTokens(b.run.tokenUsage.inputTokens)}</span> &nbsp;
-        Output: <span>${formatTokens(b.run.tokenUsage.outputTokens)}</span> &nbsp;
-        Cache Read: <span>${formatTokens(b.run.tokenUsage.cacheReadTokens)}</span> &nbsp;
-        Cache Write: <span>${formatTokens(b.run.tokenUsage.cacheCreationTokens)}</span>
-      </div>` : `<div class="arm-tokens" style="color: var(--text-muted);">Token data unavailable</div>`}
-    </div>
-
-    <div class="arm-section" style="border-color: rgba(59, 130, 246, 0.3);">
-      <div class="arm-header" style="border-bottom-color: rgba(59, 130, 246, 0.2);">
-        <span class="arm-name">With Unblocked${u.run.timedOut ? ` <span style="color: var(--yellow); font-size: 12px;">(TIMED OUT)</span>` : ""}</span>
-      </div>
-      <div class="arm-meta">
-        <div class="arm-stat"><div class="arm-stat-val">${formatDuration(u.run.durationMs)}</div><div class="arm-stat-label">Duration</div></div>
-        <div class="arm-stat"><div class="arm-stat-val">${uHasTokens ? formatCost(u.estimatedCost) : "N/A"}</div><div class="arm-stat-label">Est. Cost</div></div>
-        <div class="arm-stat"><div class="arm-stat-val">${uHasTokens ? formatTokens(uTokens) : "N/A"}</div><div class="arm-stat-label">Total Tokens</div></div>
-        <div class="arm-stat"><div class="arm-stat-val">${u.run.assistantTurns}</div><div class="arm-stat-label">Turns</div></div>
-      </div>
-      ${uHasTokens ? `<div class="arm-tokens">
-        Fresh Input: <span>${formatTokens(u.run.tokenUsage.inputTokens)}</span> &nbsp;
-        Output: <span>${formatTokens(u.run.tokenUsage.outputTokens)}</span> &nbsp;
-        Cache Read: <span>${formatTokens(u.run.tokenUsage.cacheReadTokens)}</span> &nbsp;
-        Cache Write: <span>${formatTokens(u.run.tokenUsage.cacheCreationTokens)}</span>
-      </div>` : `<div class="arm-tokens" style="color: var(--text-muted);">Token data unavailable</div>`}
-    </div>
+    ${armCard("Baseline", b, false)}
+    ${armCard("With Unblocked", u, true)}
   </div>
 
   ${modelBreakdownRows ? `
@@ -739,11 +832,34 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     <div class="section-title">Tool Usage Breakdown</div>
     <div class="tool-table-wrap">
       <table class="tool-table">
-        <thead><tr><th>Tool</th><th>Baseline</th><th>Unblocked</th><th>Delta</th></tr></thead>
+        <thead><tr><th>Tool</th><th>Baseline</th><th>Unblocked</th><th>Delta</th>${hasToolTiming ? `<th>Baseline time</th><th>Unblocked time</th>` : ""}</tr></thead>
         <tbody>${toolCompareRows}</tbody>
       </table>
     </div>
+    ${[["Baseline", b], ["Unblocked", u]].filter(([, a]) => shellOnlyEdits(a as ArmResult)).map(([n, a]) => `
+    <div style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">
+      ${n} changed ${(a as ArmResult).diffStats.filesChanged} file${(a as ArmResult).diffStats.filesChanged === 1 ? "" : "s"} without any Edit/Write call — see "Bash (writes files)" for the shell commands that did it. The diff below is the ground truth.
+    </div>`).join("")}
   </div>
+
+  ${hasToolTiming ? `
+  <div class="section">
+    <div class="section-title">Slowest Tool Calls</div>
+    <div class="hero-grid">
+      <div class="tool-table-wrap">
+        <table class="tool-table">
+          <thead><tr><th colspan="2">Baseline</th></tr></thead>
+          <tbody>${slowestRows(b)}</tbody>
+        </table>
+      </div>
+      <div class="tool-table-wrap">
+        <table class="tool-table">
+          <thead><tr><th colspan="2">With Unblocked</th></tr></thead>
+          <tbody>${slowestRows(u)}</tbody>
+        </table>
+      </div>
+    </div>
+  </div>` : ""}
 
   ${u.unblockedCalls.length > 0 ? `
   <div class="section">
@@ -764,6 +880,8 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       <span>${b.diffStats.filesChanged} files</span>
       <span class="diff-added">+${b.diffStats.linesAdded}</span>
       <span class="diff-removed">-${b.diffStats.linesRemoved}</span>
+      ${b.diffStats.commits ? `<span>${b.diffStats.commits} commit${b.diffStats.commits === 1 ? "" : "s"} by agent (included)</span>` : ""}
+      ${b.diffStats.truncated ? `<span>diff text truncated</span>` : ""}
     </div>
     <div class="diff-block"><pre><code>${formatDiff(b.diff)}</code></pre></div>
   </div>
@@ -774,6 +892,8 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       <span>${u.diffStats.filesChanged} files</span>
       <span class="diff-added">+${u.diffStats.linesAdded}</span>
       <span class="diff-removed">-${u.diffStats.linesRemoved}</span>
+      ${u.diffStats.commits ? `<span>${u.diffStats.commits} commit${u.diffStats.commits === 1 ? "" : "s"} by agent (included)</span>` : ""}
+      ${u.diffStats.truncated ? `<span>diff text truncated</span>` : ""}
     </div>
     <div class="diff-block"><pre><code>${formatDiff(u.diff)}</code></pre></div>
   </div>
