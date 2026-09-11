@@ -70,8 +70,13 @@ function modelTimeMs(arm: ArmResult): number {
   return Math.max(0, arm.run.durationMs - toolTimeMs(arm));
 }
 
+// Unblocked calls are left out: they have their own section, and this list is
+// meant to show where the *rest* of the wall time went (tests, CI, shell).
 function slowestTools(toolCalls: ToolCall[], n: number): ToolCall[] {
-  return [...toolCalls].filter(tc => (tc.durationMs ?? 0) > 0).sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0)).slice(0, n);
+  return [...toolCalls]
+    .filter(tc => (tc.durationMs ?? 0) > 0 && toolCategory(tc) !== "Unblocked")
+    .sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0))
+    .slice(0, n);
 }
 
 function toolLabel(tc: ToolCall): string {
