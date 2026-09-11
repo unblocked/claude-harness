@@ -7,13 +7,16 @@ import { runClaude, createWorktree, removeWorktree } from "./claude.ts";
 import { printReport, writeJsonResult, writeHtmlReport } from "./report.ts";
 import { estimateCost, formatCost, formatDuration, log } from "./util.ts";
 
-function captureDiff(cwd: string): string {
+// Diff the worktree against the commit it started from. Comparing to the base
+// SHA (not the index) means work the agent committed — on the detached HEAD or
+// on a branch it created — still shows up; `git diff` alone reports "(no
+// changes)" the moment the agent runs `git commit`.
+function captureDiff(cwd: string, baseSha: string): string {
   try {
-    const staged = execSync("git diff --staged", { cwd, stdio: "pipe", maxBuffer: 2 * 1024 * 1024 }).toString();
-    const unstaged = execSync("git diff", { cwd, stdio: "pipe", maxBuffer: 2 * 1024 * 1024 }).toString();
+    const tracked = execSync(`git diff ${baseSha}`, { cwd, stdio: "pipe", maxBuffer: 2 * 1024 * 1024 }).toString();
     const untracked = execSync("git ls-files --others --exclude-standard", { cwd, stdio: "pipe" }).toString().trim();
 
-    let diff = staged + unstaged;
+    let diff = tracked;
 
     if (untracked) {
       for (const file of untracked.split("\n").filter(Boolean)) {
@@ -31,7 +34,15 @@ function captureDiff(cwd: string): string {
   }
 }
 
-function parseDiffStats(diff: string): DiffStats {
+function countCommits(cwd: string, baseSha: string): number {
+  try {
+    return parseInt(execSync(`git rev-list --count ${baseSha}..HEAD`, { cwd, stdio: "pipe" }).toString().trim(), 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function parseDiffStats(diff: string, commits: number): DiffStats {
   let filesChanged = 0;
   let linesAdded = 0;
   let linesRemoved = 0;
@@ -42,7 +53,7 @@ function parseDiffStats(diff: string): DiffStats {
     else if (line.startsWith("-") && !line.startsWith("---")) linesRemoved++;
   }
 
-  return { filesChanged, linesAdded, linesRemoved };
+  return { filesChanged, linesAdded, linesRemoved, commits };
 }
 
 function extractUnblockedCalls(toolCalls: { name: string; args: Record<string, unknown>; mcpServer?: string }[]): UnblockedCall[] {
@@ -72,7 +83,7 @@ function extractUnblockedCalls(toolCalls: { name: string; args: Record<string, u
   return calls;
 }
 
-const BASELINE_NUDGE = `IMPORTANT: Do NOT use any Unblocked tools, skills, or CLI commands. Do NOT call context_research, context_get_urls, or any tool with "unblocked" in its name. Do NOT run the "unblocked" CLI binary. You may use all other tools, MCP servers, plugins, and skills.
+const BASELINE_NUDGE = `IMPORTANT: Do NOT use any Unblocked tools, Unblocked skills, or Unblocked CLI commands. Do NOT call context_research, context_get_urls, or any tool with "unblocked" in its name. Do NOT run the "unblocked" CLI binary. You may use all other tools, MCP servers, plugins, and skills.
 
 TASK:
 `;
@@ -119,8 +130,8 @@ async function runArm(config: Config, condition: Condition, outDir: string): Pro
   const wtName = `${condition}-${suffix}`;
 
   log(`[${condition}] Creating worktree: ${wtName}`);
-  const wtPath = createWorktree(config.repo, wtName, config.branch);
-  log(`[${condition}] Worktree at: ${wtPath}`);
+  const { path: wtPath, baseSha } = createWorktree(config.repo, wtName, config.branch);
+  log(`[${condition}] Worktree at: ${wtPath} (base ${baseSha.slice(0, 7)})`);
 
   log(`[${condition}] Running Claude Code...`);
   const runResult = await runClaude({
@@ -134,9 +145,10 @@ async function runArm(config: Config, condition: Condition, outDir: string): Pro
   });
   log(`[${condition}] Done: ${formatDuration(runResult.durationMs)}, ${runResult.assistantTurns} turns, exit=${runResult.exitCode}${runResult.timedOut ? " (TIMED OUT)" : ""}`);
 
-  const diff = captureDiff(wtPath);
-  const diffStats = parseDiffStats(diff);
-  log(`[${condition}] Diff: ${diffStats.filesChanged} files, +${diffStats.linesAdded} -${diffStats.linesRemoved}`);
+  const diff = captureDiff(wtPath, baseSha);
+  const commits = countCommits(wtPath, baseSha);
+  const diffStats = parseDiffStats(diff, commits);
+  log(`[${condition}] Diff: ${diffStats.filesChanged} files, +${diffStats.linesAdded} -${diffStats.linesRemoved}${commits ? ` (${commits} commit${commits === 1 ? "" : "s"} made by agent)` : ""}`);
 
   const unblockedCalls = extractUnblockedCalls(runResult.toolCalls);
   if (unblockedCalls.length > 0) {

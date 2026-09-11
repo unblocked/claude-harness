@@ -10,6 +10,8 @@ export interface ToolCall {
   name: string;
   args: Record<string, unknown>;
   timestamp: number;
+  // Wall time from tool_use to its tool_result; undefined if no result was seen.
+  durationMs?: number;
   isMcp: boolean;
   mcpServer?: string;
   model?: string;
@@ -19,6 +21,9 @@ export interface RunResult {
   durationMs: number;
   tokenUsage: TokenUsage;
   toolCalls: ToolCall[];
+  // Sum of toolCalls[].durationMs — time spent waiting on tools (tests, CI, MCP).
+  // durationMs - toolTimeMs is the model's own thinking/generation time.
+  toolTimeMs: number;
   assistantTurns: number;
   finalResponse: string;
   sessionId?: string;
@@ -38,6 +43,9 @@ export interface DiffStats {
   filesChanged: number;
   linesAdded: number;
   linesRemoved: number;
+  // Commits the agent made on top of the worktree base. The diff is taken
+  // against the base commit, so committed work is included either way.
+  commits: number;
 }
 
 export type Condition = "baseline" | "unblocked";
