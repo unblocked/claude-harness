@@ -12,6 +12,9 @@ export interface ToolCall {
   timestamp: number;
   // Wall time from tool_use to its tool_result; undefined if no result was seen.
   durationMs?: number;
+  // Issued by a subagent (the event carried parent_tool_use_id). Counted as a
+  // call, but excluded from tool-time so it isn't summed on top of the parent.
+  nested?: boolean;
   isMcp: boolean;
   mcpServer?: string;
   model?: string;
@@ -21,9 +24,6 @@ export interface RunResult {
   durationMs: number;
   tokenUsage: TokenUsage;
   toolCalls: ToolCall[];
-  // Sum of toolCalls[].durationMs — time spent waiting on tools (tests, CI, MCP).
-  // durationMs - toolTimeMs is the model's own thinking/generation time.
-  toolTimeMs: number;
   assistantTurns: number;
   finalResponse: string;
   sessionId?: string;
@@ -31,9 +31,6 @@ export interface RunResult {
   timedOut: boolean;
   jsonlPath: string;
   worktreePath: string;
-  // Branches that existed before the worktree was created; anything new at
-  // cleanup time was made by the agent and is deleted with the worktree.
-  branchesBefore?: string[];
   totalCostUsd: number | null;
 }
 
@@ -49,6 +46,8 @@ export interface DiffStats {
   // Commits the agent made on top of the worktree base. The diff is taken
   // against the base commit, so committed work is included either way.
   commits: number;
+  // True when the diff text was too large to keep; the counts above still hold.
+  truncated?: boolean;
 }
 
 export type Condition = "baseline" | "unblocked";

@@ -1,10 +1,11 @@
-import { spawn, execSync, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
 import type { Condition, RunResult, TokenUsage, ToolCall } from "./types.ts";
 import { log } from "./util.ts";
+import { git, tryGit } from "./git.ts";
 
 const BINARY = process.env.CLAUDE_BINARY ?? "claude";
 
@@ -27,7 +28,6 @@ interface ContentBlock {
 interface ParsedStream {
   tokenUsage: TokenUsage;
   toolCalls: ToolCall[];
-  toolTimeMs: number;
   assistantTurns: number;
   finalResponse: string;
   sessionId?: string;
@@ -56,7 +56,6 @@ export function parseStreamJson(jsonl: string): ParsedStream {
   const toolCalls: ToolCall[] = [];
   // tool_use id -> the ToolCall awaiting its tool_result, so we can attribute wall time.
   const pending = new Map<string, ToolCall>();
-  let toolTimeMs = 0;
   let assistantTurns = 0;
   let finalResponse = "";
   let sessionId: string | undefined;
@@ -78,7 +77,6 @@ export function parseStreamJson(jsonl: string): ParsedStream {
         pending.delete(block.tool_use_id);
         if (!Number.isNaN(eventMs) && call.timestamp > 0) {
           call.durationMs = Math.max(0, eventMs - call.timestamp);
-          toolTimeMs += call.durationMs;
         }
       }
     }
@@ -99,6 +97,7 @@ export function parseStreamJson(jsonl: string): ParsedStream {
             isMcp,
             mcpServer,
             model: typeof e.message?.model === "string" ? e.message.model : undefined,
+            nested: typeof e.parent_tool_use_id === "string" ? true : undefined,
           };
           toolCalls.push(call);
           if (block.id) pending.set(block.id, call);
@@ -138,7 +137,7 @@ export function parseStreamJson(jsonl: string): ParsedStream {
     }
   }
 
-  return { tokenUsage: usage, toolCalls, toolTimeMs, assistantTurns, finalResponse, sessionId, totalCostUsd };
+  return { tokenUsage: usage, toolCalls, assistantTurns, finalResponse, sessionId, totalCostUsd };
 }
 
 function isUnblockedTool(name: string): boolean {
@@ -158,52 +157,51 @@ export function worktreePath(repoPath: string, name: string): string {
   return path.join(WORKTREE_BASE, repoName, name);
 }
 
-// Local branch names in the repo. Branches are shared across worktrees, so
-// anything the agent creates in its worktree lands here and outlives the
-// worktree unless we delete it. Returns null (never an empty list) on
-// failure: an empty "before" snapshot would make cleanup delete everything.
-export function listBranches(repoPath: string): string[] | null {
-  try {
-    const out = execFileSync("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads"], { cwd: repoPath, stdio: "pipe" })
-      .toString().split("\n").map(s => s.trim()).filter(Boolean);
-    return out;
-  } catch {
-    return null;
-  }
-}
-
-export function createWorktree(repoPath: string, name: string, branch: string): { path: string; baseSha: string; branchesBefore: string[] | undefined } {
+export function createWorktree(repoPath: string, name: string, branch: string): { path: string; baseSha: string } {
   const wtPath = worktreePath(repoPath, name);
   fs.mkdirSync(path.dirname(wtPath), { recursive: true });
-  const branchesBefore = listBranches(repoPath) ?? undefined;
-  execSync(`git worktree add --detach "${wtPath}" "${branch}"`, { cwd: repoPath, stdio: "pipe" });
-  const baseSha = execSync("git rev-parse HEAD", { cwd: wtPath, stdio: "pipe" }).toString().trim();
-  return { path: wtPath, baseSha, branchesBefore };
+  git(repoPath, ["worktree", "add", "--detach", wtPath, branch]);
+  const baseSha = git(wtPath, ["rev-parse", "HEAD"]).trim();
+  return { path: wtPath, baseSha };
 }
 
-// Removes the worktree and any branches the agent created while it ran.
-// Only branches absent from `branchesBefore` are touched, and only after the
-// diff has been captured, so nothing the user had is deleted. Skipped entirely
-// under --keep-worktrees (this function isn't called).
-export function removeWorktree(repoPath: string, name: string, branchesBefore?: string[]): void {
-  const wtPath = worktreePath(repoPath, name);
-  try {
-    execSync(`git worktree remove --force "${wtPath}"`, { cwd: repoPath, stdio: "pipe" });
-  } catch {
-    try { execSync("git worktree prune", { cwd: repoPath, stdio: "pipe" }); } catch {}
+// Branch names the worktree's HEAD ever pointed at, from its own reflog
+// ("checkout: moving from A to B"). Read before the worktree is removed, since
+// the reflog goes with it. Only the agent could have moved this HEAD, so this
+// is the set of branches it touched — nothing the user did elsewhere is here.
+function branchesVisitedByWorktree(wtPath: string): Set<string> {
+  const visited = new Set<string>();
+  const out = tryGit(wtPath, ["reflog", "show", "--format=%gs", "HEAD"], "reading worktree reflog for cleanup");
+  for (const line of (out ?? "").split("\n")) {
+    const m = line.match(/^checkout: moving from (\S+) to (\S+)$/);
+    if (m) { visited.add(m[1]); visited.add(m[2]); }
   }
-  // No snapshot (or an empty one) means we can't tell what the agent added — leave branches alone.
-  if (!branchesBefore || branchesBefore.length === 0) return;
-  const before = new Set(branchesBefore);
-  const after = listBranches(repoPath);
-  if (!after) return;
-  for (const b of after) {
-    if (before.has(b)) continue;
-    try {
-      execFileSync("git", ["branch", "-D", b], { cwd: repoPath, stdio: "pipe" });
+  return visited;
+}
+
+// Removes the worktree, then any branch the agent created in it: a branch that
+// did not exist when the run started AND that this worktree's HEAD actually
+// checked out. Both conditions are required, so a branch the user made in their
+// own checkout while the run was in progress is never touched, and neither is
+// a pre-existing branch the agent merely looked at. Runs after the diff is
+// captured. Not called under --keep-worktrees.
+export function removeWorktree(repoPath: string, name: string, refsBefore: Map<string, string> | null): void {
+  const wtPath = worktreePath(repoPath, name);
+  const visited = fs.existsSync(wtPath) ? branchesVisitedByWorktree(wtPath) : new Set<string>();
+
+  if (tryGit(repoPath, ["worktree", "remove", "--force", wtPath], `removing worktree ${name}`) === null) {
+    tryGit(repoPath, ["worktree", "prune"], "pruning worktrees");
+  }
+
+  if (!refsBefore) {
+    log(`Skipping branch cleanup for ${name}: no ref snapshot from run start`);
+    return;
+  }
+  for (const b of visited) {
+    if (refsBefore.has(`refs/heads/${b}`)) continue; // existed before the run: not ours to delete
+    if (tryGit(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${b}`], `checking branch ${b}`) === null) continue; // not a local branch (detached sha, or already gone)
+    if (tryGit(repoPath, ["branch", "-D", b], `deleting agent-created branch ${b}`) !== null) {
       log(`Deleted agent-created branch: ${b}`);
-    } catch {
-      log(`Could not delete agent-created branch ${b} (checked out elsewhere?)`);
     }
   }
 }
@@ -378,7 +376,6 @@ export async function runClaude(opts: {
     durationMs: Date.now() - started,
     tokenUsage: parsed.tokenUsage,
     toolCalls: parsed.toolCalls,
-    toolTimeMs: parsed.toolTimeMs,
     assistantTurns: parsed.assistantTurns,
     finalResponse: parsed.finalResponse,
     sessionId: parsed.sessionId,
