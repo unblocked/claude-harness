@@ -7,17 +7,57 @@ import { runClaude, createWorktree, removeWorktree } from "./claude.ts";
 import { printReport, writeJsonResult, writeHtmlReport } from "./report.ts";
 import { estimateCost, formatCost, formatDuration, log } from "./util.ts";
 
-// Diff the worktree against the commit it started from. Comparing to the base
-// SHA (not the index) means work the agent committed — on the detached HEAD or
-// on a branch it created — still shows up; `git diff` alone reports "(no
-// changes)" the moment the agent runs `git commit`.
-function captureDiff(cwd: string, baseSha: string): string {
+function git(cwd: string, args: string): string {
+  return execSync(`git ${args}`, { cwd, stdio: "pipe", maxBuffer: 2 * 1024 * 1024 }).toString();
+}
+
+function isAncestor(cwd: string, ancestor: string, sha: string): boolean {
+  try { execSync(`git merge-base --is-ancestor ${ancestor} ${sha}`, { cwd, stdio: "pipe" }); return true; } catch { return false; }
+}
+
+// The commit holding the agent's work. Usually HEAD — but an agent that commits
+// on a branch and then checks out something else (or `reset --hard`s) leaves
+// HEAD back at the base, and a plain `git diff base` sees nothing. The
+// worktree's HEAD reflog remembers every commit HEAD pointed at, so pick the
+// descendant of the base that is furthest ahead of it.
+export function findAgentTip(cwd: string, baseSha: string): { sha: string; commits: number } {
+  const candidates = new Set<string>();
+  try { candidates.add(git(cwd, "rev-parse HEAD").trim()); } catch {}
   try {
-    const tracked = execSync(`git diff ${baseSha}`, { cwd, stdio: "pipe", maxBuffer: 2 * 1024 * 1024 }).toString();
-    const untracked = execSync("git ls-files --others --exclude-standard", { cwd, stdio: "pipe" }).toString().trim();
+    for (const sha of git(cwd, "reflog show --format=%H HEAD").split("\n")) {
+      if (sha.trim()) candidates.add(sha.trim());
+    }
+  } catch {}
 
-    let diff = tracked;
+  let best = { sha: baseSha, commits: 0 };
+  for (const sha of candidates) {
+    if (sha === baseSha || !isAncestor(cwd, baseSha, sha)) continue;
+    const commits = parseInt(git(cwd, `rev-list --count ${baseSha}..${sha}`).trim(), 10) || 0;
+    if (commits > best.commits) best = { sha, commits };
+  }
+  return best;
+}
 
+// Everything the agent changed relative to the commit the worktree started
+// from: commits it made (found via findAgentTip, wherever HEAD ended up) plus
+// whatever is still uncommitted in the working tree, plus untracked files.
+export function captureDiff(cwd: string, baseSha: string): { diff: string; commits: number } {
+  try {
+    const tip = findAgentTip(cwd, baseSha);
+    const head = git(cwd, "rev-parse HEAD").trim();
+
+    let diff = "";
+    if (head === tip.sha) {
+      // Normal case: HEAD is where the work is. One diff covers commits + working tree.
+      diff += git(cwd, `diff ${baseSha}`);
+    } else {
+      // Agent moved HEAD away from its work. Committed work from the reflog tip,
+      // then anything uncommitted on top of wherever HEAD is now.
+      if (tip.commits > 0) diff += git(cwd, `diff ${baseSha} ${tip.sha}`);
+      diff += git(cwd, "diff HEAD");
+    }
+
+    const untracked = git(cwd, "ls-files --others --exclude-standard").trim();
     if (untracked) {
       for (const file of untracked.split("\n").filter(Boolean)) {
         const result = spawnSync("git", ["diff", "--no-index", "/dev/null", file], {
@@ -28,17 +68,9 @@ function captureDiff(cwd: string, baseSha: string): string {
       }
     }
 
-    return diff || "(no changes)";
+    return { diff: diff || "(no changes)", commits: tip.commits };
   } catch {
-    return "(failed to capture diff)";
-  }
-}
-
-function countCommits(cwd: string, baseSha: string): number {
-  try {
-    return parseInt(execSync(`git rev-list --count ${baseSha}..HEAD`, { cwd, stdio: "pipe" }).toString().trim(), 10) || 0;
-  } catch {
-    return 0;
+    return { diff: "(failed to capture diff)", commits: 0 };
   }
 }
 
@@ -130,7 +162,7 @@ async function runArm(config: Config, condition: Condition, outDir: string): Pro
   const wtName = `${condition}-${suffix}`;
 
   log(`[${condition}] Creating worktree: ${wtName}`);
-  const { path: wtPath, baseSha } = createWorktree(config.repo, wtName, config.branch);
+  const { path: wtPath, baseSha, branchesBefore } = createWorktree(config.repo, wtName, config.branch);
   log(`[${condition}] Worktree at: ${wtPath} (base ${baseSha.slice(0, 7)})`);
 
   log(`[${condition}] Running Claude Code...`);
@@ -145,8 +177,7 @@ async function runArm(config: Config, condition: Condition, outDir: string): Pro
   });
   log(`[${condition}] Done: ${formatDuration(runResult.durationMs)}, ${runResult.assistantTurns} turns, exit=${runResult.exitCode}${runResult.timedOut ? " (TIMED OUT)" : ""}`);
 
-  const diff = captureDiff(wtPath, baseSha);
-  const commits = countCommits(wtPath, baseSha);
+  const { diff, commits } = captureDiff(wtPath, baseSha);
   const diffStats = parseDiffStats(diff, commits);
   log(`[${condition}] Diff: ${diffStats.filesChanged} files, +${diffStats.linesAdded} -${diffStats.linesRemoved}${commits ? ` (${commits} commit${commits === 1 ? "" : "s"} made by agent)` : ""}`);
 
@@ -157,7 +188,7 @@ async function runArm(config: Config, condition: Condition, outDir: string): Pro
 
   const cost = runResult.totalCostUsd ?? estimateCost(config.model, runResult.tokenUsage);
 
-  return { condition, run: { ...runResult, worktreePath: wtPath }, diff, diffStats, unblockedCalls, estimatedCost: cost };
+  return { condition, run: { ...runResult, worktreePath: wtPath, branchesBefore }, diff, diffStats, unblockedCalls, estimatedCost: cost };
 }
 
 export async function run(config: Config): Promise<ComparisonResult> {
@@ -181,13 +212,9 @@ export async function run(config: Config): Promise<ComparisonResult> {
   } finally {
     if (!config.keepWorktrees) {
       log("Cleaning up worktrees...");
-      if (baseline!) {
-        const wtName = path.basename(baseline.run.worktreePath);
-        removeWorktree(config.repo, wtName);
-      }
-      if (unblocked!) {
-        const wtName = path.basename(unblocked.run.worktreePath);
-        removeWorktree(config.repo, wtName);
+      for (const arm of [baseline!, unblocked!]) {
+        if (!arm) continue;
+        removeWorktree(config.repo, path.basename(arm.run.worktreePath), arm.run.branchesBefore);
       }
     }
   }

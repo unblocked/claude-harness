@@ -1,4 +1,4 @@
-import { spawn, execSync } from "node:child_process";
+import { spawn, execSync, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -158,20 +158,53 @@ export function worktreePath(repoPath: string, name: string): string {
   return path.join(WORKTREE_BASE, repoName, name);
 }
 
-export function createWorktree(repoPath: string, name: string, branch: string): { path: string; baseSha: string } {
-  const wtPath = worktreePath(repoPath, name);
-  fs.mkdirSync(path.dirname(wtPath), { recursive: true });
-  execSync(`git worktree add --detach "${wtPath}" "${branch}"`, { cwd: repoPath, stdio: "pipe" });
-  const baseSha = execSync("git rev-parse HEAD", { cwd: wtPath, stdio: "pipe" }).toString().trim();
-  return { path: wtPath, baseSha };
+// Local branch names in the repo. Branches are shared across worktrees, so
+// anything the agent creates in its worktree lands here and outlives the
+// worktree unless we delete it. Returns null (never an empty list) on
+// failure: an empty "before" snapshot would make cleanup delete everything.
+export function listBranches(repoPath: string): string[] | null {
+  try {
+    const out = execFileSync("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads"], { cwd: repoPath, stdio: "pipe" })
+      .toString().split("\n").map(s => s.trim()).filter(Boolean);
+    return out;
+  } catch {
+    return null;
+  }
 }
 
-export function removeWorktree(repoPath: string, name: string): void {
+export function createWorktree(repoPath: string, name: string, branch: string): { path: string; baseSha: string; branchesBefore: string[] | undefined } {
+  const wtPath = worktreePath(repoPath, name);
+  fs.mkdirSync(path.dirname(wtPath), { recursive: true });
+  const branchesBefore = listBranches(repoPath) ?? undefined;
+  execSync(`git worktree add --detach "${wtPath}" "${branch}"`, { cwd: repoPath, stdio: "pipe" });
+  const baseSha = execSync("git rev-parse HEAD", { cwd: wtPath, stdio: "pipe" }).toString().trim();
+  return { path: wtPath, baseSha, branchesBefore };
+}
+
+// Removes the worktree and any branches the agent created while it ran.
+// Only branches absent from `branchesBefore` are touched, and only after the
+// diff has been captured, so nothing the user had is deleted. Skipped entirely
+// under --keep-worktrees (this function isn't called).
+export function removeWorktree(repoPath: string, name: string, branchesBefore?: string[]): void {
   const wtPath = worktreePath(repoPath, name);
   try {
     execSync(`git worktree remove --force "${wtPath}"`, { cwd: repoPath, stdio: "pipe" });
   } catch {
     try { execSync("git worktree prune", { cwd: repoPath, stdio: "pipe" }); } catch {}
+  }
+  // No snapshot (or an empty one) means we can't tell what the agent added — leave branches alone.
+  if (!branchesBefore || branchesBefore.length === 0) return;
+  const before = new Set(branchesBefore);
+  const after = listBranches(repoPath);
+  if (!after) return;
+  for (const b of after) {
+    if (before.has(b)) continue;
+    try {
+      execFileSync("git", ["branch", "-D", b], { cwd: repoPath, stdio: "pipe" });
+      log(`Deleted agent-created branch: ${b}`);
+    } catch {
+      log(`Could not delete agent-created branch ${b} (checked out elsewhere?)`);
+    }
   }
 }
 

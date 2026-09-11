@@ -31,6 +31,9 @@ export interface RunResult {
   timedOut: boolean;
   jsonlPath: string;
   worktreePath: string;
+  // Branches that existed before the worktree was created; anything new at
+  // cleanup time was made by the agent and is deleted with the worktree.
+  branchesBefore?: string[];
   totalCostUsd: number | null;
 }
 
