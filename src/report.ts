@@ -18,11 +18,36 @@ function divider(): string {
   return "╠" + "═".repeat(W + 2) + "╣";
 }
 
+// Shell commands that write files. Agents sometimes bypass Edit/Write and
+// patch code through `python3 - <<'PY' ... write_text(...)`, `cat > f <<EOF`,
+// `sed -i`, etc.; without this, such an arm shows "Edit: 0" beside a real diff.
+// Deliberately narrow: an earlier, looser version matched `2>/dev/null` and
+// `=>` inside grep patterns and flagged ~125 read-only commands across the
+// saved transcripts. This one flags 16 of 701, all genuine.
+const BASH_WRITE_RE = new RegExp([
+  String.raw`(?:^|[\s;&|(])cat\s*>{1,2}\s*[^\s&|;>]+\s*<<`,                                                  // cat > file <<EOF
+  String.raw`(?:python3?|ruby|node|perl)\s+-\s*<<[\s\S]*?(?:write_text\(|\.write\(|open\([^)]*["'][wa]|writeFileSync|File\.write|IO\.write)`, // inline script that writes
+  String.raw`\bsed\s+(?:-[a-zA-Z]*\s+)*-i\b`,                                                               // sed -i
+  String.raw`\bperl\s+-p?i\b`,
+  String.raw`\btee\s+(?:-a\s+)?(?!/dev/)[\w./-]+`,                                                          // tee file
+  String.raw`\bgit\s+apply\b`,
+  String.raw`(?:^|[\s;&|])patch\s+(?:-p\d\s+)?[<\w]`,
+  String.raw`(?:^|[^\w<>=&$])>{1,2}\s*(?!/dev/|&)['"]?[\w./~-]+`,                                             // echo x > file; not 2>, =>, >&, /dev/null
+].join("|"), "m");
+
+function bashWritesFiles(cmd: string): boolean {
+  return BASH_WRITE_RE.test(cmd);
+}
+
 function toolCategory(tc: ToolCall): string {
   if (tc.isMcp) {
     return tc.mcpServer?.toLowerCase().includes("unblocked") ? "Unblocked" : `MCP:${tc.mcpServer}`;
   }
-  if (tc.name === "Bash" && /^unblocked\s+/.test((tc.args.command as string) ?? "")) return "Unblocked";
+  if (tc.name === "Bash") {
+    const cmd = (tc.args.command as string) ?? "";
+    if (/^unblocked\s+/.test(cmd)) return "Unblocked";
+    return bashWritesFiles(cmd) ? "Bash (writes files)" : "Bash";
+  }
   return tc.name;
 }
 
@@ -813,7 +838,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     </div>
     ${[["Baseline", b], ["Unblocked", u]].filter(([, a]) => shellOnlyEdits(a as ArmResult)).map(([n, a]) => `
     <div style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">
-      ${n} changed ${(a as ArmResult).diffStats.filesChanged} file${(a as ArmResult).diffStats.filesChanged === 1 ? "" : "s"} without any Edit/Write call — all edits went through shell commands. The diff below is the ground truth.
+      ${n} changed ${(a as ArmResult).diffStats.filesChanged} file${(a as ArmResult).diffStats.filesChanged === 1 ? "" : "s"} without any Edit/Write call — see "Bash (writes files)" for the shell commands that did it. The diff below is the ground truth.
     </div>`).join("")}
   </div>
 
