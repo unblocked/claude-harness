@@ -8,6 +8,7 @@ import { printReport, writeJsonResult, writeHtmlReport } from "./report.ts";
 import { estimateCost, formatCost, formatDiffSummary, formatDuration, log } from "./util.ts";
 import { commitsBetween, git, isAncestor, refsContaining, snapshotRefs, tryGit } from "./git.ts";
 import { attribute } from "./attribution.ts";
+import { assessQuality } from "./quality.ts";
 
 // The most recent commit in this worktree's HEAD reflog that descends from the
 // base and is not already part of history that existed before the run. Used only
@@ -268,6 +269,10 @@ export async function run(config: Config): Promise<ComparisonResult> {
     totalDurationMs: Date.now() - startTime,
     totalEstimatedCost: baseline.estimatedCost + unblocked.estimatedCost,
   };
+  if (config.analystModel) {
+    const q = assessQuality(result, config.analystModel);
+    if (q) result.quality = q;
+  }
 
   printReport(result);
   writeJsonResult(result, outDir);

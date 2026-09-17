@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import type { Attribution, AttributionTotals, TurnLabel } from "./types.ts";
+import type { AttributedTurn, Attribution, AttributionTotals, TurnLabel } from "./types.ts";
 import { costAt, formatCost, formatDuration, log, priceFor } from "./util.ts";
 
 // Per-turn attribution: an analyst model labels every assistant turn as task
@@ -16,8 +16,11 @@ export interface WalkTurn {
   turn: number;
   text: string;
   tools: WalkTool[];
+  startMs: number;
   costUsd: number;
   durationMs: number;
+  outputTokens: number;
+  cacheReadTokens: number;
 }
 
 const VERIFY_CMD = /\b(rspec|bin\/ci|npm (test|run test)|go test|go vet|gofmt|rubocop|tsc|pytest|jest|make (test|check)|cargo test|mvn|gradle)\b/;
@@ -64,7 +67,10 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
         inputTokens: u.input_tokens ?? 0, outputTokens: u.output_tokens ?? 0,
         cacheReadTokens: u.cache_read_input_tokens ?? 0, cacheCreationTokens: u.cache_creation_input_tokens ?? 0,
       });
-      const turn: WalkTurn & { ts: number; rawCost: number } = { turn: turns.length + 1, text: "", tools: [], costUsd: 0, durationMs: 0, ts, rawCost };
+      const turn: WalkTurn & { ts: number; rawCost: number } = {
+        turn: turns.length + 1, text: "", tools: [], startMs: Number.isNaN(ts) ? 0 : ts, costUsd: 0, durationMs: 0,
+        outputTokens: u.output_tokens ?? 0, cacheReadTokens: u.cache_read_input_tokens ?? 0, ts, rawCost,
+      };
       for (const block of e.message?.content ?? []) {
         if (block.type === "text" && block.text) turn.text += excerpt(block.text, 200) + " ";
         if (block.type === "tool_use" && block.name) {
@@ -211,21 +217,22 @@ export function classifyTurns(walk: WalkTurn[], task: string, model: string): { 
   return { labels, analystCostUsd: cost, modelUsed };
 }
 
-function totals(rows: { costUsd: number; durationMs: number }[]): AttributionTotals {
-  return { costUsd: rows.reduce((a, r) => a + r.costUsd, 0), durationMs: rows.reduce((a, r) => a + r.durationMs, 0), turns: rows.length };
+function totals(rows: AttributedTurn[]): AttributionTotals {
+  const sum = (f: (r: AttributedTurn) => number) => rows.reduce((a, r) => a + f(r), 0);
+  return { costUsd: sum(r => r.costUsd), durationMs: sum(r => r.durationMs), turns: rows.length, outputTokens: sum(r => r.outputTokens), cacheReadTokens: sum(r => r.cacheReadTokens) };
 }
 
 export function rollup(walk: WalkTurn[], labels: TurnLabel[], analystModel: string, analystCostUsd: number): Attribution {
   const byTurn = new Map(labels.map(l => [l.turn, l]));
-  const rows = walk.map(t => {
+  const rows: AttributedTurn[] = walk.map(t => {
     const l = byTurn.get(t.turn) ?? { turn: t.turn, label: "work" as const, repeatOf: null, reason: "(unlabelled by analyst; counted as work)" };
-    const summary = t.tools.length ? t.tools.map(x => `${x.name} ${x.args}`).join("; ").slice(0, 160) : (t.text.slice(0, 160) || "(empty turn)");
-    return { ...l, costUsd: t.costUsd, durationMs: t.durationMs, summary };
+    const summary = t.tools.length ? t.tools.map(x => `${x.name} ${x.args}`).join("; ").slice(0, 160) : (t.text.slice(0, 160) || "(thinking only)");
+    return { ...l, startMs: t.startMs, costUsd: t.costUsd, durationMs: t.durationMs, outputTokens: t.outputTokens, cacheReadTokens: t.cacheReadTokens, summary };
   });
   const housekeeping = rows.filter(r => r.label === "housekeeping");
-  const kept = rows.filter(r => r.label !== "housekeeping");
-  const taskCompleteTurn = rows.filter(r => r.label !== "housekeeping" && r.repeatOf == null).reduce((m, r) => Math.max(m, r.turn), 0);
-  return { analystModel, analystCostUsd, taskCompleteTurn, raw: totals(rows), throughTask: totals(kept), housekeeping: totals(housekeeping), turns: rows };
+  const core = rows.filter(r => r.label !== "housekeeping");
+  const taskCompleteTurn = core.filter(r => r.repeatOf == null).reduce((m, r) => Math.max(m, r.turn), 0);
+  return { analystModel, analystCostUsd, taskCompleteTurn, raw: totals(rows), core: totals(core), housekeeping: totals(housekeeping), turns: rows };
 }
 
 export function attribute(jsonlPath: string, task: string, totalCostUsd: number | null, model: string, tag: string): Attribution | null {
@@ -235,6 +242,6 @@ export function attribute(jsonlPath: string, task: string, totalCostUsd: number 
   const res = classifyTurns(walk, task, model);
   if (!res) return null;
   const a = rollup(walk, res.labels, res.modelUsed, res.analystCostUsd);
-  log(`[${tag}] Attribution: ${a.housekeeping.turns} housekeeping turns = ${formatCost(a.housekeeping.costUsd)} / ${formatDuration(a.housekeeping.durationMs)}; through task: ${formatCost(a.throughTask.costUsd)} / ${formatDuration(a.throughTask.durationMs)} (analyst ${formatCost(res.analystCostUsd)})`);
+  log(`[${tag}] Attribution: core ${formatCost(a.core.costUsd)} / ${formatDuration(a.core.durationMs)} (${a.core.turns} turns); housekeeping ${formatCost(a.housekeeping.costUsd)} / ${formatDuration(a.housekeeping.durationMs)} (${a.housekeeping.turns} turns); analyst ${formatCost(res.analystCostUsd)} via ${res.modelUsed}`);
   return a;
 }

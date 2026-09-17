@@ -11,6 +11,7 @@ import { parseStreamJson } from "../src/claude.ts";
 import { printReport, writeHtmlReport, writeJsonResult } from "../src/report.ts";
 import { estimateCost } from "../src/util.ts";
 import { attribute } from "../src/attribution.ts";
+import { assessQuality } from "../src/quality.ts";
 import type { ArmResult, ComparisonResult, Condition, UnblockedCall } from "../src/types.ts";
 
 interface InitInfo { cwd?: string; model?: string }
@@ -113,6 +114,11 @@ const result: ComparisonResult = {
   totalDurationMs: Math.max(baseline.run.durationMs, unblocked.run.durationMs),
   totalEstimatedCost: baseline.estimatedCost + unblocked.estimatedCost,
 };
+
+if (analystModel) {
+  const q = assessQuality(result, analystModel);
+  if (q) result.quality = q;
+}
 
 const outDir = path.join(process.cwd(), "results", "regenerated");
 fs.mkdirSync(outDir, { recursive: true });
