@@ -1,5 +1,5 @@
 // Generate a comparison report from two existing stream-json transcripts.
-// Usage: bun scripts/report_from_jsonl.ts <baseline.jsonl> <unblocked.jsonl> [result.json | model] [branch] [task] [--attribute[=model]] [--rejudge]
+// Usage: bun scripts/report_from_jsonl.ts <baseline.jsonl> <unblocked.jsonl> [result.json | model] [branch] [task] [--attribute[=model]] [--rejudge] [--impact[=model]]
 // Token usage and tool calls are always re-parsed from the transcripts. The
 // task prompt, branch, and code diffs are not recorded in stream-json output:
 // pass the run's original result.json (third argument, detected by .json
@@ -12,6 +12,7 @@ import { printReport, writeHtmlReport, writeJsonResult } from "../src/report.ts"
 import { estimateCost } from "../src/util.ts";
 import { attribute } from "../src/attribution.ts";
 import { assessQuality } from "../src/quality.ts";
+import { assessImpact } from "../src/impact.ts";
 import type { ArmResult, ComparisonResult, Condition, UnblockedCall } from "../src/types.ts";
 
 interface InitInfo { cwd?: string; model?: string }
@@ -94,10 +95,12 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
 // --attribute[=model] recomputes per-message attribution; --rejudge re-runs the
 // quality judge (same model, default opus). Only these flags are stripped from
 // argv, so a "--flag" inside a free-text task argument survives.
-const KNOWN = /^--(attribute(=.*)?|rejudge)$/;
+// --impact[=model] (re)runs the context-impact assessment.
+const KNOWN = /^--(attribute(=.*)?|rejudge|impact(=.*)?)$/;
 const attrFlag = process.argv.find(a => /^--attribute(=|$)/.test(a));
+const impactFlag = process.argv.find(a => /^--impact(=|$)/.test(a));
 const rejudge = process.argv.includes("--rejudge");
-const analystModel = attrFlag ? (attrFlag.split("=")[1] || "opus") : (rejudge ? "opus" : null);
+const analystModel = attrFlag ? (attrFlag.split("=")[1] || "opus") : impactFlag ? (impactFlag.split("=")[1] || "opus") : (rejudge ? "opus" : null);
 const [,, baseFile, ubFile, thirdArg, branchArg, ...taskArg] = process.argv.filter(a => !KNOWN.test(a));
 const orig: ComparisonResult | undefined = thirdArg?.endsWith(".json")
   ? JSON.parse(fs.readFileSync(thirdArg, "utf8"))
@@ -137,7 +140,10 @@ if (orig?.quality && !rejudge) {
   if (q) result.quality = q;
 }
 
-result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0);
+if (orig?.impact && !impactFlag) result.impact = orig.impact;
+else if (analystModel && impactFlag) { const im = assessImpact(result, analystModel); if (im) result.impact = im; }
+
+result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0);
 
 const outDir = path.join(process.cwd(), "results", "regenerated");
 fs.mkdirSync(outDir, { recursive: true });

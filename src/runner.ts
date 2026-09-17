@@ -9,6 +9,7 @@ import { estimateCost, formatCost, formatDiffSummary, formatDuration, log } from
 import { git, isAncestor, snapshotRefs, tryGit } from "./git.ts";
 import { attribute } from "./attribution.ts";
 import { assessQuality } from "./quality.ts";
+import { assessImpact } from "./impact.ts";
 
 // The commits the agent made: everything reachable from any commit this
 // worktree's HEAD ever pointed at (its reflog, plus HEAD now) that was not
@@ -291,8 +292,10 @@ export async function run(config: Config): Promise<ComparisonResult> {
   if (config.analystModel) {
     const q = assessQuality(result, config.analystModel);
     if (q) result.quality = q;
+    const im = assessImpact(result, config.analystModel);
+    if (im) result.impact = im;
   }
-  result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0);
+  result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0);
   log(`Experiment wall time ${formatDuration(Date.now() - startTime)} incl. analysis`);
 
   printReport(result);
