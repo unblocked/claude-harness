@@ -116,6 +116,8 @@ ${CRITERIA.map(c => `   - ${c.key}: ${c.text}`).join("\n")}
 
 Be even-handed. A larger diff is not better. More words are not better. A wrong answer stated confidently is worse than a right answer with caveats.
 
+In every string you write, refer to the agents only as "Agent A" and "Agent B" (possessive: "Agent A's"). Never a bare "A" or "B": those labels are replaced with real names afterwards, and a bare letter cannot be told apart from an article.
+
 =================== TASK ===================
 ${task}
 
@@ -150,13 +152,17 @@ export function assessQuality(result: ComparisonResult, model: string): QualityA
   const raw = res.data;
 
   const pick = <T>(row: { A: T; B: T }, c: Condition): T => (cond("A") === c ? row.A : row.B);
+  // Un-blind the prose: "Agent A" / "Agent B" become the arm names the reader knows.
+  const nameOf = (l: "A" | "B") => (cond(l) === "baseline" ? "Baseline" : "Unblocked");
+  const unblind = (t: string) => t.replace(/\b[Aa]gent ([AB])\b/g, (_, l: "A" | "B") => nameOf(l));
+  const ub = <T extends Record<string, unknown>>(o: T): T => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === "string" ? unblind(v) : v])) as T;
   const q: QualityAssessment = {
     judgeModel: res.modelUsed,
     judgeCostUsd: res.costUsd,
-    requirements: raw.requirements.map(r => ({ requirement: r.requirement, baseline: pick(r, "baseline"), unblocked: pick(r, "unblocked") })),
-    criteria: raw.criteria.map(c => ({ criterion: c.key, baseline: pick(c, "baseline"), unblocked: pick(c, "unblocked") })),
-    findings: raw.findings.map(f => ({ arm: cond(f.arm), finding: f.finding, evidence: f.evidence })),
-    verdict: { better: raw.verdict.better === "tie" ? "tie" : cond(raw.verdict.better), rationale: raw.verdict.rationale },
+    requirements: raw.requirements.map(r => ({ requirement: unblind(r.requirement), baseline: ub(pick(r, "baseline")), unblocked: ub(pick(r, "unblocked")) })),
+    criteria: raw.criteria.map(c => ({ criterion: c.key, baseline: ub(pick(c, "baseline")), unblocked: ub(pick(c, "unblocked")) })),
+    findings: raw.findings.map(f => ({ arm: cond(f.arm), finding: unblind(f.finding), evidence: unblind(f.evidence) })),
+    verdict: { better: raw.verdict.better === "tie" ? "tie" : cond(raw.verdict.better), rationale: unblind(raw.verdict.rationale) },
   };
   log(`Quality: verdict ${q.verdict.better}; judge ${formatCost(q.judgeCostUsd)} via ${res.modelUsed}`);
   return q;
