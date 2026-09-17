@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import type { ArmResult, ComparisonResult, EconomicsBreakdown } from "./types.ts";
+import type { ArmResult, ComparisonResult, EconomicsBreakdown, ToolCall } from "./types.ts";
 import { priceFor } from "./util.ts";
 import { VERIFY_CMD } from "./analyst.ts";
 
@@ -48,10 +48,13 @@ function researchCarried(arm: ArmResult): { calls: number; payloadTokens: number
 }
 
 function toolWaitByCategory(arm: ArmResult): Record<string, number> {
-  // Wall time of tool calls by kind, using the per-call durations from the stream.
+  // Wall time of tool calls by kind, core messages only when attribution
+  // exists, so the per-kind rows add up to the core tool-wait headline.
+  const windows = arm.attribution?.turns.filter(t => t.label !== "housekeeping" && t.startMs > 0).map(t => [t.startMs, t.startMs + t.durationMs] as const);
+  const inCore = (tc: ToolCall) => !windows || windows.some(([s, e]) => tc.timestamp >= s && tc.timestamp < e);
   const out: Record<string, number> = {};
   for (const tc of arm.run.toolCalls) {
-    if (tc.nested || !(tc.durationMs ?? 0)) continue;
+    if (tc.nested || !(tc.durationMs ?? 0) || !inCore(tc)) continue;
     const cmd = String(tc.args.command ?? "");
     const kind = tc.isMcp ? (tc.mcpServer?.toLowerCase().includes("unblocked") ? "research" : "mcp")
       : tc.name !== "Bash" ? "file ops"
