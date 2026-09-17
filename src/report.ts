@@ -226,9 +226,9 @@ export function printReport(result: ComparisonResult): void {
       r("  1 · CORE TASK WORK  (information gathering, coding, testing — housekeeping removed)"),
       r(`  ${"─".repeat(W - 2)}`),
       r(`  ${padRight("Cost", 28)}${padLeft(formatCost(b.attribution.core.costUsd), 10)}  →  ${padLeft(formatCost(u.attribution.core.costUsd), 10)}  (${pctChange(b.attribution.core.costUsd, u.attribution.core.costUsd)})`),
-      r(`  ${padRight("Time", 28)}${padLeft(formatDuration(b.attribution.core.durationMs), 10)}  →  ${padLeft(formatDuration(u.attribution.core.durationMs), 10)}  (${pctChange(b.attribution.core.durationMs, u.attribution.core.durationMs)})`),
-      r(`  ${padRight("  model time", 28)}${padLeft(formatDuration(coreModelTimeMs(b)), 10)}  →  ${padLeft(formatDuration(coreModelTimeMs(u)), 10)}  (${pctChange(coreModelTimeMs(b), coreModelTimeMs(u))})`),
-      r(`  ${padRight("  tool time (tests, CI…)", 28)}${padLeft(formatDuration(coreToolTimeMs(b)), 10)}  →  ${padLeft(formatDuration(coreToolTimeMs(u)), 10)}  (${pctChange(coreToolTimeMs(b), coreToolTimeMs(u))})`),
+      r(`  ${padRight("Model time (headline)", 28)}${padLeft(formatDuration(coreModelTimeMs(b)), 10)}  →  ${padLeft(formatDuration(coreModelTimeMs(u)), 10)}  (${pctChange(coreModelTimeMs(b), coreModelTimeMs(u))})`),
+      r(`  ${padRight("  tool wait (variant)", 28)}${padLeft(formatDuration(coreToolTimeMs(b)), 10)}  →  ${padLeft(formatDuration(coreToolTimeMs(u)), 10)}  (${pctChange(coreToolTimeMs(b), coreToolTimeMs(u))})`),
+      r(`  ${padRight("  core total", 28)}${padLeft(formatDuration(b.attribution.core.durationMs), 10)}  →  ${padLeft(formatDuration(u.attribution.core.durationMs), 10)}  (${pctChange(b.attribution.core.durationMs, u.attribution.core.durationMs)})`),
       r(`  ${padRight("Output tokens", 28)}${padLeft(formatTokens(b.attribution.core.outputTokens), 10)}  →  ${padLeft(formatTokens(u.attribution.core.outputTokens), 10)}  (${pctChange(b.attribution.core.outputTokens, u.attribution.core.outputTokens)})`),
       r(`  ${padRight("Cache-read tokens", 28)}${padLeft(formatTokens(b.attribution.core.cacheReadTokens), 10)}  →  ${padLeft(formatTokens(u.attribution.core.cacheReadTokens), 10)}  (${pctChange(b.attribution.core.cacheReadTokens, u.attribution.core.cacheReadTokens)})`),
       r(`  ${padRight("Turns", 28)}${padLeft(String(b.attribution.core.turns), 10)}  →  ${padLeft(String(u.attribution.core.turns), 10)}  (${pctChange(b.attribution.core.turns, u.attribution.core.turns)})`),
@@ -252,6 +252,14 @@ export function printReport(result: ComparisonResult): void {
       r(`  ${padRight("Verdict", 28)}${result.quality.verdict.better} (${result.quality.verdict.confidence} confidence)`),
       ...result.quality.criteria.map(c => r(`  ${padRight("  " + c.criterion, 28)}${padLeft(String(c.baseline.score), 10)}  →  ${padLeft(String(c.unblocked.score), 10)}  / 5`)),
       r(`  ${padRight("Requirements met", 28)}${padLeft(result.quality.requirements.filter(x => x.baseline.status === "met").length + "/" + result.quality.requirements.length, 10)}  →  ${padLeft(result.quality.requirements.filter(x => x.unblocked.status === "met").length + "/" + result.quality.requirements.length, 10)}`),
+    ] : []),
+    ...(result.impact ? [
+      blank(),
+      r("  4 · CONTEXT IMPACT  (un-blinded)"),
+      r(`  ${"─".repeat(W - 2)}`),
+      r(`  ${padRight("Outcome / context role", 28)}${result.impact.impact.outcome} / ${result.impact.impact.contextRole}`),
+      r(`  ${padRight("Research calls", 28)}${result.impact.research.map(x => x.value).join(", ")}`),
+      r(`  ${padRight("Gaps", 28)}${result.impact.gaps.length}   Unused: ${result.impact.unused.length}`),
     ] : []),
   ];
 
@@ -875,29 +883,29 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   ${hasAttr ? `
   <div class="section">
     <div class="section-title">1 · Core task work</div>
-    <div class="section-note">Information gathering, writing code, running tests. The part of a run that context can influence and that repeats across runs. Housekeeping messages (section 2) are removed from both arms by the same rule.${(b.attribution!.outputExact && u.attribution!.outputExact) ? "" : " Per-message output tokens are shared out from the run total by content size (transcript recorded without --include-partial-messages); run totals are exact."}</div>
+    <div class="section-note">Information gathering, writing code, running tests. The part of a run that context can influence and that repeats across runs. Housekeeping messages (section 2) are removed from both arms by the same rule. Time is model time: waiting on tests and CI is shown but not in the headline, because how much to run is the agent's choice, not the context's.${(b.attribution!.outputExact && u.attribution!.outputExact) ? "" : " Per-message output tokens are shared out from the run total by content size (transcript recorded without --include-partial-messages); run totals are exact."}</div>
     <div class="hero-grid hero-3">
       ${heroCard("Cost", b.attribution!.core.costUsd, u.attribution!.core.costUsd, formatCost)}
-      ${hasCoreTiming ? heroCard("Time", b.attribution!.core.durationMs, u.attribution!.core.durationMs, formatDuration) : ""}
+      ${hasCoreTiming ? heroCard("Model time", coreModelTimeMs(b), coreModelTimeMs(u), formatDuration) : ""}
       ${heroCard("Output tokens", b.attribution!.core.outputTokens, u.attribution!.core.outputTokens, formatTokens)}
     </div>
     ${barPair("Cost", b.attribution!.core.costUsd, u.attribution!.core.costUsd, maxCost, formatCost)}
-    ${hasCoreTiming ? barPair("Model time", coreModelTimeMs(b), coreModelTimeMs(u), maxTime, formatDuration, "thinking + generation") : ""}
-    ${hasCoreTiming ? barPair("Tool time", coreToolTimeMs(b), coreToolTimeMs(u), maxTime, formatDuration, "tests, CI, MCP, shell") : ""}
+    ${hasCoreTiming ? barPair("Model time", coreModelTimeMs(b), coreModelTimeMs(u), maxTime, formatDuration, "thinking + generation; the headline time") : ""}
+    ${hasCoreTiming ? barPair("Tool wait", coreToolTimeMs(b), coreToolTimeMs(u), maxTime, formatDuration, "tests, CI, MCP, shell — depends on what each agent chose to run; see section 2") : ""}
     ${barPair("Output tokens", b.attribution!.core.outputTokens, u.attribution!.core.outputTokens, Math.max(b.attribution!.core.outputTokens, u.attribution!.core.outputTokens, 1), formatTokens, "what the model wrote")}
     ${barPair("Cache-read tokens", b.attribution!.core.cacheReadTokens, u.attribution!.core.cacheReadTokens, Math.max(b.attribution!.core.cacheReadTokens, u.attribution!.core.cacheReadTokens, 1), formatTokens, "context re-read per turn; 2% of output price")}
     ${barPair("Turns", b.attribution!.core.turns, u.attribution!.core.turns, Math.max(b.attribution!.core.turns, u.attribution!.core.turns, 1), String)}
   </div>
 
   <div class="section">
-    <div class="section-title">2 · Housekeeping <span class="section-sub">excluded from section 1</span></div>
-    <div class="section-note">Turns the model chose on its own after or between task work: reverting lockfiles, deleting build artifacts, polling git status, branching, committing, re-running checks that already passed. Varies run to run and is not driven by context, so it is reported here rather than in the comparison. Labelled by ${escapeHtml(b.attribution!.analystModel)}; every excluded turn is listed below so the call can be checked.</div>
+    <div class="section-title">2 · Housekeeping and tool wait <span class="section-sub">variant; excluded from the headline</span></div>
+    <div class="section-note">Tool wait is time spent waiting on tests, CI and shell commands inside core work; it depends on how much each agent decided to run, so it is listed here rather than in the headline. Housekeeping is messages the model chose on its own after or between task work: reverting lockfiles, deleting build artifacts, polling git status, branching, committing, re-running checks that already passed. Varies run to run and is not driven by context, so it is reported here rather than in the comparison. Labelled by ${escapeHtml(b.attribution!.analystModel)}; every excluded turn is listed below so the call can be checked.</div>
     <div class="tool-table-wrap">
       <table class="tool-table">
-        <thead><tr><th>Arm</th><th>Turns</th><th>Cost</th><th>Time</th><th>What it was</th><th>Raw total incl. housekeeping</th></tr></thead>
+        <thead><tr><th>Arm</th><th>Housekeeping msgs</th><th>Cost</th><th>Time</th><th>What it was</th><th>Tool wait in core work</th><th>Raw total</th></tr></thead>
         <tbody>
-          <tr><td>Baseline</td><td>${b.attribution!.housekeeping.turns}</td><td>${formatCost(b.attribution!.housekeeping.costUsd)}</td><td>${formatDuration(b.attribution!.housekeeping.durationMs)}</td><td>${escapeHtml(housekeepingKinds(b)) || "–"}</td><td>${formatCost(b.estimatedCost)} · ${formatDuration(b.run.durationMs)}</td></tr>
-          <tr><td>With Unblocked</td><td>${u.attribution!.housekeeping.turns}</td><td>${formatCost(u.attribution!.housekeeping.costUsd)}</td><td>${formatDuration(u.attribution!.housekeeping.durationMs)}</td><td>${escapeHtml(housekeepingKinds(u)) || "–"}</td><td>${formatCost(u.estimatedCost)} · ${formatDuration(u.run.durationMs)}</td></tr>
+          <tr><td>Baseline</td><td>${b.attribution!.housekeeping.turns}</td><td>${formatCost(b.attribution!.housekeeping.costUsd)}</td><td>${formatDuration(b.attribution!.housekeeping.durationMs)}</td><td>${escapeHtml(housekeepingKinds(b)) || "–"}</td><td>${formatDuration(coreToolTimeMs(b))}</td><td>${formatCost(b.estimatedCost)} · ${formatDuration(b.run.durationMs)}</td></tr>
+          <tr><td>With Unblocked</td><td>${u.attribution!.housekeeping.turns}</td><td>${formatCost(u.attribution!.housekeeping.costUsd)}</td><td>${formatDuration(u.attribution!.housekeeping.durationMs)}</td><td>${escapeHtml(housekeepingKinds(u)) || "–"}</td><td>${formatDuration(coreToolTimeMs(u))}</td><td>${formatCost(u.estimatedCost)} · ${formatDuration(u.run.durationMs)}</td></tr>
         </tbody>
       </table>
     </div>
@@ -952,6 +960,40 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     </div>
     ${result.quality.findings.length ? `<div class="findings">${result.quality.findings.map(f => `
       <div class="finding"><span class="finding-arm ${f.arm}">${f.arm === "unblocked" ? "With Unblocked" : "Baseline"}</span> ${escapeHtml(f.finding)}<div class="evidence">${escapeHtml(f.evidence)}</div></div>`).join("")}</div>` : ""}
+  </div>` : ""}
+
+  ${result.impact ? `
+  <div class="section">
+    <div class="section-title">4 · What the Unblocked context did <span class="section-sub">un-blinded: ${escapeHtml(result.impact.model)}</span></div>
+    <div class="section-note">Which research results the agent used and for what, which facts the baseline found by other means, what the research should have returned and didn't, and whether the quality outcome is attributable to the context or to the agent.</div>
+    <div class="verdict ${result.impact.impact.outcome === "better" ? "positive" : result.impact.impact.outcome === "worse" ? "negative" : ""}">
+      <div class="verdict-head">Outcome with Unblocked: ${result.impact.impact.outcome} <span class="verdict-conf">· context role: ${result.impact.impact.contextRole}</span></div>
+      <div>${escapeHtml(result.impact.impact.summary)}</div>
+      <div style="margin-top: 8px;"><strong>What would most have changed the result:</strong> ${escapeHtml(result.impact.impact.whatWouldChange)}</div>
+    </div>
+    <div class="tool-table-wrap" style="margin-bottom: 16px;">
+      <table class="tool-table">
+        <thead><tr><th>Research call</th><th>Returned</th><th>Used</th><th>Value</th></tr></thead>
+        <tbody>${result.impact.research.map(rc => `
+          <tr>
+            <td>T${rc.turn} · ${escapeHtml(rc.query.slice(0, 140))}<div class="evidence">${escapeHtml(rc.note)}</div></td>
+            <td>${rc.itemsReturned}</td>
+            <td>${rc.itemsUsed.length ? rc.itemsUsed.map(x => `<div><b>${escapeHtml(x.item.slice(0, 80))}</b><div class="evidence">${escapeHtml(x.use)}</div></div>`).join("") : `<span style="color: var(--text-muted)">none</span>`}</td>
+            <td><span class="met ${rc.value === "decisive" || rc.value === "useful" ? "met-met" : rc.value === "misleading" ? "met-unmet" : "met-partial"}">${rc.value}</span></td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+    ${result.impact.gaps.length ? `<div class="findings" style="margin-bottom: 16px;">${result.impact.gaps.map(g => `
+      <div class="finding"><span class="finding-arm baseline">Gap</span> ${escapeHtml(g.missing)}<div class="evidence">${escapeHtml(g.evidence)} — ${escapeHtml(g.consequence)}</div></div>`).join("")}</div>` : ""}
+    ${result.impact.unused.length ? `<div class="findings" style="margin-bottom: 16px;">${result.impact.unused.map(g => `
+      <div class="finding"><span class="finding-arm unblocked">Had, didn't use</span> ${escapeHtml(g.had)}<div class="evidence">${escapeHtml(g.consequence)}</div></div>`).join("")}</div>` : ""}
+    <div class="tool-table-wrap">
+      <table class="tool-table">
+        <thead><tr><th>Fact the baseline found without Unblocked</th><th>How</th><th>Unblocked had it?</th></tr></thead>
+        <tbody>${result.impact.baselineDiscoveries.map(d => `<tr><td>${escapeHtml(d.fact)}</td><td>${escapeHtml(d.how)}</td><td>${d.unblockedHadIt ? "yes" : `<span class="met met-unmet">no</span>`}</td></tr>`).join("") || `<tr><td colspan="3" style="color: var(--text-muted)">none noted</td></tr>`}</tbody>
+      </table>
+    </div>
   </div>` : ""}
 
   <div class="section">

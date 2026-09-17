@@ -135,6 +135,18 @@ export interface QualityAssessment {
   verdict: { better: Condition | "tie"; confidence: "low" | "medium" | "high"; rationale: string };
 }
 
+// Un-blinded assessment of what the research context did (src/impact.ts).
+export interface ContextImpact {
+  model: string;
+  costUsd: number;
+  research: { turn: number; query: string; itemsReturned: number; itemsUsed: { item: string; use: string }[]; value: "decisive" | "useful" | "unused" | "misleading"; note: string }[];
+  contextFacts: { fact: string; usedFor: string; evidence: string }[];
+  baselineDiscoveries: { fact: string; how: string; unblockedHadIt: boolean }[];
+  gaps: { missing: string; evidence: string; consequence: string }[];
+  unused: { had: string; consequence: string }[];
+  impact: { outcome: "better" | "worse" | "similar"; contextRole: "decisive" | "significant" | "minor" | "none" | "harmful"; summary: string; whatWouldChange: string };
+}
+
 export interface ArmResult {
   condition: Condition;
   run: RunResult;
@@ -158,6 +170,7 @@ export interface ComparisonResult {
   totalEstimatedCost: number;
   analysisCostUsd?: number;
   quality?: QualityAssessment;
+  impact?: ContextImpact;
 }
 
 export interface Config {
