@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ArmResult, ComparisonResult, ToolCall } from "./types.ts";
+import type { ArmResult, ComparisonResult, Met, ToolCall } from "./types.ts";
 import { costAt, formatCost, formatDiffSummary, formatDuration, formatTokens, padLeft, padRight, priceFor, totalTokens, uncachedTokens } from "./util.ts";
 import type { TokenUsage } from "./types.ts";
 
@@ -75,6 +75,39 @@ export function toolTimeMs(arm: ArmResult): number {
 function hasTiming(arm: ArmResult): boolean {
   return arm.run.toolCalls.some(tc => (tc.durationMs ?? 0) > 0);
 }
+
+// Tool wall time inside core turns only (union, subagent calls excluded).
+function coreToolTimeMs(arm: ArmResult): number {
+  const a = arm.attribution;
+  if (!a) return toolTimeMs(arm);
+  const windows = a.turns.filter(t => t.label !== "housekeeping" && t.startMs > 0).map(t => [t.startMs, t.startMs + t.durationMs] as const);
+  const inCore = (tc: ToolCall) => windows.some(([s, e]) => tc.timestamp >= s && tc.timestamp < e);
+  return unionMs(arm.run.toolCalls.filter(inCore));
+}
+
+function coreModelTimeMs(arm: ArmResult): number {
+  const a = arm.attribution;
+  if (!a) return modelTimeMs(arm);
+  return Math.max(0, a.core.durationMs - coreToolTimeMs(arm));
+}
+
+// Short description of what the housekeeping turns were, for the summary line.
+function housekeepingKinds(arm: ArmResult): string {
+  const a = arm.attribution;
+  if (!a) return "";
+  const kinds: Record<string, number> = {};
+  for (const t of a.turns) {
+    if (t.label !== "housekeeping") continue;
+    const s = t.summary.toLowerCase();
+    const k = /commit/.test(s) ? "commit" : /checkout -b|switch -c|branch/.test(s) ? "branch" : /git status|git diff --stat|git log|rev-parse/.test(s) ? "status checks"
+      : /package-lock|lockfile|checkout --|checkout -- /.test(s) ? "lockfile revert" : /rm -rf|rm -f|rmdir|dist|coverage/.test(s) ? "artifact cleanup"
+      : /rspec|bin\/ci|npm|go test|test:js/.test(s) ? "redundant rerun" : /thinking/.test(s) ? "thinking" : "other";
+    kinds[k] = (kinds[k] ?? 0) + 1;
+  }
+  return Object.entries(kinds).sort((x, y) => y[1] - x[1]).map(([k, n]) => `${k} ×${n}`).join(", ");
+}
+
+const MET_ICON: Record<Met, string> = { met: "✓", partial: "◐", unmet: "✗" };
 
 // Files the agent changed without ever calling Edit/Write: everything went
 // through shell commands (heredocs, sed, git). Worth a note next to the tool
@@ -171,8 +204,8 @@ function armSummary(label: string, arm: ArmResult): string[] {
     `  ${padRight("Tool calls", 28)}${padLeft(String(arm.run.toolCalls.length), 10)}  Unblocked: ${arm.unblockedCalls.length}${shellOnlyEdits(arm) ? "  (all edits via shell)" : ""}`,
     `  ${padRight("Diff", 28)}${formatDiffSummary(arm.diffStats)}`,
     ...(arm.attribution ? [
-      `  ${padRight("Housekeeping turns", 28)}${padLeft(String(arm.attribution.housekeeping.turns), 10)}  ${padLeft(formatCost(arm.attribution.housekeeping.costUsd), 10)}  ${padLeft(formatDuration(arm.attribution.housekeeping.durationMs), 8)}`,
-      `  ${padRight("Through task (excl. hk)", 28)}${padLeft(formatDuration(arm.attribution.throughTask.durationMs), 10)}  ${padLeft(formatCost(arm.attribution.throughTask.costUsd), 10)}  ${padLeft(String(arm.attribution.throughTask.turns), 8)} turns`,
+      `  ${padRight("Core work", 28)}${padLeft(formatDuration(arm.attribution.core.durationMs), 10)}  ${padLeft(formatCost(arm.attribution.core.costUsd), 10)}  ${padLeft(formatTokens(arm.attribution.core.outputTokens), 8)}  ${padLeft(String(arm.attribution.core.turns), 3)}`,
+      `  ${padRight("Housekeeping", 28)}${padLeft(formatDuration(arm.attribution.housekeeping.durationMs), 10)}  ${padLeft(formatCost(arm.attribution.housekeeping.costUsd), 10)}  ${padLeft(formatTokens(arm.attribution.housekeeping.outputTokens), 8)}  ${padLeft(String(arm.attribution.housekeeping.turns), 3)}`,
     ] : []),
   ];
 }
@@ -200,22 +233,37 @@ export function printReport(result: ComparisonResult): void {
 
     divider(),
     blank(),
-    r("  COMPARISON"),
-    r(`  ${"─".repeat(W - 2)}`),
-    r(`  ${padRight("Duration", 28)}${padLeft(formatDuration(b.run.durationMs), 10)}  →  ${padLeft(formatDuration(u.run.durationMs), 10)}  (${pctChange(b.run.durationMs, u.run.durationMs)})`),
-    ...(hasTiming(b) || hasTiming(u) ? [
-      r(`  ${padRight("  model time", 28)}${padLeft(formatDuration(modelTimeMs(b)), 10)}  →  ${padLeft(formatDuration(modelTimeMs(u)), 10)}  (${pctChange(modelTimeMs(b), modelTimeMs(u))})`),
-      r(`  ${padRight("  tool time (tests, CI…)", 28)}${padLeft(formatDuration(toolTimeMs(b)), 10)}  →  ${padLeft(formatDuration(toolTimeMs(u)), 10)}  (${pctChange(toolTimeMs(b), toolTimeMs(u))})`),
-    ] : []),
-    r(`  ${padRight("Output tokens", 28)}${padLeft(formatTokens(b.run.tokenUsage.outputTokens), 10)}  →  ${padLeft(formatTokens(u.run.tokenUsage.outputTokens), 10)}  (${pctChange(b.run.tokenUsage.outputTokens, u.run.tokenUsage.outputTokens)})`),
-    r(`  ${padRight("Cache-read tokens", 28)}${padLeft(formatTokens(b.run.tokenUsage.cacheReadTokens), 10)}  →  ${padLeft(formatTokens(u.run.tokenUsage.cacheReadTokens), 10)}  (${pctChange(b.run.tokenUsage.cacheReadTokens, u.run.tokenUsage.cacheReadTokens)})`),
-    r(`  ${padRight("Total tokens (all classes)", 28)}${padLeft(formatTokens(totalTokens(b.run.tokenUsage)), 10)}  →  ${padLeft(formatTokens(totalTokens(u.run.tokenUsage)), 10)}  (${pctChange(totalTokens(b.run.tokenUsage), totalTokens(u.run.tokenUsage))})`),
-    r(`  ${padRight("Est. Cost", 28)}${padLeft(formatCost(b.estimatedCost), 10)}  →  ${padLeft(formatCost(u.estimatedCost), 10)}  (${pctChange(b.estimatedCost, u.estimatedCost)})`),
     ...(b.attribution && u.attribution ? [
-      r(`  ${padRight("  excl. housekeeping", 28)}${padLeft(formatCost(b.attribution.throughTask.costUsd), 10)}  →  ${padLeft(formatCost(u.attribution.throughTask.costUsd), 10)}  (${pctChange(b.attribution.throughTask.costUsd, u.attribution.throughTask.costUsd)})`),
-      r(`  ${padRight("Duration excl. housekeeping", 28)}${padLeft(formatDuration(b.attribution.throughTask.durationMs), 10)}  →  ${padLeft(formatDuration(u.attribution.throughTask.durationMs), 10)}  (${pctChange(b.attribution.throughTask.durationMs, u.attribution.throughTask.durationMs)})`),
+      r("  1 · CORE TASK WORK  (information gathering, coding, testing — housekeeping removed)"),
+      r(`  ${"─".repeat(W - 2)}`),
+      r(`  ${padRight("Cost", 28)}${padLeft(formatCost(b.attribution.core.costUsd), 10)}  →  ${padLeft(formatCost(u.attribution.core.costUsd), 10)}  (${pctChange(b.attribution.core.costUsd, u.attribution.core.costUsd)})`),
+      r(`  ${padRight("Time", 28)}${padLeft(formatDuration(b.attribution.core.durationMs), 10)}  →  ${padLeft(formatDuration(u.attribution.core.durationMs), 10)}  (${pctChange(b.attribution.core.durationMs, u.attribution.core.durationMs)})`),
+      r(`  ${padRight("  model time", 28)}${padLeft(formatDuration(coreModelTimeMs(b)), 10)}  →  ${padLeft(formatDuration(coreModelTimeMs(u)), 10)}  (${pctChange(coreModelTimeMs(b), coreModelTimeMs(u))})`),
+      r(`  ${padRight("  tool time (tests, CI…)", 28)}${padLeft(formatDuration(coreToolTimeMs(b)), 10)}  →  ${padLeft(formatDuration(coreToolTimeMs(u)), 10)}  (${pctChange(coreToolTimeMs(b), coreToolTimeMs(u))})`),
+      r(`  ${padRight("Output tokens", 28)}${padLeft(formatTokens(b.attribution.core.outputTokens), 10)}  →  ${padLeft(formatTokens(u.attribution.core.outputTokens), 10)}  (${pctChange(b.attribution.core.outputTokens, u.attribution.core.outputTokens)})`),
+      r(`  ${padRight("Cache-read tokens", 28)}${padLeft(formatTokens(b.attribution.core.cacheReadTokens), 10)}  →  ${padLeft(formatTokens(u.attribution.core.cacheReadTokens), 10)}  (${pctChange(b.attribution.core.cacheReadTokens, u.attribution.core.cacheReadTokens)})`),
+      r(`  ${padRight("Turns", 28)}${padLeft(String(b.attribution.core.turns), 10)}  →  ${padLeft(String(u.attribution.core.turns), 10)}  (${pctChange(b.attribution.core.turns, u.attribution.core.turns)})`),
+      blank(),
+      r("  2 · HOUSEKEEPING  (model habit: tidying, committing, redundant reruns — not context-driven)"),
+      r(`  ${"─".repeat(W - 2)}`),
+      r(`  ${padRight("Baseline", 28)}${padLeft(String(b.attribution.housekeeping.turns), 4)} turns  ${padLeft(formatCost(b.attribution.housekeeping.costUsd), 9)}  ${padLeft(formatDuration(b.attribution.housekeeping.durationMs), 8)}  ${housekeepingKinds(b).slice(0, 40)}`),
+      r(`  ${padRight("Unblocked", 28)}${padLeft(String(u.attribution.housekeeping.turns), 4)} turns  ${padLeft(formatCost(u.attribution.housekeeping.costUsd), 9)}  ${padLeft(formatDuration(u.attribution.housekeeping.durationMs), 8)}  ${housekeepingKinds(u).slice(0, 40)}`),
+      r(`  ${padRight("Raw totals (incl. hk)", 28)}${padLeft(formatCost(b.estimatedCost), 10)}  →  ${padLeft(formatCost(u.estimatedCost), 10)}   ${padLeft(formatDuration(b.run.durationMs), 8)} → ${formatDuration(u.run.durationMs)}`),
+    ] : [
+      r("  COMPARISON (raw; run with attribution for the core/housekeeping split)"),
+      r(`  ${"─".repeat(W - 2)}`),
+      r(`  ${padRight("Duration", 28)}${padLeft(formatDuration(b.run.durationMs), 10)}  →  ${padLeft(formatDuration(u.run.durationMs), 10)}  (${pctChange(b.run.durationMs, u.run.durationMs)})`),
+      r(`  ${padRight("Est. Cost", 28)}${padLeft(formatCost(b.estimatedCost), 10)}  →  ${padLeft(formatCost(u.estimatedCost), 10)}  (${pctChange(b.estimatedCost, u.estimatedCost)})`),
+      r(`  ${padRight("Output tokens", 28)}${padLeft(formatTokens(b.run.tokenUsage.outputTokens), 10)}  →  ${padLeft(formatTokens(u.run.tokenUsage.outputTokens), 10)}  (${pctChange(b.run.tokenUsage.outputTokens, u.run.tokenUsage.outputTokens)})`),
+    ]),
+    ...(result.quality ? [
+      blank(),
+      r("  3 · QUALITY  (blinded judge)"),
+      r(`  ${"─".repeat(W - 2)}`),
+      r(`  ${padRight("Verdict", 28)}${result.quality.verdict.better} (${result.quality.verdict.confidence} confidence)`),
+      ...result.quality.criteria.map(c => r(`  ${padRight("  " + c.criterion, 28)}${padLeft(String(c.baseline.score), 10)}  →  ${padLeft(String(c.unblocked.score), 10)}  / 5`)),
+      r(`  ${padRight("Requirements met", 28)}${padLeft(result.quality.requirements.filter(x => x.baseline.status === "met").length + "/" + result.quality.requirements.length, 10)}  →  ${padLeft(result.quality.requirements.filter(x => x.unblocked.status === "met").length + "/" + result.quality.requirements.length, 10)}`),
     ] : []),
-    r(`  ${padRight("Tool calls", 28)}${padLeft(String(b.run.toolCalls.length), 10)}  →  ${padLeft(String(u.run.toolCalls.length), 10)}  (${pctChange(b.run.toolCalls.length, u.run.toolCalls.length)})`),
   ];
 
   if (u.unblockedCalls.length > 0) {
@@ -293,33 +341,6 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   const allTools = [...new Set([...Object.keys(toolsB), ...Object.keys(toolsU)])].sort();
   const hasToolTiming = hasTiming(b) || hasTiming(u);
   const hasAttr = !!(b.attribution && u.attribution);
-
-  const attributionSection = (label: string, arm: ArmResult) => {
-    const a = arm.attribution!;
-    const row = (name: string, t: { costUsd: number; durationMs: number; turns: number }) =>
-      `<tr><td>${name}</td><td>${t.turns}</td><td>${formatCost(t.costUsd)}</td><td>${formatDuration(t.durationMs)}</td></tr>`;
-    const excluded = a.turns.filter(t => t.label === "housekeeping").map(t => `
-        <tr>
-          <td>${t.turn}</td>
-          <td>${formatCost(t.costUsd)}</td>
-          <td>${formatDuration(t.durationMs)}</td>
-          <td style="font-family: 'SF Mono', 'Fira Code', Consolas, monospace; font-size: 12px;">${escapeHtml(t.summary)}</td>
-          <td style="font-size: 12px; color: var(--text-muted);">${escapeHtml(t.reason)}${t.repeatOf ? ` (repeats turn ${t.repeatOf})` : ""}</td>
-        </tr>`).join("");
-    return `
-      <div class="arm-section">
-        <div class="arm-header"><span class="arm-name">${escapeHtml(label)}</span>
-          <span style="font-size: 12px; color: var(--text-muted);">task complete at turn ${a.taskCompleteTurn} of ${a.raw.turns}</span></div>
-        <table class="tool-table">
-          <thead><tr><th></th><th>Turns</th><th>Cost</th><th>Time</th></tr></thead>
-          <tbody>${row("Raw", a.raw)}${row("Through task (excl. housekeeping)", a.throughTask)}${row("Housekeeping", a.housekeeping)}</tbody>
-        </table>
-        ${excluded ? `<table class="tool-table" style="border-top: 1px solid var(--border);">
-          <thead><tr><th>Turn</th><th>Cost</th><th>Time</th><th>What it did</th><th>Why excluded</th></tr></thead>
-          <tbody>${excluded}</tbody>
-        </table>` : `<div class="arm-tokens" style="color: var(--text-muted);">No housekeeping turns</div>`}
-      </div>`;
-  };
   const timeCell = (ms: number | undefined) => ms ? formatDuration(ms) : `<span style="color: var(--text-muted)">–</span>`;
 
   const armModels = (tools: Record<string, Record<string, number>>) =>
@@ -334,6 +355,35 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       .map(([m, n]) => `${escapeHtml(m || "unknown")} ${n}`)
       .join(" &middot; ");
     return `${total} <span style="color: var(--text-muted); font-size: 12px;">(${split})</span>`;
+  };
+
+
+  const heroCard = (label: string, bVal: number, uVal: number, fmt: (n: number) => string) => {
+    const better = uVal < bVal;
+    return `
+    <div class="hero-card${better ? " positive" : " negative"}">
+      <div class="hero-label">${label}</div>
+      <div class="hero-value${better ? " positive" : " negative"}">${pctChange(bVal, uVal)}</div>
+      <div class="hero-detail">${fmt(bVal)} &rarr; ${fmt(uVal)}</div>
+    </div>`;
+  };
+
+  const housekeepingLedger = (label: string, arm: ArmResult) => {
+    const rows = arm.attribution!.turns.filter(t => t.label === "housekeeping");
+    if (!rows.length) return `<div class="arm-tokens" style="color: var(--text-muted);">${escapeHtml(label)}: no housekeeping turns</div>`;
+    return `
+      <div class="arm-section">
+        <div class="arm-header"><span class="arm-name">${escapeHtml(label)}</span></div>
+        <table class="tool-table">
+          <thead><tr><th>Turn</th><th>Cost</th><th>Time</th><th>What it did</th><th>Why excluded</th></tr></thead>
+          <tbody>${rows.map(t => `
+          <tr>
+            <td>${t.turn}</td><td>${formatCost(t.costUsd)}</td><td>${formatDuration(t.durationMs)}</td>
+            <td style="font-family: 'SF Mono', 'Fira Code', Consolas, monospace; font-size: 12px;">${escapeHtml(t.summary)}</td>
+            <td style="font-size: 12px; color: var(--text-muted);">${escapeHtml(t.reason)}${t.repeatOf ? ` (repeats turn ${t.repeatOf})` : ""}</td>
+          </tr>`).join("")}</tbody>
+        </table>
+      </div>`;
   };
 
   const toolCompareRows = allTools.map(tool => {
@@ -764,6 +814,26 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   .diff-add { color: var(--green); background: rgba(34, 197, 94, 0.08); display: inline-block; width: 100%; }
   .diff-del { color: var(--red); background: rgba(239, 68, 68, 0.08); display: inline-block; width: 100%; }
 
+  .hero-3 { grid-template-columns: repeat(3, 1fr); }
+  .section-note { font-size: 13px; color: var(--text-muted); margin: -8px 0 16px; line-height: 1.6; }
+  .section-sub { font-size: 12px; font-weight: 500; color: var(--text-muted); margin-left: 8px; }
+  .ledger { margin-top: 12px; }
+  .ledger summary { cursor: pointer; font-size: 13px; color: var(--accent-light); padding: 6px 0; }
+  .verdict { background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 12px; padding: 16px 20px; margin-bottom: 16px; font-size: 14px; line-height: 1.6; }
+  .verdict.positive { border-left-color: var(--green); }
+  .verdict.negative { border-left-color: var(--red); }
+  .verdict-head { font-weight: 700; font-size: 16px; margin-bottom: 6px; }
+  .verdict-conf { font-weight: 500; font-size: 13px; color: var(--text-muted); }
+  .met { font-weight: 700; font-size: 13px; }
+  .met-met { color: var(--green); } .met-partial { color: var(--yellow); } .met-unmet { color: var(--red); }
+  .score { font-weight: 700; }
+  .evidence { font-size: 12px; color: var(--text-muted); margin-top: 3px; line-height: 1.5; }
+  .findings { display: flex; flex-direction: column; gap: 8px; }
+  .finding { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; font-size: 13px; }
+  .finding-arm { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; margin-right: 8px; }
+  .finding-arm.unblocked { color: var(--accent-light); } .finding-arm.baseline { color: var(--text-muted); }
+  @media (max-width: 768px) { .hero-3 { grid-template-columns: 1fr; } }
+
   .footer {
     text-align: center;
     padding-top: 32px;
@@ -808,35 +878,87 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     </div>
   </div>
 
-  <div class="hero-grid">
-    <div class="hero-card${u.run.durationMs < b.run.durationMs ? " positive" : " negative"}">
-      <div class="hero-label">Speed</div>
-      <div class="hero-value${u.run.durationMs < b.run.durationMs ? " positive" : " negative"}">
-        ${pctChange(b.run.durationMs, u.run.durationMs)}
-      </div>
-      <div class="hero-detail">${formatDuration(b.run.durationMs)} &rarr; ${formatDuration(u.run.durationMs)}</div>
+  ${hasAttr ? `
+  <div class="section">
+    <div class="section-title">1 · Core task work</div>
+    <div class="section-note">Information gathering, writing code, running tests. The part of a run that context can influence and that repeats across runs. Housekeeping turns (section 2) are removed from both arms by the same rule.</div>
+    <div class="hero-grid hero-3">
+      ${heroCard("Cost", b.attribution!.core.costUsd, u.attribution!.core.costUsd, formatCost)}
+      ${heroCard("Time", b.attribution!.core.durationMs, u.attribution!.core.durationMs, formatDuration)}
+      ${heroCard("Output tokens", b.attribution!.core.outputTokens, u.attribution!.core.outputTokens, formatTokens)}
     </div>
-    <div class="hero-card${u.estimatedCost < b.estimatedCost ? " positive" : " negative"}">
-      <div class="hero-label">Cost</div>
-      <div class="hero-value${u.estimatedCost < b.estimatedCost ? " positive" : " negative"}">
-        ${pctChange(b.estimatedCost, u.estimatedCost)}
-      </div>
-      <div class="hero-detail">${formatCost(b.estimatedCost)} &rarr; ${formatCost(u.estimatedCost)}</div>
-    </div>
+    ${barPair("Cost", b.attribution!.core.costUsd, u.attribution!.core.costUsd, maxCost, formatCost)}
+    ${barPair("Model time", coreModelTimeMs(b), coreModelTimeMs(u), maxTime, formatDuration, "thinking + generation")}
+    ${barPair("Tool time", coreToolTimeMs(b), coreToolTimeMs(u), maxTime, formatDuration, "tests, CI, MCP, shell")}
+    ${barPair("Output tokens", b.attribution!.core.outputTokens, u.attribution!.core.outputTokens, Math.max(b.attribution!.core.outputTokens, u.attribution!.core.outputTokens, 1), formatTokens, "what the model wrote")}
+    ${barPair("Cache-read tokens", b.attribution!.core.cacheReadTokens, u.attribution!.core.cacheReadTokens, Math.max(b.attribution!.core.cacheReadTokens, u.attribution!.core.cacheReadTokens, 1), formatTokens, "context re-read per turn; 2% of output price")}
+    ${barPair("Turns", b.attribution!.core.turns, u.attribution!.core.turns, Math.max(b.attribution!.core.turns, u.attribution!.core.turns, 1), String)}
   </div>
 
   <div class="section">
-    <div class="section-title">Head-to-Head</div>
+    <div class="section-title">2 · Housekeeping <span class="section-sub">excluded from section 1</span></div>
+    <div class="section-note">Turns the model chose on its own after or between task work: reverting lockfiles, deleting build artifacts, polling git status, branching, committing, re-running checks that already passed. Varies run to run and is not driven by context, so it is reported here rather than in the comparison. Labelled by ${escapeHtml(b.attribution!.analystModel)}; every excluded turn is listed below so the call can be checked.</div>
+    <div class="tool-table-wrap">
+      <table class="tool-table">
+        <thead><tr><th>Arm</th><th>Turns</th><th>Cost</th><th>Time</th><th>What it was</th><th>Raw total incl. housekeeping</th></tr></thead>
+        <tbody>
+          <tr><td>Baseline</td><td>${b.attribution!.housekeeping.turns}</td><td>${formatCost(b.attribution!.housekeeping.costUsd)}</td><td>${formatDuration(b.attribution!.housekeeping.durationMs)}</td><td>${escapeHtml(housekeepingKinds(b)) || "–"}</td><td>${formatCost(b.estimatedCost)} · ${formatDuration(b.run.durationMs)}</td></tr>
+          <tr><td>With Unblocked</td><td>${u.attribution!.housekeeping.turns}</td><td>${formatCost(u.attribution!.housekeeping.costUsd)}</td><td>${formatDuration(u.attribution!.housekeeping.durationMs)}</td><td>${escapeHtml(housekeepingKinds(u)) || "–"}</td><td>${formatCost(u.estimatedCost)} · ${formatDuration(u.run.durationMs)}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <details class="ledger"><summary>Excluded turns, with reasons</summary>
+      ${housekeepingLedger("Baseline", b)}
+      ${housekeepingLedger("With Unblocked", u)}
+    </details>
+  </div>` : `
+  <div class="hero-grid">
+    ${heroCard("Speed", b.run.durationMs, u.run.durationMs, formatDuration)}
+    ${heroCard("Cost", b.estimatedCost, u.estimatedCost, formatCost)}
+  </div>
+  <div class="section">
+    <div class="section-title">Head-to-Head (raw)</div>
     ${barPair("Duration", b.run.durationMs, u.run.durationMs, maxTime, formatDuration)}
-    ${hasToolTiming ? barPair("Model time", bModelMs, uModelMs, maxTime, formatDuration, "thinking + generation") : ""}
-    ${hasToolTiming ? barPair("Tool time", bToolMs, uToolMs, maxTime, formatDuration, "tests, CI, MCP, shell") : ""}
     ${barPair("Est. Cost", b.estimatedCost, u.estimatedCost, maxCost, formatCost)}
-    ${hasAttr ? barPair("Cost excl. housekeeping", b.attribution!.throughTask.costUsd, u.attribution!.throughTask.costUsd, maxCost, formatCost, "tidying, committing, redundant reruns removed") : ""}
-    ${hasAttr ? barPair("Duration excl. housekeeping", b.attribution!.throughTask.durationMs, u.attribution!.throughTask.durationMs, maxTime, formatDuration) : ""}
     ${barPair("Output tokens", bOut, uOut, maxOut, formatTokens, "what the model wrote")}
     ${barPair("Cache-read tokens", bCache, uCache, maxCache, formatTokens, "context re-read per turn; 2% of output price")}
-    ${barPair("Total tokens", bTokens, uTokens, maxTokens, formatTokens, "all classes summed — not cost-proportional")}
-  </div>
+  </div>`}
+
+  ${result.quality ? `
+  <div class="section">
+    <div class="section-title">3 · Quality analysis <span class="section-sub">blinded judge: ${escapeHtml(result.quality.judgeModel)}</span></div>
+    <div class="section-note">The judge saw the task, each arm's final response, the tests it ran, and its diff, labelled A and B in random order. It did not know which arm had Unblocked.</div>
+    <div class="verdict ${result.quality.verdict.better === "unblocked" ? "positive" : result.quality.verdict.better === "baseline" ? "negative" : ""}">
+      <div class="verdict-head">Verdict: ${result.quality.verdict.better === "tie" ? "tie" : result.quality.verdict.better === "unblocked" ? "With Unblocked" : "Baseline"} <span class="verdict-conf">(${result.quality.verdict.confidence} confidence)</span></div>
+      <div>${escapeHtml(result.quality.verdict.rationale)}</div>
+    </div>
+    <div class="tool-table-wrap" style="margin-bottom: 16px;">
+      <table class="tool-table">
+        <thead><tr><th>Requirement from the task</th><th>Baseline</th><th>With Unblocked</th></tr></thead>
+        <tbody>${result.quality.requirements.map(rq => `
+          <tr>
+            <td>${escapeHtml(rq.requirement)}</td>
+            <td><span class="met met-${rq.baseline.status}">${MET_ICON[rq.baseline.status]} ${rq.baseline.status}</span><div class="evidence">${escapeHtml(rq.baseline.evidence)}</div></td>
+            <td><span class="met met-${rq.unblocked.status}">${MET_ICON[rq.unblocked.status]} ${rq.unblocked.status}</span><div class="evidence">${escapeHtml(rq.unblocked.evidence)}</div></td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+    <div class="tool-table-wrap" style="margin-bottom: 16px;">
+      <table class="tool-table">
+        <thead><tr><th>Criterion</th><th>Baseline</th><th>With Unblocked</th></tr></thead>
+        <tbody>${result.quality.criteria.map(c => `
+          <tr>
+            <td>${escapeHtml(c.criterion)}</td>
+            <td><span class="score">${c.baseline.score}/5</span><div class="evidence">${escapeHtml(c.baseline.rationale)}</div></td>
+            <td><span class="score">${c.unblocked.score}/5</span><div class="evidence">${escapeHtml(c.unblocked.rationale)}</div></td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+    ${result.quality.findings.length ? `<div class="findings">${result.quality.findings.map(f => `
+      <div class="finding"><span class="finding-arm ${f.arm}">${f.arm === "unblocked" ? "With Unblocked" : "Baseline"}</span> ${escapeHtml(f.finding)}<div class="evidence">${escapeHtml(f.evidence)}</div></div>`).join("")}</div>` : ""}
+  </div>` : ""}
 
   <div class="section">
     <div class="section-title">Arm Details</div>
@@ -879,18 +1001,6 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       ${n} changed ${(a as ArmResult).diffStats.filesChanged} file${(a as ArmResult).diffStats.filesChanged === 1 ? "" : "s"} without any Edit/Write call — see "Bash (writes files)" for the shell commands that did it. The diff below is the ground truth.
     </div>`).join("")}
   </div>
-
-  ${hasAttr ? `
-  <div class="section">
-    <div class="section-title">Turn Attribution</div>
-    <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">
-      Each turn labelled by ${escapeHtml(b.attribution!.analystModel)} as task work, verification, or housekeeping (tidying, committing, redundant reruns).
-      "Through task" removes housekeeping from both arms with the same rule. Every excluded turn is listed so the call can be checked.
-      Analyst cost: ${formatCost(b.attribution!.analystCostUsd + u.attribution!.analystCostUsd)} (not included in arm costs).
-    </div>
-    ${attributionSection("Baseline", b)}
-    ${attributionSection("With Unblocked", u)}
-  </div>` : ""}
 
   ${hasToolTiming ? `
   <div class="section">

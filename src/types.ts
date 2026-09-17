@@ -62,19 +62,62 @@ export interface TurnLabel {
   reason: string;
 }
 
-export interface AttributionTotals { costUsd: number; durationMs: number; turns: number }
+export interface AttributionTotals {
+  costUsd: number;
+  durationMs: number;
+  turns: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+}
 
-// Per-turn labels from an analyst model plus the rollup. `throughTask` is the
-// run with housekeeping turns removed: the number to compare arms on when the
-// tail of tidying, committing and redundant reruns should not count.
+export interface AttributedTurn extends TurnLabel {
+  startMs: number;       // epoch ms of the assistant event; 0 if the transcript has no timestamps
+  costUsd: number;
+  durationMs: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  summary: string;
+}
+
+// Per-turn labels from an analyst model plus the rollup. `core` is work +
+// verify: the part of the run the treatment can influence and that repeats
+// across runs. `housekeeping` is what the model chose to do on its own
+// (tidying, committing, redundant reruns): variable, not treatment-driven,
+// reported separately so it doesn't decide the comparison.
 export interface Attribution {
   analystModel: string;
   analystCostUsd: number;
   taskCompleteTurn: number;
   raw: AttributionTotals;
-  throughTask: AttributionTotals;
+  core: AttributionTotals;
   housekeeping: AttributionTotals;
-  turns: (TurnLabel & { costUsd: number; durationMs: number; summary: string })[];
+  turns: AttributedTurn[];
+}
+
+export type Met = "met" | "partial" | "unmet";
+
+export interface QualityRequirement {
+  requirement: string;
+  baseline: { status: Met; evidence: string };
+  unblocked: { status: Met; evidence: string };
+}
+
+export interface QualityCriterion {
+  criterion: string;
+  baseline: { score: number; rationale: string };
+  unblocked: { score: number; rationale: string };
+}
+
+// Blinded judgement of the two arms' output: requirements coverage, scored
+// criteria, notable findings and a verdict. The judge sees arms as A and B in
+// random order; the result is un-blinded before it is stored.
+export interface QualityAssessment {
+  judgeModel: string;
+  judgeCostUsd: number;
+  requirements: QualityRequirement[];
+  criteria: QualityCriterion[];
+  findings: { arm: Condition; finding: string; evidence: string }[];
+  verdict: { better: Condition | "tie"; confidence: "low" | "medium" | "high"; rationale: string };
 }
 
 export interface ArmResult {
@@ -96,6 +139,7 @@ export interface ComparisonResult {
   unblocked: ArmResult;
   totalDurationMs: number;
   totalEstimatedCost: number;
+  quality?: QualityAssessment;
 }
 
 export interface Config {
