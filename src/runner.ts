@@ -291,10 +291,10 @@ export async function run(config: Config): Promise<ComparisonResult> {
     totalEstimatedCost: baseline.estimatedCost + unblocked.estimatedCost,
   };
   if (config.analystModel) {
-    const q = assessQuality(result, config.analystModel);
+    const q = assessQuality(result, config.judgeModel);
     if (q) result.quality = q;
     result.economics = economics(result);
-    const im = assessImpact(result, config.analystModel);
+    const im = assessImpact(result, config.judgeModel);
     if (im) result.impact = im;
   }
   result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0);

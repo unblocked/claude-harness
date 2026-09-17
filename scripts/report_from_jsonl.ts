@@ -1,5 +1,5 @@
 // Generate a comparison report from two existing stream-json transcripts.
-// Usage: bun scripts/report_from_jsonl.ts <baseline.jsonl> <unblocked.jsonl> [result.json | model] [branch] [task] [--attribute[=model]] [--rejudge] [--impact[=model]]
+// Usage: bun scripts/report_from_jsonl.ts <baseline.jsonl> <unblocked.jsonl> [result.json | model] [branch] [task] [--attribute[=model]] [--rejudge[=model]] [--impact[=model]]
 // Token usage and tool calls are always re-parsed from the transcripts. The
 // task prompt, branch, and code diffs are not recorded in stream-json output:
 // pass the run's original result.json (third argument, detected by .json
@@ -96,12 +96,14 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
 // --attribute[=model] recomputes per-message attribution; --rejudge re-runs the
 // quality judge (same model, default opus). Only these flags are stripped from
 // argv, so a "--flag" inside a free-text task argument survives.
-// --impact[=model] (re)runs the context-impact assessment.
-const KNOWN = /^--(attribute(=.*)?|rejudge|impact(=.*)?)$/;
-const attrFlag = process.argv.find(a => /^--attribute(=|$)/.test(a));
-const impactFlag = process.argv.find(a => /^--impact(=|$)/.test(a));
-const rejudge = process.argv.includes("--rejudge");
-const analystModel = attrFlag ? (attrFlag.split("=")[1] || "opus") : impactFlag ? (impactFlag.split("=")[1] || "opus") : (rejudge ? "opus" : null);
+// --attribute[=model] recomputes attribution (default opus); --rejudge[=model]
+// re-runs the quality judge and --impact[=model] the context-impact pass
+// (default fable). Only these flags are stripped from argv.
+const KNOWN = /^--(attribute|rejudge|impact)(=.*)?$/;
+const flagModel = (name: string, dflt: string) => { const f = process.argv.find(a => a === `--${name}` || a.startsWith(`--${name}=`)); return f ? (f.split("=")[1] || dflt) : null; };
+const attrModel = flagModel("attribute", "opus");
+const judgeModel = flagModel("rejudge", "fable");
+const impactModel = flagModel("impact", "fable");
 const [,, baseFile, ubFile, thirdArg, branchArg, ...taskArg] = process.argv.filter(a => !KNOWN.test(a));
 const orig: ComparisonResult | undefined = thirdArg?.endsWith(".json")
   ? JSON.parse(fs.readFileSync(thirdArg, "utf8"))
@@ -114,9 +116,9 @@ const task = orig?.task ?? (taskArg.join(" ") || "(task not recorded in transcri
 const repo = orig?.repo ?? repoFromCwd(init.cwd) ?? "(from transcripts)";
 const baseline = arm("baseline", baseFile, model, orig?.baseline);
 const unblocked = arm("unblocked", ubFile, model, orig?.unblocked);
-if (attrFlag && analystModel) {
+if (attrModel) {
   for (const a of [baseline, unblocked]) {
-    const attr = attribute(a.run.jsonlPath, task, a.run.totalCostUsd ?? a.estimatedCost, analystModel, a.condition);
+    const attr = attribute(a.run.jsonlPath, task, a.run.totalCostUsd ?? a.estimatedCost, attrModel, a.condition);
     if (attr) a.attribution = attr;
   }
 }
@@ -132,18 +134,15 @@ const result: ComparisonResult = {
   totalEstimatedCost: baseline.estimatedCost + unblocked.estimatedCost,
 };
 
-// The judge is the expensive, non-deterministic step; keep a previous verdict
-// from the supplied result.json unless --rejudge is passed.
-if (orig?.quality && !rejudge) {
-  result.quality = orig.quality;
-} else if (analystModel) {
-  const q = assessQuality(result, analystModel);
-  if (q) result.quality = q;
-}
+// The judge and impact passes are the expensive, non-deterministic steps; a
+// previous result from the supplied result.json is kept unless re-run is asked
+// for, and a failed re-run keeps the previous result rather than dropping it.
+if (judgeModel) result.quality = assessQuality(result, judgeModel) ?? orig?.quality;
+else if (orig?.quality) result.quality = orig.quality;
 
 result.economics = economics(result);
-if (orig?.impact && !impactFlag) result.impact = orig.impact;
-else if (analystModel && impactFlag) { const im = assessImpact(result, analystModel); if (im) result.impact = im; }
+if (impactModel) result.impact = assessImpact(result, impactModel) ?? orig?.impact;
+else if (orig?.impact) result.impact = orig.impact;
 
 result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0);
 
