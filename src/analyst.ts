@@ -8,6 +8,11 @@ import { log } from "./util.ts";
 
 const BINARY = process.env.CLAUDE_BINARY ?? "claude";
 export const FALLBACK_MODEL = "opus";
+
+// Shell commands that run tests, linters, type checks, builds or CI. Used to
+// pick verification output for the judge and to classify tool wait. Broad on
+// purpose: `gradlew`, `make lint-changes`, `bun test`, `detekt` all count.
+export const VERIFY_CMD = /(\b(rspec|rails test|bin\/ci|npm (test|run [\w:-]*(test|lint|check|build)[\w:-]*)|pnpm (test|lint|build)|yarn (test|lint|build)|bun test|go (test|vet|build)|gofmt|rubocop|tsc|eslint|pytest|jest|vitest|cargo (test|build|clippy)|mvn|gradlew?|detekt|ktlint)\b|\bmake [\w-]*(test|lint|check|build|ci)[\w-]*\b)/;
 const DECLINE_RETRIES = 2;
 
 // Strings that have tripped input safeguards on real transcripts (auth headers,

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import type { AttributedTurn, Attribution, AttributionTotals, TurnLabel } from "./types.ts";
 import { costAt, formatCost, formatDuration, log, priceFor } from "./util.ts";
-import { runStructured } from "./analyst.ts";
+import { runStructured, VERIFY_CMD } from "./analyst.ts";
 
 // Per-message attribution: an analyst model labels every assistant message as
 // task work, verification, or housekeeping, so the comparison can be reported
@@ -24,7 +24,6 @@ export interface WalkTurn {
   cacheReadTokens: number;
 }
 
-const VERIFY_CMD = /\b(rspec|bin\/ci|npm (test|run test)|go test|go vet|gofmt|rubocop|tsc|pytest|jest|make (test|check)|cargo test|mvn|gradle)\b/;
 
 function excerpt(s: string, n: number): string {
   s = s.replace(/\s+/g, " ").trim();

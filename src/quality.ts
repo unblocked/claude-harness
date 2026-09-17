@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import type { ArmResult, ComparisonResult, Condition, QualityAssessment } from "./types.ts";
 import { formatCost, log } from "./util.ts";
-import { runStructured } from "./analyst.ts";
+import { runStructured, VERIFY_CMD } from "./analyst.ts";
 
 // Blinded quality judgement of the two arms' output. The judge sees the task,
 // each arm's final response, diff, and verification record, labelled A and B
@@ -11,7 +11,6 @@ import { runStructured } from "./analyst.ts";
 // research tool, and mentions of it in the agents' own text are neutralised.
 
 const DIFF_BUDGET = 40_000;   // chars of diff per arm shown to the judge
-const VERIFY_CMD = /\b(rspec|bin\/ci|npm (test|run test)|go test|go vet|gofmt|go build|rubocop|tsc|pytest|jest|make (test|check)|cargo test|mvn|gradle)\b/;
 
 export const CRITERIA = [
   { key: "completeness", text: "Completeness: how much of the task, as stated, was actually delivered." },

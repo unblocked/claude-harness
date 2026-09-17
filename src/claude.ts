@@ -168,6 +168,11 @@ export function createWorktree(repoPath: string, name: string, branch: string): 
   const wtPath = worktreePath(repoPath, name);
   fs.mkdirSync(path.dirname(wtPath), { recursive: true });
   git(repoPath, ["worktree", "add", "--detach", wtPath, branch]);
+  // `worktree add` leaves submodules empty; an agent then loses minutes to a
+  // missing schema or vendored dependency before it can even compile.
+  if (fs.existsSync(path.join(wtPath, ".gitmodules"))) {
+    if (tryGit(wtPath, ["submodule", "update", "--init", "--recursive"], "initialising submodules in worktree") !== null) log(`Initialised submodules in ${name}`);
+  }
   const baseSha = git(wtPath, ["rev-parse", "HEAD"]).trim();
   return { path: wtPath, baseSha };
 }

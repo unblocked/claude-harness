@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import type { ArmResult, ComparisonResult, EconomicsBreakdown } from "./types.ts";
 import { priceFor } from "./util.ts";
+import { VERIFY_CMD } from "./analyst.ts";
 
 // Deterministic decomposition of the cost, time and token differences between
 // the two arms, computed the same way for both. It names which term moved a
@@ -54,9 +55,10 @@ function toolWaitByCategory(arm: ArmResult): Record<string, number> {
     const cmd = String(tc.args.command ?? "");
     const kind = tc.isMcp ? (tc.mcpServer?.toLowerCase().includes("unblocked") ? "research" : "mcp")
       : tc.name !== "Bash" ? "file ops"
-      : /\b(rspec|bin\/ci|npm (test|run test)|go test|pytest|jest|make (test|check)|cargo test|mvn|gradle)\b/.test(cmd) ? "tests/CI"
-      : /\b(rubocop|gofmt|go vet|tsc|eslint|lint)\b/.test(cmd) ? "lint/typecheck"
+      : /\b(rubocop|gofmt|go vet|tsc|eslint|detekt|ktlint)\b|lint/.test(cmd) ? "lint/typecheck"
+      : VERIFY_CMD.test(cmd) ? "tests/CI/build"
       : /\b(gh api|gh search|curl |wget |rails runner)\b/.test(cmd) ? "external lookups"
+      : /git submodule/.test(cmd) ? "git submodule"
       : /^git\b|&& git\b|; git\b/.test(cmd) ? "git"
       : "shell";
     out[kind] = (out[kind] ?? 0) + (tc.durationMs ?? 0);
