@@ -25,7 +25,8 @@ program
   .option("--keep-worktrees", "Don't clean up worktrees after run", false)
   .option("--cli", "Use Unblocked CLI via Bash tool instead of MCP", false)
   // opus by default: fable's input safeguards declined 6 of 7 first attempts on ordinary CI transcripts.
-  .option("--analyst-model <model>", "Model that labels each turn as work/verify/housekeeping", "opus")
+  .option("--analyst-model <model>", "Model that labels each message as work/verify/housekeeping", "opus")
+  .option("--judge-model <model>", "Model for the quality judge and context-impact passes", "fable")
   .option("--no-attribution", "Skip the per-turn attribution pass");
 
 program.parse();
@@ -46,6 +47,7 @@ const config: Config = {
   keepWorktrees: opts.keepWorktrees,
   cliMode: opts.cli,
   analystModel: opts.attribution === false ? null : opts.analystModel,
+  judgeModel: opts.judgeModel,
 };
 
 run(config).catch((err) => {

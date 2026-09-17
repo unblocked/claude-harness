@@ -97,8 +97,8 @@ const SCHEMA = {
     },
     verdict: {
       type: "object",
-      properties: { better: { type: "string", enum: ["A", "B", "tie"] }, confidence: { type: "string", enum: ["low", "medium", "high"] }, rationale: { type: "string" } },
-      required: ["better", "confidence", "rationale"],
+      properties: { better: { type: "string", enum: ["A", "B", "tie"] }, rationale: { type: "string" } },
+      required: ["better", "rationale"],
     },
   },
   required: ["requirements", "criteria", "findings", "verdict"],
@@ -107,14 +107,14 @@ const SCHEMA = {
 function judgePrompt(task: string, first: ArmResult, second: ArmResult): string {
   return `Two autonomous coding agents, A and B, were given the same task in identical copies of the same repository. You are judging the quality of what each produced. You will see the task, then for each agent its final written response, the verification commands it ran with the end of their output, and its diff. Judge only from this material. Do not guess at anything you cannot see.
 
-Do the following:
-1. Extract the task's explicit requirements as a list of short statements, one per distinct thing the task asks for (a decision to make, a change to make, a constraint to respect, something to state in the final response). Keep them to the task's own words where possible. For each requirement, grade each agent met / partial / unmet with one sentence of evidence from its response or diff.
-2. Score each agent 1 to 5 on each criterion below, with a one-sentence rationale that names concrete evidence. Use the full range: 5 means a careful senior engineer would find nothing to add, 1 means the criterion was failed outright.
+Do the following. Every string you write goes on a one-page report, so keep them short.
+1. Extract the task's explicit requirements, one per distinct thing it asks for, each ≤ 10 words. For each, grade each agent met / partial / unmet with evidence ≤ 12 words drawn from its response or diff.
+2. Score each agent 1 to 5 on each criterion below, rationale ≤ 15 words naming concrete evidence. Use the full range.
 ${CRITERIA.map(c => `   - ${c.key}: ${c.text}`).join("\n")}
-3. List the notable findings, good or bad, that a reviewer of these two changes would want to know, each tied to one agent with evidence. Include any claim in a final response that the diff or verification record contradicts, and any place one agent found something important the other missed.
-4. Give a verdict: which agent's result is better, with confidence and a short rationale. "tie" only if they are genuinely equivalent.
+3. List at most 4 findings a reviewer would need, each ≤ 20 words, tied to one agent with evidence ≤ 15 words. Prefer claims the diff or verification record contradicts, and things one agent found that the other missed.
+4. verdict: which agent's result is better, and a rationale of ≤ 2 sentences that names the core reason. "tie" only if genuinely equivalent.
 
-Be specific and even-handed. A larger diff is not better. More words in the final response are not better. The same wrong answer stated confidently is worse than a right answer stated with caveats.
+Be even-handed. A larger diff is not better. More words are not better. A wrong answer stated confidently is worse than a right answer with caveats.
 
 =================== TASK ===================
 ${task}
@@ -127,7 +127,7 @@ type Raw = {
   requirements: { requirement: string; A: { status: "met" | "partial" | "unmet"; evidence: string }; B: { status: "met" | "partial" | "unmet"; evidence: string } }[];
   criteria: { key: string; A: { score: number; rationale: string }; B: { score: number; rationale: string } }[];
   findings: { arm: "A" | "B"; finding: string; evidence: string }[];
-  verdict: { better: "A" | "B" | "tie"; confidence: "low" | "medium" | "high"; rationale: string };
+  verdict: { better: "A" | "B" | "tie"; rationale: string };
 };
 
 export function assessQuality(result: ComparisonResult, model: string): QualityAssessment | null {
@@ -156,8 +156,8 @@ export function assessQuality(result: ComparisonResult, model: string): QualityA
     requirements: raw.requirements.map(r => ({ requirement: r.requirement, baseline: pick(r, "baseline"), unblocked: pick(r, "unblocked") })),
     criteria: raw.criteria.map(c => ({ criterion: c.key, baseline: pick(c, "baseline"), unblocked: pick(c, "unblocked") })),
     findings: raw.findings.map(f => ({ arm: cond(f.arm), finding: f.finding, evidence: f.evidence })),
-    verdict: { better: raw.verdict.better === "tie" ? "tie" : cond(raw.verdict.better), confidence: raw.verdict.confidence, rationale: raw.verdict.rationale },
+    verdict: { better: raw.verdict.better === "tie" ? "tie" : cond(raw.verdict.better), rationale: raw.verdict.rationale },
   };
-  log(`Quality: verdict ${q.verdict.better} (${q.verdict.confidence}); judge ${formatCost(q.judgeCostUsd)} via ${res.modelUsed}`);
+  log(`Quality: verdict ${q.verdict.better}; judge ${formatCost(q.judgeCostUsd)} via ${res.modelUsed}`);
   return q;
 }

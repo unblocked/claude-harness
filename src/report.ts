@@ -259,13 +259,13 @@ export function printReport(result: ComparisonResult): void {
       blank(),
       r("  3 · QUALITY  (blinded judge)"),
       r(`  ${"─".repeat(W - 2)}`),
-      r(`  ${padRight("Verdict", 28)}${result.quality.verdict.better} (${result.quality.verdict.confidence} confidence)`),
+      r(`  ${padRight("Verdict", 28)}${result.quality.verdict.better}`),
       ...result.quality.criteria.map(c => r(`  ${padRight("  " + c.criterion, 28)}${padLeft(String(c.baseline.score), 10)}  →  ${padLeft(String(c.unblocked.score), 10)}  / 5`)),
       r(`  ${padRight("Requirements met", 28)}${padLeft(result.quality.requirements.filter(x => x.baseline.status === "met").length + "/" + result.quality.requirements.length, 10)}  →  ${padLeft(result.quality.requirements.filter(x => x.unblocked.status === "met").length + "/" + result.quality.requirements.length, 10)}`),
     ] : []),
     ...(result.impact?.economics ? [
       blank(),
-      r("  WHY THE NUMBERS DIFFER"),
+      r("  EXPLANATION OF NUMBERS"),
       r(`  ${"─".repeat(W - 2)}`),
       ...["cost", "time", "tokens"].flatMap(k => wrap(`${k}: ${result.impact!.economics![k as "cost" | "time" | "tokens"]}`, W - 4).map(l => r(`  ${l}`))),
     ] : []),
@@ -273,9 +273,9 @@ export function printReport(result: ComparisonResult): void {
       blank(),
       r("  4 · CONTEXT IMPACT  (un-blinded)"),
       r(`  ${"─".repeat(W - 2)}`),
-      r(`  ${padRight("Outcome / context role", 28)}${result.impact.impact.outcome} / ${result.impact.impact.contextRole}`),
+      r(`  ${padRight("Outcome / context / driver", 28)}${result.impact.impact.outcome} / ${result.impact.impact.contextEffect} / ${result.impact.impact.outcomeDriver}`),
       r(`  ${padRight("Research calls", 28)}${result.impact.research.map(x => x.value).join(", ")}`),
-      r(`  ${padRight("Gaps", 28)}${result.impact.gaps.length}   Unused: ${result.impact.unused.length}`),
+      ...(result.impact.loss && result.impact.loss.unblockedFailure !== "n/a" ? [r(`  ${padRight("Why baseline won", 28)}${result.impact.loss.unblockedFailure}`)] : []),
     ] : []),
   ];
 
@@ -379,7 +379,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       <div class="finding" style="margin-bottom: 8px;"><b>${title}</b>${text ? `<div style="margin-top: 4px;">${escapeHtml(text)}</div>` : ""}<div class="evidence" style="margin-top: 6px;">${facts}</div></div>`;
     const toolKinds = Object.entries(e.time.toolWaitDelta).filter(([, v]) => Math.abs(v) >= 1000).sort((a, b2) => Math.abs(b2[1]) - Math.abs(a[1])).map(([k, v]) => `${escapeHtml(k)} ${min(v)}`).join(", ");
     return `
-    <div class="section-title" style="font-size: 15px; margin-top: 24px;">Why the numbers differ <span class="section-sub">Unblocked relative to baseline, core work</span></div>
+    <div class="section-title" style="font-size: 15px; margin-top: 24px;">Explanation of numbers <span class="section-sub">Unblocked relative to baseline</span></div>
     <div class="findings">
       ${para("Cost " + usd(e.cost.deltaUsd), ex?.cost, `output ${usd(e.cost.terms.output)} · cache-read ${usd(e.cost.terms.cacheRead)} · cache-write ${usd(e.cost.terms.cacheWrite)} · input ${usd(e.cost.terms.input)}${Math.abs(e.cost.unexplainedUsd) >= 0.01 ? ` · residual ${usd(e.cost.unexplainedUsd)}` : ""}`)}
       ${para("Time " + min(e.time.deltaMs), ex?.time, `model time ${min(e.time.modelDeltaMs)} · tool wait ${min(e.time.toolDeltaMs)}${toolKinds ? ` (${toolKinds})` : ""}`)}
@@ -918,7 +918,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   ${hasAttr ? `
   <div class="section">
     <div class="section-title">1 · Core task work</div>
-    <div class="section-note">Information gathering, writing code, running tests. The part of a run that context can influence and that repeats across runs. Housekeeping messages (section 2) are removed from both arms by the same rule. Time is model time: waiting on tests and CI is shown but not in the headline, because how much to run is the agent's choice, not the context's.${(b.attribution!.outputExact && u.attribution!.outputExact) ? "" : " Per-message output tokens are shared out from the run total by content size (transcript recorded without --include-partial-messages); run totals are exact."}</div>
+    <div class="section-note">Reading, deciding, coding, testing. Housekeeping removed from both arms. Time is model time; tool wait is in section 2.</div>
     <div class="hero-grid hero-3">
       ${heroCard("Cost", b.attribution!.core.costUsd, u.attribution!.core.costUsd, formatCost)}
       ${hasCoreTiming ? heroCard("Model time", coreModelTimeMs(b), coreModelTimeMs(u), formatDuration) : ""}
@@ -934,8 +934,8 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   </div>
 
   <div class="section">
-    <div class="section-title">2 · Housekeeping and tool wait <span class="section-sub">variant; excluded from the headline</span></div>
-    <div class="section-note">Tool wait is time spent waiting on tests, CI and shell commands inside core work; it depends on how much each agent decided to run, so it is listed here rather than in the headline. Housekeeping is messages the model chose on its own after or between task work: reverting lockfiles, deleting build artifacts, polling git status, branching, committing, re-running checks that already passed. Varies run to run and is not driven by context, so it is reported here rather than in the comparison. Labelled by ${escapeHtml(b.attribution!.analystModel)}; every excluded turn is listed below so the call can be checked.</div>
+    <div class="section-title">2 · Housekeeping and tool wait <span class="section-sub">excluded from the headline</span></div>
+    <div class="section-note">Tool wait: time spent in tests, CI and shell commands, set by what each agent chose to run. Housekeeping: lockfile reverts, artifact cleanup, status checks, branching, committing, redundant reruns. Model habit, not context.</div>
     <div class="tool-table-wrap">
       <table class="tool-table">
         <thead><tr><th>Arm</th><th>Housekeeping msgs</th><th>Cost</th><th>Time</th><th>What it was</th><th>Tool wait in core work</th><th>Raw total</th></tr></thead>
@@ -965,9 +965,9 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   ${result.quality ? `
   <div class="section">
     <div class="section-title">3 · Quality analysis <span class="section-sub">blinded judge: ${escapeHtml(result.quality.judgeModel)}</span></div>
-    <div class="section-note">The judge saw the task, each arm's final response, the tests it ran, and its diff, labelled A and B in random order. It did not know which arm had Unblocked.</div>
+    <div class="section-note">Blinded judge: saw task, final responses, tests run and diffs as A/B in random order.</div>
     <div class="verdict ${result.quality.verdict.better === "unblocked" ? "positive" : result.quality.verdict.better === "baseline" ? "negative" : ""}">
-      <div class="verdict-head">Verdict: ${result.quality.verdict.better === "tie" ? "tie" : result.quality.verdict.better === "unblocked" ? "With Unblocked" : "Baseline"} <span class="verdict-conf">(${result.quality.verdict.confidence} confidence)</span></div>
+      <div class="verdict-head">Verdict: ${result.quality.verdict.better === "tie" ? "tie" : result.quality.verdict.better === "unblocked" ? "With Unblocked" : "Baseline"}</div>
       <div>${escapeHtml(result.quality.verdict.rationale)}</div>
     </div>
     <div class="tool-table-wrap" style="margin-bottom: 16px;">
@@ -1001,33 +1001,24 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   ${result.impact ? `
   <div class="section">
     <div class="section-title">4 · What the Unblocked context did <span class="section-sub">un-blinded: ${escapeHtml(result.impact.model)}</span></div>
-    <div class="section-note">Which research results the agent used and for what, which facts the baseline found by other means, what the research should have returned and didn't, and whether the quality outcome is attributable to the context or to the agent.</div>
-    <div class="verdict ${result.impact.impact.outcome === "better" ? "positive" : result.impact.impact.outcome === "worse" ? "negative" : ""}">
-      <div class="verdict-head">Outcome with Unblocked: ${result.impact.impact.outcome} <span class="verdict-conf">· context role: ${result.impact.impact.contextRole}</span></div>
+    <div class="section-note">Which research results the agent used, and whether the outcome traces to the context or to the agent.</div>
+    <div class="verdict ${result.impact.impact.contextEffect === "helped" ? "positive" : result.impact.impact.contextEffect === "hurt" ? "negative" : ""}">
+      <div class="verdict-head">Outcome: ${result.impact.impact.outcome} <span class="verdict-conf">· context ${result.impact.impact.contextEffect} · driven by ${result.impact.impact.outcomeDriver}</span></div>
       <div>${escapeHtml(result.impact.impact.summary)}</div>
       <div style="margin-top: 8px;"><strong>What would most have changed the result:</strong> ${escapeHtml(result.impact.impact.whatWouldChange)}</div>
+      ${result.impact.loss && result.impact.loss.unblockedFailure !== "n/a" ? `<div style="margin-top: 8px;"><strong>Why baseline won:</strong> ${escapeHtml(result.impact.loss.unblockedFailure)}${result.impact.loss.baselineFound ? ` — baseline found ${escapeHtml(result.impact.loss.baselineFound)} (${escapeHtml(result.impact.loss.howFound)})` : ""}. ${escapeHtml(result.impact.loss.explanation)}</div>` : ""}
     </div>
-    <div class="tool-table-wrap" style="margin-bottom: 16px;">
+    <div class="tool-table-wrap">
       <table class="tool-table">
         <thead><tr><th>Research call</th><th>Returned</th><th>Used</th><th>Value</th></tr></thead>
         <tbody>${result.impact.research.map(rc => `
           <tr>
-            <td>T${rc.turn} · ${escapeHtml(rc.query.slice(0, 140))}<div class="evidence">${escapeHtml(rc.note)}</div></td>
+            <td>T${rc.turn} · ${escapeHtml(rc.query.slice(0, 120))}<div class="evidence">${escapeHtml(rc.note)}</div></td>
             <td>${rc.itemsReturned}</td>
-            <td>${rc.itemsUsed.length ? rc.itemsUsed.map(x => `<div><b>${escapeHtml(x.item.slice(0, 80))}</b><div class="evidence">${escapeHtml(x.use)}</div></div>`).join("") : `<span style="color: var(--text-muted)">none</span>`}</td>
+            <td>${rc.itemsUsed.length ? rc.itemsUsed.map(x => `<div><b>${escapeHtml(x.item.slice(0, 60))}</b> <span class="evidence" style="display:inline">${escapeHtml(x.use)}</span></div>`).join("") : `<span style="color: var(--text-muted)">none</span>`}</td>
             <td><span class="met ${rc.value === "decisive" || rc.value === "useful" ? "met-met" : rc.value === "misleading" ? "met-unmet" : "met-partial"}">${rc.value}</span></td>
           </tr>`).join("")}
         </tbody>
-      </table>
-    </div>
-    ${result.impact.gaps.length ? `<div class="findings" style="margin-bottom: 16px;">${result.impact.gaps.map(g => `
-      <div class="finding"><span class="finding-arm baseline">Gap</span> ${escapeHtml(g.missing)}<div class="evidence">${escapeHtml(g.evidence)} — ${escapeHtml(g.consequence)}</div></div>`).join("")}</div>` : ""}
-    ${result.impact.unused.length ? `<div class="findings" style="margin-bottom: 16px;">${result.impact.unused.map(g => `
-      <div class="finding"><span class="finding-arm unblocked">Had, didn't use</span> ${escapeHtml(g.had)}<div class="evidence">${escapeHtml(g.consequence)}</div></div>`).join("")}</div>` : ""}
-    <div class="tool-table-wrap">
-      <table class="tool-table">
-        <thead><tr><th>Fact the baseline found without Unblocked</th><th>How</th><th>Unblocked had it?</th></tr></thead>
-        <tbody>${result.impact.baselineDiscoveries.map(d => `<tr><td>${escapeHtml(d.fact)}</td><td>${escapeHtml(d.how)}</td><td>${d.unblockedHadIt ? "yes" : `<span class="met met-unmet">no</span>`}</td></tr>`).join("") || `<tr><td colspan="3" style="color: var(--text-muted)">none noted</td></tr>`}</tbody>
       </table>
     </div>
   </div>` : ""}

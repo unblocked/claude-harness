@@ -132,7 +132,7 @@ export interface QualityAssessment {
   requirements: QualityRequirement[];
   criteria: QualityCriterion[];
   findings: { arm: Condition; finding: string; evidence: string }[];
-  verdict: { better: Condition | "tie"; confidence: "low" | "medium" | "high"; rationale: string };
+  verdict: { better: Condition | "tie"; rationale: string };
 }
 
 // Deterministic decomposition of the cost/time/token deltas (src/economics.ts).
@@ -156,14 +156,24 @@ export interface EconomicsBreakdown {
 export interface ContextImpact {
   model: string;
   costUsd: number;
-  // Why the arms' cost, time and token counts differ, grounded in EconomicsBreakdown.
-  economics?: { cost: string; time: string; tokens: string };
   research: { turn: number; query: string; itemsReturned: number; itemsUsed: { item: string; use: string }[]; value: "decisive" | "useful" | "unused" | "misleading"; note: string }[];
-  contextFacts: { fact: string; usedFor: string; evidence: string }[];
-  baselineDiscoveries: { fact: string; how: string; unblockedHadIt: boolean }[];
-  gaps: { missing: string; evidence: string; consequence: string }[];
-  unused: { had: string; consequence: string }[];
-  impact: { outcome: "better" | "worse" | "similar"; contextRole: "decisive" | "significant" | "minor" | "none" | "harmful"; summary: string; whatWouldChange: string };
+  impact: {
+    outcome: "better" | "worse" | "similar";          // the Unblocked arm's result vs baseline, per the blinded judge
+    contextEffect: "helped" | "hurt" | "mixed" | "none"; // what the research context itself did to that result
+    outcomeDriver: "context" | "agent" | "both";        // whether the outcome traces to the context or to the agent's own behaviour
+    summary: string;
+    whatWouldChange: string;
+  };
+  // Filled when the Unblocked outcome was worse: what the baseline found that
+  // the Unblocked agent did not, how, and which failure mode the Unblocked side hit.
+  loss?: {
+    baselineFound: string;                       // "" when baseline found nothing Unblocked lacked
+    howFound: "systematic search" | "chance" | "n/a";
+    unblockedFailure: "context misled" | "stopped searching early" | "context absent, never looked elsewhere" | "unrelated to context" | "n/a";
+    explanation: string;
+  };
+  // Why the arms' cost, time and token counts differ, grounded in EconomicsBreakdown.
+  economics: { cost: string; time: string; tokens: string };
 }
 
 export interface ArmResult {
@@ -201,6 +211,8 @@ export interface Config {
   branch: string;
   keepWorktrees: boolean;
   cliMode: boolean;
-  // Analyst model for per-turn attribution; null disables the pass.
+  // Analyst model for per-turn attribution; null disables all analysis passes.
   analystModel: string | null;
+  // Model for the quality judge and context-impact passes.
+  judgeModel: string;
 }

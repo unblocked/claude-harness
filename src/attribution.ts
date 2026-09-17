@@ -247,7 +247,7 @@ Rules:
 - A turn cannot be split. If it mixes purposes, label it by its dominant purpose. A turn that both commits and runs CI is housekeeping if the CI run is a repeat.
 - Set repeat_of to the turn number this one redundantly repeats, otherwise null. A repeated verify run counts as housekeeping.
 - The final summary turn (text only, no tool call, at the end) is work.
-- Keep each reason to one short sentence naming what the turn did and why it got its label.
+- reason: at most eight words, e.g. "reverts incidental lockfile change" or "commits checkpoint".
 
 The task the agent was given:
 """

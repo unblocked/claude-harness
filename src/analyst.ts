@@ -22,7 +22,11 @@ export function redact(s: string): string {
 
 export interface StructuredResult<T> { data: T; costUsd: number; modelUsed: string }
 
-interface RawOut { structured_output?: unknown; result?: string; total_cost_usd?: number; is_error?: boolean }
+interface RawOut { structured_output?: unknown; result?: string; total_cost_usd?: number; is_error?: boolean; stop_reason?: string; num_turns?: number; subtype?: string }
+
+// HARNESS_DEBUG_DIR=<dir>: every analyst call's raw CLI output is written there.
+const DEBUG_DIR = process.env.HARNESS_DEBUG_DIR;
+let debugSeq = 0;
 
 function callOnce(prompt: string, model: string, schema: object, timeoutMs: number): { out: RawOut | null; declined: boolean; error: string } {
   const args = [
@@ -30,12 +34,21 @@ function callOnce(prompt: string, model: string, schema: object, timeoutMs: numb
     "--output-format", "json", "--json-schema", JSON.stringify(schema),
   ];
   const res = spawnSync(BINARY, args, { input: prompt, stdio: ["pipe", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs });
+  if (DEBUG_DIR) {
+    try {
+      const base = `${DEBUG_DIR}/analyst-${Date.now()}-${++debugSeq}`;
+      require("node:fs").writeFileSync(`${base}.prompt.txt`, prompt);
+      require("node:fs").writeFileSync(`${base}.stdout.json`, res.stdout ?? "");
+      require("node:fs").writeFileSync(`${base}.stderr.txt`, res.stderr ?? "");
+    } catch {}
+  }
   if (!res.stdout?.length) return { out: null, declined: false, error: `exit ${res.status}: ${(res.stderr ?? "").toString().slice(0, 300)}` };
   let out: RawOut;
   try { out = JSON.parse(res.stdout.toString()); } catch (err) { return { out: null, declined: false, error: `unparseable output: ${(err as Error).message}` }; }
   if (out.structured_output) return { out, declined: false, error: "" };
   const msg = String(out.result ?? "");
-  return { out, declined: /safeguards flagged/i.test(msg), error: msg.slice(0, 200) };
+  const detail = `stop_reason=${out.stop_reason ?? "?"} subtype=${out.subtype ?? "?"} is_error=${out.is_error ?? "?"} turns=${out.num_turns ?? "?"} result="${msg.slice(0, 200)}"`;
+  return { out, declined: /safeguards flagged/i.test(msg), error: detail };
 }
 
 // Runs the prompt and returns the schema-shaped result, or null after logging
@@ -50,6 +63,11 @@ export function runStructured<T>(what: string, prompt: string, model: string, sc
   cost += r.out?.total_cost_usd ?? 0;
   for (let attempt = 1; !r.out?.structured_output && r.declined && attempt <= DECLINE_RETRIES; attempt++) {
     log(`${what}: ${model} declined the input (safeguards, intermittent); retry ${attempt}/${DECLINE_RETRIES}`);
+    r = callOnce(p, model, schema, timeoutMs);
+    cost += r.out?.total_cost_usd ?? 0;
+  }
+  if (!r.out?.structured_output && !r.declined) {
+    log(`${what}: no structured output on first attempt (${r.error}); retrying once`);
     r = callOnce(p, model, schema, timeoutMs);
     cost += r.out?.total_cost_usd ?? 0;
   }

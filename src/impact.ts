@@ -82,29 +82,24 @@ const SCHEMA = {
       value: { type: "string", enum: ["decisive", "useful", "unused", "misleading"] },
       note: { type: "string" },
     }, required: ["turn", "query", "itemsReturned", "itemsUsed", "value", "note"] } },
-    contextFacts: { type: "array", items: { type: "object", properties: {
-      fact: { type: "string" }, usedFor: { type: "string" }, evidence: { type: "string" },
-    }, required: ["fact", "usedFor", "evidence"] } },
-    baselineDiscoveries: { type: "array", items: { type: "object", properties: {
-      fact: { type: "string" }, how: { type: "string" }, unblockedHadIt: { type: "boolean" },
-    }, required: ["fact", "how", "unblockedHadIt"] } },
-    gaps: { type: "array", items: { type: "object", properties: {
-      missing: { type: "string" }, evidence: { type: "string" }, consequence: { type: "string" },
-    }, required: ["missing", "evidence", "consequence"] } },
-    unused: { type: "array", items: { type: "object", properties: {
-      had: { type: "string" }, consequence: { type: "string" },
-    }, required: ["had", "consequence"] } },
     impact: { type: "object", properties: {
       outcome: { type: "string", enum: ["better", "worse", "similar"] },
-      contextRole: { type: "string", enum: ["decisive", "significant", "minor", "none", "harmful"] },
+      contextEffect: { type: "string", enum: ["helped", "hurt", "mixed", "none"] },
+      outcomeDriver: { type: "string", enum: ["context", "agent", "both"] },
       summary: { type: "string" },
       whatWouldChange: { type: "string" },
-    }, required: ["outcome", "contextRole", "summary", "whatWouldChange"] },
+    }, required: ["outcome", "contextEffect", "outcomeDriver", "summary", "whatWouldChange"] },
+    loss: { type: "object", properties: {
+      baselineFound: { type: "string" },
+      howFound: { type: "string", enum: ["systematic search", "chance", "n/a"] },
+      unblockedFailure: { type: "string", enum: ["context misled", "stopped searching early", "context absent, never looked elsewhere", "unrelated to context", "n/a"] },
+      explanation: { type: "string" },
+    }, required: ["baselineFound", "howFound", "unblockedFailure", "explanation"] },
     economics: { type: "object", properties: {
       cost: { type: "string" }, time: { type: "string" }, tokens: { type: "string" },
     }, required: ["cost", "time", "tokens"] },
   },
-  required: ["research", "contextFacts", "baselineDiscoveries", "gaps", "unused", "impact", "economics"],
+  required: ["research", "impact", "loss", "economics"],
 };
 
 function prompt(result: ComparisonResult): string {
@@ -114,27 +109,29 @@ function prompt(result: ComparisonResult): string {
   const researchBlock = u.research.map(rc => `--- Research call at T${rc.turn} (${rc.tool}), ${rc.chars} chars returned ---
 query: ${rc.query}
 ${rc.items.map((it, i) => `  [${i + 1}] ${it.title} (${it.chars} chars)\n      ${it.preview}`).join("\n") || "  (nothing returned)"}`).join("\n\n");
-  const verdict = q ? `Verdict: ${q.verdict.better} (${q.verdict.confidence}). ${q.verdict.rationale}
+  const verdict = q ? `Verdict: ${q.verdict.better}. ${q.verdict.rationale}
 Requirements: ${q.requirements.map(r => `"${r.requirement}" baseline=${r.baseline.status}, unblocked=${r.unblocked.status}`).join("; ")}
 Findings: ${q.findings.map(f => `(${f.arm}) ${f.finding}`).join(" | ")}` : "(no quality verdict available)";
 
-  return `Two autonomous coding agents did the same task in identical copies of one repository. The UNBLOCKED agent had a research tool (Unblocked) that searches the organisation's PRs, docs, chat, issues and other repositories; the BASELINE agent did not, but could use anything else, including the enterprise GitHub API. An independent blinded judge has already compared their outputs. Your job is narrower and un-blinded: determine what the research context actually did.
+  return `Two autonomous coding agents did the same task in identical copies of one repository. The UNBLOCKED agent had a research tool (Unblocked) that searches the organisation's PRs, docs, chat, issues and other repositories; the BASELINE agent did not, but could use anything else, including the enterprise GitHub API. A blinded judge has already compared their outputs. Your job is un-blinded and narrow: what did the research context actually do?
 
-Answer these, with evidence from the material below:
-1. For each research call: how many items came back, which of them the UNBLOCKED agent actually used (cited in its final response, acted on in code or comments, led to a follow-up read) and for what, and whether the call was decisive, useful, unused, or misleading (returned something that led the agent to a wrong conclusion, including a confident "nothing found").
-2. contextFacts: the specific facts the UNBLOCKED agent got from research and used, with what each was used for.
-3. baselineDiscoveries: facts the BASELINE agent found by other means (reading the repo, external lookups such as the GitHub API, probing), and for each whether the UNBLOCKED agent also had that fact (from research or on its own).
-4. gaps: what the research should have surfaced for this task but did not, judged by what the baseline found elsewhere or what the task pointed at, and the consequence for the UNBLOCKED agent's result.
-5. unused: context the UNBLOCKED agent had (from research or its own reading) and failed to use, and the consequence.
-6. impact: given the judge's verdict, was the UNBLOCKED outcome better, worse or similar; what role the research context played in that (decisive, significant, minor, none, or harmful); a short summary a customer could read; and what single change (to the context returned, or to how the agent used it) would most have changed the result.
-7. economics: three short explanations (2–4 sentences each) of why the two arms differ in cost, in time, and in tokens, for a customer. Each must be grounded in the ECONOMICS BREAKDOWN below: name the term that moved the delta and its size, then say what in the transcripts caused that term (a research payload re-read every message, a full test suite versus a subset, more thinking, more messages spent on a decision, a loop, an external lookup). Say plainly when a cost bought something (a fact the other arm never got) and when it bought nothing. Same standard for both arms; do not soften one side.
+Answer with evidence from the material below. Keep every string short; this goes on a one-page report.
+1. research: for each research call — items returned, which items the UNBLOCKED agent actually used (cited, acted on in code, or followed up) and for what (each "use" ≤ 12 words), and its value: decisive, useful, unused, or misleading (led to a wrong conclusion, including a confident "nothing found"). note ≤ 15 words.
+2. impact: three separate judgements, do not conflate them:
+   - outcome: was the UNBLOCKED result better, worse or similar than baseline, per the judge.
+   - contextEffect: what the research context itself did to that result — helped, hurt, mixed, or none. Research that supplied the facts the agent built on "helped" even if the agent then lost on other grounds; research that returned a confident absence the agent repeated "hurt".
+   - outcomeDriver: whether the outcome traces mainly to the context, to the agent's own behaviour (what it chose to test, verify, check, write), or both.
+   - summary: ≤ 2 sentences a customer could read, naming the decisive fact or gap.
+   - whatWouldChange: 1 sentence — the single change to the context returned, or to how the agent used it, that would most have changed the result.
+3. loss: only meaningful when outcome is "worse" (otherwise fill n/a and empty strings). Name what the BASELINE found that the UNBLOCKED agent never had, if anything. Say whether the baseline found it by a systematic search a careful engineer would do (e.g. a code search on the org's GitHub for the exact pattern) or by chance. Then pick the UNBLOCKED failure mode: the context misled it (returned something wrong, or a confident "nothing found" the agent repeated); the context made it stop searching early (it had a lead in hand, or an obvious next step, and treated the research as the answer); the context did not include it and the agent never looked elsewhere; or the loss is unrelated to context. explanation ≤ 2 sentences.
+4. economics: three explanations, ≤ 2 sentences each, of why the arms differ in cost, time and tokens. Name only the one or two terms that moved each delta, with their size from the ECONOMICS BREAKDOWN, and what in the transcripts caused them. Say what the cost bought when it bought something. Same standard for both arms.
 
-Attribute causes precisely. "The agent ran more tests" is agent behaviour, not context. "The agent chose sdlc because a research item showed the org roster" is context. "The agent said no prior art existed because the research summary said none was surfaced, while the baseline found it with a code search" is a context gap with a consequence.
+"The agent ran more tests" is agent behaviour, not context. "The agent chose sdlc because a research item showed the org roster" is context. "The agent said no prior art existed because research surfaced none, while the baseline found it with a code search" is context that hurt.
 
 =================== TASK ===================
 ${result.task}
 
-=================== ECONOMICS BREAKDOWN (core work, housekeeping removed; computed, not estimated by you) ===================
+=================== ECONOMICS BREAKDOWN (core work, housekeeping removed; computed) ===================
 ${result.economics ? describeEconomics(result.economics) : "(not available)"}
 
 =================== QUALITY JUDGE (blinded) ===================
@@ -163,6 +160,6 @@ export function assessImpact(result: ComparisonResult, model: string): ContextIm
   const res = runStructured<Omit<ContextImpact, "model" | "costUsd">>("Impact", p, model, SCHEMA, 15 * 60 * 1000, false);
   if (!res) return null;
   const out: ContextImpact = { ...res.data, model: res.modelUsed, costUsd: res.costUsd };
-  log(`Impact: outcome ${out.impact.outcome}, context role ${out.impact.contextRole}; ${formatCost(out.costUsd)} via ${res.modelUsed}`);
+  log(`Impact: outcome ${out.impact.outcome}, context ${out.impact.contextEffect}, driver ${out.impact.outcomeDriver}${out.loss && out.loss.unblockedFailure !== "n/a" ? `; loss: ${out.loss.unblockedFailure}` : ""}; ${formatCost(out.costUsd)} via ${res.modelUsed}`);
   return out;
 }
