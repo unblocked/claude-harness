@@ -5,8 +5,10 @@ const DEFAULT_MAX_BUFFER = 8 * 1024 * 1024;
 
 // Run git without a shell. Arguments are passed verbatim, so branch names,
 // paths and ref formats need no quoting. Throws on non-zero exit.
+// core.quotePath=false: paths with non-ASCII characters come out as UTF-8
+// instead of C-quoted octal, so diffs and file lists read correctly.
 export function git(cwd: string, args: string[], maxBuffer = DEFAULT_MAX_BUFFER): string {
-  return execFileSync("git", args, { cwd, stdio: "pipe", maxBuffer }).toString();
+  return execFileSync("git", ["-c", "core.quotePath=false", ...args], { cwd, stdio: "pipe", maxBuffer }).toString();
 }
 
 // Same, but a failure is logged and reported as null instead of thrown. For

@@ -3,6 +3,10 @@ export interface TokenUsage {
   outputTokens: number;
   cacheCreationTokens: number;
   cacheReadTokens: number;
+  // Present on byModel entries when the CLI reported them: exact billed cost
+  // and the thinking share of outputTokens.
+  costUsd?: number;
+  thinkingTokens?: number;
   byModel?: Record<string, TokenUsage>;
 }
 
@@ -21,9 +25,14 @@ export interface ToolCall {
 }
 
 export interface RunResult {
+  // The CLI's own duration_ms for the session when it reported one, else the
+  // harness wall time. Excludes process spawn and shutdown.
   durationMs: number;
+  // Harness wall time from spawn to exit; durationMs plus process overhead.
+  wallMs?: number;
   tokenUsage: TokenUsage;
   toolCalls: ToolCall[];
+  // API messages on the main thread (unique message ids), not content blocks.
   assistantTurns: number;
   finalResponse: string;
   sessionId?: string;
@@ -64,16 +73,20 @@ export interface TurnLabel {
 
 export interface AttributionTotals {
   costUsd: number;
-  durationMs: number;
-  turns: number;
+  durationMs: number;    // modelMs + toolMs
+  modelMs: number;       // generation incl. thinking
+  toolMs: number;        // waiting on tool results
+  turns: number;         // API messages
   outputTokens: number;
   cacheReadTokens: number;
 }
 
 export interface AttributedTurn extends TurnLabel {
-  startMs: number;       // epoch ms of the assistant event; 0 if the transcript has no timestamps
+  startMs: number;       // epoch ms the message's window starts (previous message's end); 0 if no timestamps
   costUsd: number;
   durationMs: number;
+  modelMs: number;
+  toolMs: number;
   outputTokens: number;
   cacheReadTokens: number;
   summary: string;
@@ -87,7 +100,9 @@ export interface AttributedTurn extends TurnLabel {
 export interface Attribution {
   analystModel: string;
   analystCostUsd: number;
-  taskCompleteTurn: number;
+  // True when every message's output count came from the stream (recorded with
+  // --include-partial-messages); false when shared out from the run total by content size.
+  outputExact: boolean;
   raw: AttributionTotals;
   core: AttributionTotals;
   housekeeping: AttributionTotals;
@@ -137,8 +152,11 @@ export interface ComparisonResult {
   model: string;
   baseline: ArmResult;
   unblocked: ArmResult;
+  // Longest arm; arms run in parallel.
   totalDurationMs: number;
+  // Both arms' billed cost. Analysis (attribution + judge) is separate.
   totalEstimatedCost: number;
+  analysisCostUsd?: number;
   quality?: QualityAssessment;
 }
 

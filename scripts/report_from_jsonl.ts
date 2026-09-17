@@ -37,12 +37,19 @@ function repoFromCwd(cwd: string | undefined): string | undefined {
   return parts.length >= 2 ? parts[parts.length - 2] : undefined;
 }
 
+// The CLI's duration_ms; for a transcript with no result event (killed run),
+// the span of event timestamps.
 function durationMs(jsonl: string): number {
+  let first = NaN, last = NaN;
   for (const line of jsonl.split("\n")) {
     if (!line) continue;
-    try { const e = JSON.parse(line); if (e?.type === "result" && typeof e.duration_ms === "number") return e.duration_ms; } catch {}
+    try {
+      const e = JSON.parse(line);
+      if (e?.type === "result" && typeof e.duration_ms === "number") return e.duration_ms;
+      if (typeof e?.timestamp === "string") { const t = Date.parse(e.timestamp); if (Number.isNaN(first)) first = t; last = t; }
+    } catch {}
   }
-  return 0;
+  return Number.isNaN(first) ? 0 : Math.max(0, last - first);
 }
 
 function unblockedCalls(toolCalls: { name: string; args: Record<string, unknown>; mcpServer?: string }[]): UnblockedCall[] {
@@ -84,10 +91,14 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
   };
 }
 
-// --attribute[=model] runs the per-turn attribution pass (default model: opus).
-const attrFlag = process.argv.find(a => a.startsWith("--attribute"));
-const analystModel = attrFlag ? (attrFlag.split("=")[1] || "opus") : null;
-const [,, baseFile, ubFile, thirdArg, branchArg, ...taskArg] = process.argv.filter(a => !a.startsWith("--"));
+// --attribute[=model] recomputes per-message attribution; --rejudge re-runs the
+// quality judge (same model, default opus). Only these flags are stripped from
+// argv, so a "--flag" inside a free-text task argument survives.
+const KNOWN = /^--(attribute(=.*)?|rejudge)$/;
+const attrFlag = process.argv.find(a => /^--attribute(=|$)/.test(a));
+const rejudge = process.argv.includes("--rejudge");
+const analystModel = attrFlag ? (attrFlag.split("=")[1] || "opus") : (rejudge ? "opus" : null);
+const [,, baseFile, ubFile, thirdArg, branchArg, ...taskArg] = process.argv.filter(a => !KNOWN.test(a));
 const orig: ComparisonResult | undefined = thirdArg?.endsWith(".json")
   ? JSON.parse(fs.readFileSync(thirdArg, "utf8"))
   : undefined;
@@ -99,7 +110,7 @@ const task = orig?.task ?? (taskArg.join(" ") || "(task not recorded in transcri
 const repo = orig?.repo ?? repoFromCwd(init.cwd) ?? "(from transcripts)";
 const baseline = arm("baseline", baseFile, model, orig?.baseline);
 const unblocked = arm("unblocked", ubFile, model, orig?.unblocked);
-if (analystModel) {
+if (attrFlag && analystModel) {
   for (const a of [baseline, unblocked]) {
     const attr = attribute(a.run.jsonlPath, task, a.run.totalCostUsd ?? a.estimatedCost, analystModel, a.condition);
     if (attr) a.attribution = attr;
@@ -119,13 +130,14 @@ const result: ComparisonResult = {
 
 // The judge is the expensive, non-deterministic step; keep a previous verdict
 // from the supplied result.json unless --rejudge is passed.
-const rejudge = process.argv.includes("--rejudge");
 if (orig?.quality && !rejudge) {
   result.quality = orig.quality;
 } else if (analystModel) {
   const q = assessQuality(result, analystModel);
   if (q) result.quality = q;
 }
+
+result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0);
 
 const outDir = path.join(process.cwd(), "results", "regenerated");
 fs.mkdirSync(outDir, { recursive: true });

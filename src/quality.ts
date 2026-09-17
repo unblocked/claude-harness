@@ -1,7 +1,7 @@
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import type { ArmResult, ComparisonResult, Condition, QualityAssessment } from "./types.ts";
 import { formatCost, log } from "./util.ts";
+import { runStructured } from "./analyst.ts";
 
 // Blinded quality judgement of the two arms' output. The judge sees the task,
 // each arm's final response, diff, and verification record, labelled A and B
@@ -10,7 +10,6 @@ import { formatCost, log } from "./util.ts";
 // verdict. Un-blinded before it is stored. It never sees which arm had the
 // research tool, and mentions of it in the agents' own text are neutralised.
 
-const BINARY = process.env.CLAUDE_BINARY ?? "claude";
 const DIFF_BUDGET = 40_000;   // chars of diff per arm shown to the judge
 const VERIFY_CMD = /\b(rspec|bin\/ci|npm (test|run test)|go test|go vet|gofmt|go build|rubocop|tsc|pytest|jest|make (test|check)|cargo test|mvn|gradle)\b/;
 
@@ -132,6 +131,11 @@ type Raw = {
 };
 
 export function assessQuality(result: ComparisonResult, model: string): QualityAssessment | null {
+  // A placeholder where the diff should be means the judge would be grading a sentinel.
+  for (const arm of [result.baseline, result.unblocked]) {
+    if (!arm.diff || arm.diff.startsWith("(")) { log(`Quality: skipping judge, ${arm.condition} arm has no diff to judge (${arm.diff.slice(0, 60)})`); return null; }
+  }
+
   // Blind: random order, so "A" is baseline half the time.
   const aIsBaseline = Math.random() < 0.5;
   const first = aIsBaseline ? result.baseline : result.unblocked;
@@ -140,24 +144,19 @@ export function assessQuality(result: ComparisonResult, model: string): QualityA
 
   const prompt = judgePrompt(result.task, first, second);
   log(`Quality: judging with ${model} (${Math.round(prompt.length / 1000)}k chars, arm A = ${aIsBaseline ? "baseline" : "unblocked"})…`);
-  const args = ["-p", "--model", model, "--max-turns", "1", "--tools", "", "--strict-mcp-config", "--no-session-persistence", "--output-format", "json", "--json-schema", JSON.stringify(SCHEMA)];
-  const res = spawnSync(BINARY, args, { input: prompt, stdio: ["pipe", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024, timeout: 15 * 60 * 1000 });
-  if (!res.stdout?.length) { log(`Quality: judge call failed (exit ${res.status}): ${(res.stderr ?? "").toString().slice(0, 300)}`); return null; }
-  let out: { structured_output?: Raw; result?: string; total_cost_usd?: number };
-  try { out = JSON.parse(res.stdout.toString()); } catch (err) { log(`Quality: unparseable judge output: ${(err as Error).message}`); return null; }
-  const raw = out.structured_output;
-  if (!raw) { log(`Quality: judge returned no structured output: ${String(out.result ?? "").slice(0, 200)}`); return null; }
+  const res = runStructured<Raw>("Quality", prompt, model, SCHEMA);
+  if (!res) return null;
+  const raw = res.data;
 
   const pick = <T>(row: { A: T; B: T }, c: Condition): T => (cond("A") === c ? row.A : row.B);
-  const criterionText = (key: string) => CRITERIA.find(c => c.key === key)?.key ?? key;
   const q: QualityAssessment = {
-    judgeModel: model,
-    judgeCostUsd: out.total_cost_usd ?? 0,
+    judgeModel: res.modelUsed,
+    judgeCostUsd: res.costUsd,
     requirements: raw.requirements.map(r => ({ requirement: r.requirement, baseline: pick(r, "baseline"), unblocked: pick(r, "unblocked") })),
-    criteria: raw.criteria.map(c => ({ criterion: criterionText(c.key), baseline: pick(c, "baseline"), unblocked: pick(c, "unblocked") })),
+    criteria: raw.criteria.map(c => ({ criterion: c.key, baseline: pick(c, "baseline"), unblocked: pick(c, "unblocked") })),
     findings: raw.findings.map(f => ({ arm: cond(f.arm), finding: f.finding, evidence: f.evidence })),
     verdict: { better: raw.verdict.better === "tie" ? "tie" : cond(raw.verdict.better), confidence: raw.verdict.confidence, rationale: raw.verdict.rationale },
   };
-  log(`Quality: verdict ${q.verdict.better} (${q.verdict.confidence}); judge ${formatCost(q.judgeCostUsd)}`);
+  log(`Quality: verdict ${q.verdict.better} (${q.verdict.confidence}); judge ${formatCost(q.judgeCostUsd)} via ${res.modelUsed}`);
   return q;
 }
