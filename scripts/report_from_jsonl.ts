@@ -13,6 +13,7 @@ import { estimateCost } from "../src/util.ts";
 import { attribute } from "../src/attribution.ts";
 import { assessQuality } from "../src/quality.ts";
 import { assessImpact } from "../src/impact.ts";
+import { economics } from "../src/economics.ts";
 import type { ArmResult, ComparisonResult, Condition, UnblockedCall } from "../src/types.ts";
 
 interface InitInfo { cwd?: string; model?: string }
@@ -140,6 +141,7 @@ if (orig?.quality && !rejudge) {
   if (q) result.quality = q;
 }
 
+result.economics = economics(result);
 if (orig?.impact && !impactFlag) result.impact = orig.impact;
 else if (analystModel && impactFlag) { const im = assessImpact(result, analystModel); if (im) result.impact = im; }
 

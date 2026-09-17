@@ -10,6 +10,7 @@ import { git, isAncestor, snapshotRefs, tryGit } from "./git.ts";
 import { attribute } from "./attribution.ts";
 import { assessQuality } from "./quality.ts";
 import { assessImpact } from "./impact.ts";
+import { economics } from "./economics.ts";
 
 // The commits the agent made: everything reachable from any commit this
 // worktree's HEAD ever pointed at (its reflog, plus HEAD now) that was not
@@ -292,6 +293,7 @@ export async function run(config: Config): Promise<ComparisonResult> {
   if (config.analystModel) {
     const q = assessQuality(result, config.analystModel);
     if (q) result.quality = q;
+    result.economics = economics(result);
     const im = assessImpact(result, config.analystModel);
     if (im) result.impact = im;
   }

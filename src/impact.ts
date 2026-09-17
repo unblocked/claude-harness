@@ -2,6 +2,7 @@ import fs from "node:fs";
 import type { ArmResult, ComparisonResult, ContextImpact } from "./types.ts";
 import { formatCost, log } from "./util.ts";
 import { runStructured } from "./analyst.ts";
+import { describeEconomics } from "./economics.ts";
 
 // Context-impact assessment: un-blinded, run after the quality judge. Answers
 // what the Unblocked context actually did — which returned items the agent
@@ -99,8 +100,11 @@ const SCHEMA = {
       summary: { type: "string" },
       whatWouldChange: { type: "string" },
     }, required: ["outcome", "contextRole", "summary", "whatWouldChange"] },
+    economics: { type: "object", properties: {
+      cost: { type: "string" }, time: { type: "string" }, tokens: { type: "string" },
+    }, required: ["cost", "time", "tokens"] },
   },
-  required: ["research", "contextFacts", "baselineDiscoveries", "gaps", "unused", "impact"],
+  required: ["research", "contextFacts", "baselineDiscoveries", "gaps", "unused", "impact", "economics"],
 };
 
 function prompt(result: ComparisonResult): string {
@@ -123,11 +127,15 @@ Answer these, with evidence from the material below:
 4. gaps: what the research should have surfaced for this task but did not, judged by what the baseline found elsewhere or what the task pointed at, and the consequence for the UNBLOCKED agent's result.
 5. unused: context the UNBLOCKED agent had (from research or its own reading) and failed to use, and the consequence.
 6. impact: given the judge's verdict, was the UNBLOCKED outcome better, worse or similar; what role the research context played in that (decisive, significant, minor, none, or harmful); a short summary a customer could read; and what single change (to the context returned, or to how the agent used it) would most have changed the result.
+7. economics: three short explanations (2–4 sentences each) of why the two arms differ in cost, in time, and in tokens, for a customer. Each must be grounded in the ECONOMICS BREAKDOWN below: name the term that moved the delta and its size, then say what in the transcripts caused that term (a research payload re-read every message, a full test suite versus a subset, more thinking, more messages spent on a decision, a loop, an external lookup). Say plainly when a cost bought something (a fact the other arm never got) and when it bought nothing. Same standard for both arms; do not soften one side.
 
 Attribute causes precisely. "The agent ran more tests" is agent behaviour, not context. "The agent chose sdlc because a research item showed the org roster" is context. "The agent said no prior art existed because the research summary said none was surfaced, while the baseline found it with a code search" is a context gap with a consequence.
 
 =================== TASK ===================
 ${result.task}
+
+=================== ECONOMICS BREAKDOWN (core work, housekeeping removed; computed, not estimated by you) ===================
+${result.economics ? describeEconomics(result.economics) : "(not available)"}
 
 =================== QUALITY JUDGE (blinded) ===================
 ${verdict}

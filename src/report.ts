@@ -39,6 +39,16 @@ function bashWritesFiles(cmd: string): boolean {
   return BASH_WRITE_RE.test(cmd);
 }
 
+function wrap(text: string, width: number): string[] {
+  const out: string[] = [];
+  let line = "";
+  for (const word of text.split(/\s+/)) {
+    if ((line + " " + word).trim().length > width) { out.push(line.trim()); line = word; } else line = (line + " " + word).trim();
+  }
+  if (line) out.push(line);
+  return out;
+}
+
 function toolCategory(tc: ToolCall): string {
   if (tc.isMcp) {
     return tc.mcpServer?.toLowerCase().includes("unblocked") ? "Unblocked" : `MCP:${tc.mcpServer}`;
@@ -253,6 +263,12 @@ export function printReport(result: ComparisonResult): void {
       ...result.quality.criteria.map(c => r(`  ${padRight("  " + c.criterion, 28)}${padLeft(String(c.baseline.score), 10)}  →  ${padLeft(String(c.unblocked.score), 10)}  / 5`)),
       r(`  ${padRight("Requirements met", 28)}${padLeft(result.quality.requirements.filter(x => x.baseline.status === "met").length + "/" + result.quality.requirements.length, 10)}  →  ${padLeft(result.quality.requirements.filter(x => x.unblocked.status === "met").length + "/" + result.quality.requirements.length, 10)}`),
     ] : []),
+    ...(result.impact?.economics ? [
+      blank(),
+      r("  WHY THE NUMBERS DIFFER"),
+      r(`  ${"─".repeat(W - 2)}`),
+      ...["cost", "time", "tokens"].flatMap(k => wrap(`${k}: ${result.impact!.economics![k as "cost" | "time" | "tokens"]}`, W - 4).map(l => r(`  ${l}`))),
+    ] : []),
     ...(result.impact ? [
       blank(),
       r("  4 · CONTEXT IMPACT  (un-blinded)"),
@@ -351,6 +367,25 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     return `${total} <span style="color: var(--text-muted); font-size: 12px;">(${split})</span>`;
   };
 
+
+  // Why the numbers differ: the explainer's three paragraphs (when present) over the computed decomposition.
+  const economicsBlock = (r: ComparisonResult) => {
+    const e = r.economics!;
+    const ex = r.impact?.economics;
+    const usd = (n: number) => (n >= 0 ? "+" : "−") + "$" + Math.abs(n).toFixed(2);
+    const tok = (n: number) => (n >= 0 ? "+" : "−") + formatTokens(Math.abs(n));
+    const min = (ms: number) => (ms >= 0 ? "+" : "−") + formatDuration(Math.abs(ms));
+    const para = (title: string, text: string | undefined, facts: string) => `
+      <div class="finding" style="margin-bottom: 8px;"><b>${title}</b>${text ? `<div style="margin-top: 4px;">${escapeHtml(text)}</div>` : ""}<div class="evidence" style="margin-top: 6px;">${facts}</div></div>`;
+    const toolKinds = Object.entries(e.time.toolWaitDelta).filter(([, v]) => Math.abs(v) >= 1000).sort((a, b2) => Math.abs(b2[1]) - Math.abs(a[1])).map(([k, v]) => `${escapeHtml(k)} ${min(v)}`).join(", ");
+    return `
+    <div class="section-title" style="font-size: 15px; margin-top: 24px;">Why the numbers differ <span class="section-sub">Unblocked relative to baseline, core work</span></div>
+    <div class="findings">
+      ${para("Cost " + usd(e.cost.deltaUsd), ex?.cost, `output ${usd(e.cost.terms.output)} · cache-read ${usd(e.cost.terms.cacheRead)} · cache-write ${usd(e.cost.terms.cacheWrite)} · input ${usd(e.cost.terms.input)}${Math.abs(e.cost.unexplainedUsd) >= 0.01 ? ` · residual ${usd(e.cost.unexplainedUsd)}` : ""}`)}
+      ${para("Time " + min(e.time.deltaMs), ex?.time, `model time ${min(e.time.modelDeltaMs)} · tool wait ${min(e.time.toolDeltaMs)}${toolKinds ? ` (${toolKinds})` : ""}`)}
+      ${para("Tokens: output " + tok(e.output.deltaTokens) + ", cache-read " + tok(e.cacheRead.deltaTokens), ex?.tokens, `output = thinking ${tok(e.output.thinkingDelta)} + visible ${tok(e.output.visibleDelta)} · cache-read: research context carried ≈ ${tok(e.cacheRead.researchCarriedTokens)}, average context per message ${tok(e.cacheRead.contextPerMessageDelta)}, messages ${e.cacheRead.messagesDelta >= 0 ? "+" : ""}${e.cacheRead.messagesDelta} · Unblocked research: ${e.unblocked.research.calls} calls, ≈${formatTokens(e.unblocked.research.payloadTokens)} tokens returned`)}
+    </div>`;
+  };
 
   const heroCard = (label: string, bVal: number, uVal: number, fmt: (n: number) => string) => {
     const pct = pctChange(bVal, uVal);
@@ -894,7 +929,8 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     ${hasCoreTiming ? barPair("Tool wait", coreToolTimeMs(b), coreToolTimeMs(u), maxTime, formatDuration, "tests, CI, MCP, shell — depends on what each agent chose to run; see section 2") : ""}
     ${barPair("Output tokens", b.attribution!.core.outputTokens, u.attribution!.core.outputTokens, Math.max(b.attribution!.core.outputTokens, u.attribution!.core.outputTokens, 1), formatTokens, "what the model wrote")}
     ${barPair("Cache-read tokens", b.attribution!.core.cacheReadTokens, u.attribution!.core.cacheReadTokens, Math.max(b.attribution!.core.cacheReadTokens, u.attribution!.core.cacheReadTokens, 1), formatTokens, "context re-read per turn; 2% of output price")}
-    ${barPair("Turns", b.attribution!.core.turns, u.attribution!.core.turns, Math.max(b.attribution!.core.turns, u.attribution!.core.turns, 1), String)}
+    ${barPair("Messages", b.attribution!.core.turns, u.attribution!.core.turns, Math.max(b.attribution!.core.turns, u.attribution!.core.turns, 1), String)}
+    ${result.economics ? economicsBlock(result) : ""}
   </div>
 
   <div class="section">

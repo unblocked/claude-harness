@@ -135,10 +135,29 @@ export interface QualityAssessment {
   verdict: { better: Condition | "tie"; confidence: "low" | "medium" | "high"; rationale: string };
 }
 
+// Deterministic decomposition of the cost/time/token deltas (src/economics.ts).
+export interface EconomicsSide {
+  costUsd: number; durationMs: number; modelMs: number; toolMs: number; messages: number;
+  outputTokens: number; thinkingTokens: number; visibleTokens: number;
+  cacheReadTokens: number; cacheWriteTokens: number; inputTokens: number; contextPerMessage: number;
+  research: { calls: number; payloadTokens: number; carriedTokens: number };
+  toolWait: Record<string, number>;
+}
+export interface EconomicsBreakdown {
+  baseline: EconomicsSide;
+  unblocked: EconomicsSide;
+  cost: { deltaUsd: number; terms: { output: number; cacheRead: number; cacheWrite: number; input: number }; unexplainedUsd: number };
+  cacheRead: { deltaTokens: number; researchCarriedTokens: number; contextPerMessageDelta: number; messagesDelta: number };
+  output: { deltaTokens: number; thinkingDelta: number; visibleDelta: number };
+  time: { deltaMs: number; modelDeltaMs: number; toolDeltaMs: number; toolWaitDelta: Record<string, number> };
+}
+
 // Un-blinded assessment of what the research context did (src/impact.ts).
 export interface ContextImpact {
   model: string;
   costUsd: number;
+  // Why the arms' cost, time and token counts differ, grounded in EconomicsBreakdown.
+  economics?: { cost: string; time: string; tokens: string };
   research: { turn: number; query: string; itemsReturned: number; itemsUsed: { item: string; use: string }[]; value: "decisive" | "useful" | "unused" | "misleading"; note: string }[];
   contextFacts: { fact: string; usedFor: string; evidence: string }[];
   baselineDiscoveries: { fact: string; how: string; unblockedHadIt: boolean }[];
@@ -171,6 +190,7 @@ export interface ComparisonResult {
   analysisCostUsd?: number;
   quality?: QualityAssessment;
   impact?: ContextImpact;
+  economics?: EconomicsBreakdown;
 }
 
 export interface Config {
