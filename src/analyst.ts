@@ -29,8 +29,10 @@ const DEBUG_DIR = process.env.HARNESS_DEBUG_DIR;
 let debugSeq = 0;
 
 function callOnce(prompt: string, model: string, schema: object, timeoutMs: number): { out: RawOut | null; declined: boolean; error: string } {
+  // --max-turns 3, not 1: structured output is returned through a tool round
+  // trip, and with 1 the CLI ends in error_max_turns before the JSON arrives.
   const args = [
-    "-p", "--model", model, "--max-turns", "1", "--tools", "", "--strict-mcp-config", "--no-session-persistence",
+    "-p", "--model", model, "--max-turns", "3", "--tools", "", "--strict-mcp-config", "--no-session-persistence",
     "--output-format", "json", "--json-schema", JSON.stringify(schema),
   ];
   const res = spawnSync(BINARY, args, { input: prompt, stdio: ["pipe", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs });
