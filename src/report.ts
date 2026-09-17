@@ -400,26 +400,32 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       </tr>`;
   }).join("");
 
+  // Headline numbers are core work when attribution exists; raw totals move to the footnote.
   const armCard = (label: string, arm: ArmResult, accent: boolean) => {
     const t = arm.run.tokenUsage;
     const has = totalTokens(t) > 0;
+    const a = arm.attribution;
+    const head = a
+      ? { dur: a.core.durationMs, cost: a.core.costUsd, out: a.core.outputTokens, turns: a.core.turns, tag: "core" }
+      : { dur: arm.run.durationMs, cost: arm.estimatedCost, out: t.outputTokens, turns: arm.run.assistantTurns, tag: "" };
     return `
     <div class="arm-section"${accent ? ` style="border-color: rgba(59, 130, 246, 0.3);"` : ""}>
       <div class="arm-header"${accent ? ` style="border-bottom-color: rgba(59, 130, 246, 0.2);"` : ""}>
         <span class="arm-name">${escapeHtml(label)}${arm.run.timedOut ? ` <span style="color: var(--yellow); font-size: 12px;">(TIMED OUT)</span>` : ""}</span>
+        ${a ? `<span style="font-size: 12px; color: var(--text-muted);">core task work · raw incl. housekeeping: ${formatCost(arm.estimatedCost)}, ${formatDuration(arm.run.durationMs)}, ${formatTokens(t.outputTokens)} out</span>` : ""}
       </div>
       <div class="arm-meta">
-        <div class="arm-stat"><div class="arm-stat-val">${formatDuration(arm.run.durationMs)}</div><div class="arm-stat-label">Duration</div></div>
-        <div class="arm-stat"><div class="arm-stat-val">${has ? formatCost(arm.estimatedCost) : "N/A"}</div><div class="arm-stat-label">Est. Cost</div></div>
-        <div class="arm-stat"><div class="arm-stat-val">${has ? formatTokens(t.outputTokens) : "N/A"}</div><div class="arm-stat-label">Output Tokens</div></div>
-        <div class="arm-stat"><div class="arm-stat-val">${arm.run.assistantTurns}</div><div class="arm-stat-label">Turns</div></div>
+        <div class="arm-stat"><div class="arm-stat-val">${formatDuration(head.dur)}</div><div class="arm-stat-label">${head.tag} Duration</div></div>
+        <div class="arm-stat"><div class="arm-stat-val">${has ? formatCost(head.cost) : "N/A"}</div><div class="arm-stat-label">${head.tag} Cost</div></div>
+        <div class="arm-stat"><div class="arm-stat-val">${has ? formatTokens(head.out) : "N/A"}</div><div class="arm-stat-label">${head.tag} Output Tokens</div></div>
+        <div class="arm-stat"><div class="arm-stat-val">${head.turns}</div><div class="arm-stat-label">${head.tag} ${a ? "Messages" : "Turns"}</div></div>
       </div>
       ${has ? `<div class="arm-tokens">
-        Fresh Input: <span>${formatTokens(t.inputTokens)}</span> &nbsp;
+        ${a ? `Core cache read: <span>${formatTokens(a.core.cacheReadTokens)}</span> &nbsp; Housekeeping: <span>${a.housekeeping.turns} msgs, ${formatCost(a.housekeeping.costUsd)}, ${formatDuration(a.housekeeping.durationMs)}</span> &nbsp;` : ""}
+        Raw &mdash; Fresh Input: <span>${formatTokens(t.inputTokens)}</span> &nbsp;
         Output: <span>${formatTokens(t.outputTokens)}</span> &nbsp;
         Cache Read: <span>${formatTokens(t.cacheReadTokens)}</span> &nbsp;
-        Cache Write: <span>${formatTokens(t.cacheCreationTokens)}</span> &nbsp;
-        Total: <span>${formatTokens(totalTokens(t))}</span>
+        Cache Write: <span>${formatTokens(t.cacheCreationTokens)}</span>
       </div>` : `<div class="arm-tokens" style="color: var(--text-muted);">Token data unavailable</div>`}
       <div class="arm-tokens">
         ${hasTiming(arm) ? `Model time: <span>${formatDuration(modelTimeMs(arm))}</span> &nbsp; Tool time: <span>${formatDuration(toolTimeMs(arm))}</span> &nbsp;` : ""}

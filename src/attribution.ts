@@ -45,42 +45,50 @@ function resultExcerpt(name: string, args: string, body: string): string {
   return excerpt(body, 300);
 }
 
-// One row per top-level assistant turn: what it said, what it ran, what came
-// back, what it cost and how long until the next turn. Per-turn cost is priced
-// from the turn's own usage and scaled so the turns sum to the run's billed
-// total, which absorbs subagent usage and any pricing drift.
+// One row per API message. The stream emits one assistant event per content
+// block, and every block of a message carries the same usage snapshot, so
+// blocks are grouped by message id before anything is summed. That snapshot's
+// output_tokens is the message-start value (near zero), so per-message output
+// is estimated by sharing the run's real output total across messages in
+// proportion to their content size (thinking + text + tool input). Per-message
+// cost is priced from the usage and scaled so the messages sum to the billed
+// total.
 export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[] {
   const events = jsonl.split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-  const turns: (WalkTurn & { ts: number; rawCost: number })[] = [];
+  type Row = WalkTurn & { ts: number; rawCost: number; chars: number; usage: Record<string, number>; model: string };
+  const rows: Row[] = [];
+  const byId = new Map<string, Row>();
   const pending = new Map<string, WalkTool>();
   let endTs = NaN;
+  let totalOutput = 0;
 
   for (const e of events) {
     const ts = typeof e.timestamp === "string" ? Date.parse(e.timestamp) : NaN;
-    if (e.type === "result" && !Number.isNaN(ts)) endTs = ts;
-    if (typeof e.parent_tool_use_id === "string") continue; // subagent traffic: folded into the parent turn's cost via scaling
+    if (e.type === "result") {
+      if (!Number.isNaN(ts)) endTs = ts;
+      for (const mu of Object.values((e.modelUsage ?? {}) as Record<string, { outputTokens?: number }>)) totalOutput += mu.outputTokens ?? 0;
+      if (!totalOutput && e.usage?.output_tokens) totalOutput = e.usage.output_tokens;
+    }
+    if (typeof e.parent_tool_use_id === "string") continue; // subagent traffic: folded in via cost scaling
 
     if (e.type === "assistant") {
-      const model = typeof e.message?.model === "string" ? e.message.model : "opus";
-      const u = e.message?.usage ?? {};
-      const rawCost = costAt(priceFor(model), {
-        inputTokens: u.input_tokens ?? 0, outputTokens: u.output_tokens ?? 0,
-        cacheReadTokens: u.cache_read_input_tokens ?? 0, cacheCreationTokens: u.cache_creation_input_tokens ?? 0,
-      });
-      const turn: WalkTurn & { ts: number; rawCost: number } = {
-        turn: turns.length + 1, text: "", tools: [], startMs: Number.isNaN(ts) ? 0 : ts, costUsd: 0, durationMs: 0,
-        outputTokens: u.output_tokens ?? 0, cacheReadTokens: u.cache_read_input_tokens ?? 0, ts, rawCost,
-      };
+      const id = String(e.message?.id ?? `evt-${rows.length}`);
+      let row = byId.get(id);
+      if (!row) {
+        row = { turn: rows.length + 1, text: "", tools: [], startMs: Number.isNaN(ts) ? 0 : ts, costUsd: 0, durationMs: 0, outputTokens: 0, cacheReadTokens: 0,
+          ts, rawCost: 0, chars: 0, usage: e.message?.usage ?? {}, model: typeof e.message?.model === "string" ? e.message.model : "opus" };
+        rows.push(row); byId.set(id, row);
+      }
       for (const block of e.message?.content ?? []) {
-        if (block.type === "text" && block.text) turn.text += excerpt(block.text, 200) + " ";
+        if (block.type === "thinking") row.chars += String(block.thinking ?? "").length;
+        if (block.type === "text" && block.text) { row.text += excerpt(block.text, 200) + " "; row.chars += block.text.length; }
         if (block.type === "tool_use" && block.name) {
+          row.chars += JSON.stringify(block.input ?? {}).length;
           const tool: WalkTool = { name: block.name, args: argsExcerpt(block.name, block.input ?? {}), result: "" };
-          turn.tools.push(tool);
+          row.tools.push(tool);
           if (block.id) pending.set(block.id, tool);
         }
       }
-      turn.text = turn.text.trim();
-      turns.push(turn);
     } else if (e.type === "user" && Array.isArray(e.message?.content)) {
       for (const block of e.message.content) {
         if (block.type !== "tool_result") continue;
@@ -93,14 +101,24 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
     }
   }
 
-  for (let i = 0; i < turns.length; i++) {
-    const next = i + 1 < turns.length ? turns[i + 1].ts : endTs;
-    turns[i].durationMs = !Number.isNaN(turns[i].ts) && !Number.isNaN(next) ? Math.max(0, next - turns[i].ts) : 0;
+  const totalChars = rows.reduce((a, r) => a + r.chars, 0) || 1;
+  for (const r of rows) {
+    r.text = r.text.trim();
+    r.outputTokens = Math.round(totalOutput * (r.chars / totalChars));
+    r.cacheReadTokens = r.usage.cache_read_input_tokens ?? 0;
+    r.rawCost = costAt(priceFor(r.model), {
+      inputTokens: r.usage.input_tokens ?? 0, outputTokens: r.outputTokens,
+      cacheReadTokens: r.cacheReadTokens, cacheCreationTokens: r.usage.cache_creation_input_tokens ?? 0,
+    });
   }
-  const rawSum = turns.reduce((a, t) => a + t.rawCost, 0);
+  for (let i = 0; i < rows.length; i++) {
+    const next = i + 1 < rows.length ? rows[i + 1].ts : endTs;
+    rows[i].durationMs = !Number.isNaN(rows[i].ts) && !Number.isNaN(next) ? Math.max(0, next - rows[i].ts) : 0;
+  }
+  const rawSum = rows.reduce((a, r) => a + r.rawCost, 0);
   const scale = totalCostUsd && rawSum > 0 ? totalCostUsd / rawSum : 1;
-  for (const t of turns) t.costUsd = t.rawCost * scale;
-  return turns.map(({ ts: _ts, rawCost: _rc, ...t }) => t);
+  for (const r of rows) r.costUsd = r.rawCost * scale;
+  return rows.map(({ ts: _ts, rawCost: _rc, chars: _c, usage: _u, model: _m, ...t }) => t);
 }
 
 function renderWalk(walk: WalkTurn[]): string {

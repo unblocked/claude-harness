@@ -1,5 +1,5 @@
 // Generate a comparison report from two existing stream-json transcripts.
-// Usage: bun scripts/report_from_jsonl.ts <baseline.jsonl> <unblocked.jsonl> [result.json | model] [branch] [task] [--attribute[=model]]
+// Usage: bun scripts/report_from_jsonl.ts <baseline.jsonl> <unblocked.jsonl> [result.json | model] [branch] [task] [--attribute[=model]] [--rejudge]
 // Token usage and tool calls are always re-parsed from the transcripts. The
 // task prompt, branch, and code diffs are not recorded in stream-json output:
 // pass the run's original result.json (third argument, detected by .json
@@ -79,13 +79,15 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
     diffStats: orig?.diffStats ?? { filesChanged: 0, linesAdded: 0, linesRemoved: 0, commits: 0 },
     unblockedCalls: unblockedCalls(parsed.toolCalls),
     estimatedCost: cost,
+    // Carried over unless --attribute recomputes it; the analyst call is the slow part.
+    attribution: orig?.attribution,
   };
 }
 
 // --attribute[=model] runs the per-turn attribution pass (default model: opus).
 const attrFlag = process.argv.find(a => a.startsWith("--attribute"));
 const analystModel = attrFlag ? (attrFlag.split("=")[1] || "opus") : null;
-const [,, baseFile, ubFile, thirdArg, branchArg, ...taskArg] = process.argv.filter(a => !a.startsWith("--attribute"));
+const [,, baseFile, ubFile, thirdArg, branchArg, ...taskArg] = process.argv.filter(a => !a.startsWith("--"));
 const orig: ComparisonResult | undefined = thirdArg?.endsWith(".json")
   ? JSON.parse(fs.readFileSync(thirdArg, "utf8"))
   : undefined;
@@ -115,7 +117,12 @@ const result: ComparisonResult = {
   totalEstimatedCost: baseline.estimatedCost + unblocked.estimatedCost,
 };
 
-if (analystModel) {
+// The judge is the expensive, non-deterministic step; keep a previous verdict
+// from the supplied result.json unless --rejudge is passed.
+const rejudge = process.argv.includes("--rejudge");
+if (orig?.quality && !rejudge) {
+  result.quality = orig.quality;
+} else if (analystModel) {
   const q = assessQuality(result, analystModel);
   if (q) result.quality = q;
 }
