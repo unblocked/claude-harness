@@ -161,34 +161,36 @@ function extractUnblockedCalls(toolCalls: { name: string; args: Record<string, u
   return calls;
 }
 
-const BASELINE_NUDGE = `IMPORTANT: Do NOT use any Unblocked tools, Unblocked skills, or Unblocked CLI commands. Do NOT call context_research, context_get_urls, or any tool with "unblocked" in its name. Do NOT run the "unblocked" CLI binary. You may use all other tools, MCP servers, plugins, and skills.
+// The same research discipline goes to both arms, with only the tool named
+// differently, so the comparison measures the tool and not the instructions.
+// A research result that comes back empty is treated as evidence, not as a
+// finding: the agent is told to check a second source before concluding that
+// something does not exist.
+const RESEARCH_DISCIPLINE = `How to research, whatever tools you use:
+- Before writing code, look for the convention this organisation already uses for this class of problem: prior art in this repository, in other repositories, in build images and shared actions, in docs, tickets and past discussions.
+- After planning, check for operational risks, previous incidents, deployment gotchas and rejected approaches related to your plan. Before implementing an unfamiliar pattern, verify conventions and team decisions.
+- A search that returns nothing is not a finding. If a source returns nothing on a question that matters, check a second source before concluding that nothing exists: a code search across the organisation's repositories, the file a comment or ticket points at, a runbook.
+- In your final response, say where each decisive fact came from, and say plainly when you are inferring.`;
+
+const BASELINE_NUDGE = `IMPORTANT: Do NOT use any Unblocked tools, Unblocked skills, or Unblocked CLI commands. Do NOT call context_research, context_get_urls, or any tool with "unblocked" in its name. Do NOT run the "unblocked" CLI binary. You may use all other tools, MCP servers, plugins, and skills, including code search across the organisation's repositories.
+
+${RESEARCH_DISCIPLINE}
 
 TASK:
 `;
 
-const UNBLOCKED_MCP_NUDGE = `IMPORTANT: Before doing anything else, call the Unblocked context_research MCP tool with a detailed query describing the task (effort: low). This is your FIRST action.
+const UNBLOCKED_MCP_NUDGE = `IMPORTANT: Before doing anything else, call the Unblocked context_research MCP tool with a detailed query describing the task (effort: low). This is your FIRST action. Use context_research again (effort: low) at the points below, and context_get_urls to expand on anything it surfaces. You may also use all other tools, MCP servers, plugins, and skills.
 
-After that initial call, there are points in your planning and implementation flow where additional calls to context_research would be useful (always effort: low):
-- After planning: check for operational risks, previous incidents, deployment gotchas, or rejected approaches related to your plan
-- Before implementing unfamiliar patterns: verify conventions and team decisions
-
-If you need to expand on something context_research surfaced, use context_get_urls to fetch additional detail.
-
-You may also use all other tools, MCP servers, plugins, and skills as needed.
+${RESEARCH_DISCIPLINE}
 
 TASK:
 `;
 
 const UNBLOCKED_CLI_NUDGE = `IMPORTANT: Before doing anything else, run the Unblocked CLI to research this task. This is your FIRST action:
 unblocked context-research --effort low --query "<detailed query describing the task>"
+Use context-research again (--effort low) at the points below, and context-get-urls to expand on anything it surfaces. You may also use all other tools, MCP servers, plugins, and skills.
 
-After that initial call, continue using context-research throughout the task (always --effort low):
-- After planning: check for operational risks, previous incidents, deployment gotchas, or rejected approaches related to your plan
-- Before implementing unfamiliar patterns: verify conventions and team decisions
-
-If you need to expand on something context-research surfaced, use context-get-urls to fetch additional detail.
-
-You may also use all other tools, MCP servers, plugins, and skills as needed.
+${RESEARCH_DISCIPLINE}
 
 TASK:
 `;
