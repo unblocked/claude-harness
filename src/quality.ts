@@ -144,7 +144,8 @@ export function assessQuality(result: ComparisonResult, model: string): QualityA
 
   const prompt = judgePrompt(result.task, first, second);
   log(`Quality: judging with ${model} (${Math.round(prompt.length / 1000)}k chars, arm A = ${aIsBaseline ? "baseline" : "unblocked"})…`);
-  const res = runStructured<Raw>("Quality", prompt, model, SCHEMA);
+  // Unredacted: the judge must see digests, env var names and auth headers as written.
+  const res = runStructured<Raw>("Quality", prompt, model, SCHEMA, 15 * 60 * 1000, false);
   if (!res) return null;
   const raw = res.data;
 

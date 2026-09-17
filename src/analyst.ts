@@ -38,10 +38,12 @@ function callOnce(prompt: string, model: string, schema: object, timeoutMs: numb
   return { out, declined: /safeguards flagged/i.test(msg), error: msg.slice(0, 200) };
 }
 
-// Runs the prompt (redacted) and returns the schema-shaped result, or null
-// after logging why. Cost includes declined attempts, which still bill.
-export function runStructured<T>(what: string, prompt: string, model: string, schema: object, timeoutMs = 15 * 60 * 1000): StructuredResult<T> | null {
-  const p = redact(prompt);
+// Runs the prompt and returns the schema-shaped result, or null after logging
+// why. Cost includes declined attempts, which still bill. `redactInput` strips
+// strings that have tripped input safeguards; leave it off when the caller
+// needs them intact (the quality judge reads image digests and env names).
+export function runStructured<T>(what: string, prompt: string, model: string, schema: object, timeoutMs = 15 * 60 * 1000, redactInput = true): StructuredResult<T> | null {
+  const p = redactInput ? redact(prompt) : prompt;
   let cost = 0;
   let modelUsed = model;
   let r = callOnce(p, model, schema, timeoutMs);
