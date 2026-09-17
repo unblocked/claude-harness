@@ -170,6 +170,10 @@ function armSummary(label: string, arm: ArmResult): string[] {
     ] : []),
     `  ${padRight("Tool calls", 28)}${padLeft(String(arm.run.toolCalls.length), 10)}  Unblocked: ${arm.unblockedCalls.length}${shellOnlyEdits(arm) ? "  (all edits via shell)" : ""}`,
     `  ${padRight("Diff", 28)}${formatDiffSummary(arm.diffStats)}`,
+    ...(arm.attribution ? [
+      `  ${padRight("Housekeeping turns", 28)}${padLeft(String(arm.attribution.housekeeping.turns), 10)}  ${padLeft(formatCost(arm.attribution.housekeeping.costUsd), 10)}  ${padLeft(formatDuration(arm.attribution.housekeeping.durationMs), 8)}`,
+      `  ${padRight("Through task (excl. hk)", 28)}${padLeft(formatDuration(arm.attribution.throughTask.durationMs), 10)}  ${padLeft(formatCost(arm.attribution.throughTask.costUsd), 10)}  ${padLeft(String(arm.attribution.throughTask.turns), 8)} turns`,
+    ] : []),
   ];
 }
 
@@ -207,6 +211,10 @@ export function printReport(result: ComparisonResult): void {
     r(`  ${padRight("Cache-read tokens", 28)}${padLeft(formatTokens(b.run.tokenUsage.cacheReadTokens), 10)}  →  ${padLeft(formatTokens(u.run.tokenUsage.cacheReadTokens), 10)}  (${pctChange(b.run.tokenUsage.cacheReadTokens, u.run.tokenUsage.cacheReadTokens)})`),
     r(`  ${padRight("Total tokens (all classes)", 28)}${padLeft(formatTokens(totalTokens(b.run.tokenUsage)), 10)}  →  ${padLeft(formatTokens(totalTokens(u.run.tokenUsage)), 10)}  (${pctChange(totalTokens(b.run.tokenUsage), totalTokens(u.run.tokenUsage))})`),
     r(`  ${padRight("Est. Cost", 28)}${padLeft(formatCost(b.estimatedCost), 10)}  →  ${padLeft(formatCost(u.estimatedCost), 10)}  (${pctChange(b.estimatedCost, u.estimatedCost)})`),
+    ...(b.attribution && u.attribution ? [
+      r(`  ${padRight("  excl. housekeeping", 28)}${padLeft(formatCost(b.attribution.throughTask.costUsd), 10)}  →  ${padLeft(formatCost(u.attribution.throughTask.costUsd), 10)}  (${pctChange(b.attribution.throughTask.costUsd, u.attribution.throughTask.costUsd)})`),
+      r(`  ${padRight("Duration excl. housekeeping", 28)}${padLeft(formatDuration(b.attribution.throughTask.durationMs), 10)}  →  ${padLeft(formatDuration(u.attribution.throughTask.durationMs), 10)}  (${pctChange(b.attribution.throughTask.durationMs, u.attribution.throughTask.durationMs)})`),
+    ] : []),
     r(`  ${padRight("Tool calls", 28)}${padLeft(String(b.run.toolCalls.length), 10)}  →  ${padLeft(String(u.run.toolCalls.length), 10)}  (${pctChange(b.run.toolCalls.length, u.run.toolCalls.length)})`),
   ];
 
@@ -284,6 +292,34 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   const timeU = toolTimeBreakdown(u.run.toolCalls);
   const allTools = [...new Set([...Object.keys(toolsB), ...Object.keys(toolsU)])].sort();
   const hasToolTiming = hasTiming(b) || hasTiming(u);
+  const hasAttr = !!(b.attribution && u.attribution);
+
+  const attributionSection = (label: string, arm: ArmResult) => {
+    const a = arm.attribution!;
+    const row = (name: string, t: { costUsd: number; durationMs: number; turns: number }) =>
+      `<tr><td>${name}</td><td>${t.turns}</td><td>${formatCost(t.costUsd)}</td><td>${formatDuration(t.durationMs)}</td></tr>`;
+    const excluded = a.turns.filter(t => t.label === "housekeeping").map(t => `
+        <tr>
+          <td>${t.turn}</td>
+          <td>${formatCost(t.costUsd)}</td>
+          <td>${formatDuration(t.durationMs)}</td>
+          <td style="font-family: 'SF Mono', 'Fira Code', Consolas, monospace; font-size: 12px;">${escapeHtml(t.summary)}</td>
+          <td style="font-size: 12px; color: var(--text-muted);">${escapeHtml(t.reason)}${t.repeatOf ? ` (repeats turn ${t.repeatOf})` : ""}</td>
+        </tr>`).join("");
+    return `
+      <div class="arm-section">
+        <div class="arm-header"><span class="arm-name">${escapeHtml(label)}</span>
+          <span style="font-size: 12px; color: var(--text-muted);">task complete at turn ${a.taskCompleteTurn} of ${a.raw.turns}</span></div>
+        <table class="tool-table">
+          <thead><tr><th></th><th>Turns</th><th>Cost</th><th>Time</th></tr></thead>
+          <tbody>${row("Raw", a.raw)}${row("Through task (excl. housekeeping)", a.throughTask)}${row("Housekeeping", a.housekeeping)}</tbody>
+        </table>
+        ${excluded ? `<table class="tool-table" style="border-top: 1px solid var(--border);">
+          <thead><tr><th>Turn</th><th>Cost</th><th>Time</th><th>What it did</th><th>Why excluded</th></tr></thead>
+          <tbody>${excluded}</tbody>
+        </table>` : `<div class="arm-tokens" style="color: var(--text-muted);">No housekeeping turns</div>`}
+      </div>`;
+  };
   const timeCell = (ms: number | undefined) => ms ? formatDuration(ms) : `<span style="color: var(--text-muted)">–</span>`;
 
   const armModels = (tools: Record<string, Record<string, number>>) =>
@@ -795,6 +831,8 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     ${hasToolTiming ? barPair("Model time", bModelMs, uModelMs, maxTime, formatDuration, "thinking + generation") : ""}
     ${hasToolTiming ? barPair("Tool time", bToolMs, uToolMs, maxTime, formatDuration, "tests, CI, MCP, shell") : ""}
     ${barPair("Est. Cost", b.estimatedCost, u.estimatedCost, maxCost, formatCost)}
+    ${hasAttr ? barPair("Cost excl. housekeeping", b.attribution!.throughTask.costUsd, u.attribution!.throughTask.costUsd, maxCost, formatCost, "tidying, committing, redundant reruns removed") : ""}
+    ${hasAttr ? barPair("Duration excl. housekeeping", b.attribution!.throughTask.durationMs, u.attribution!.throughTask.durationMs, maxTime, formatDuration) : ""}
     ${barPair("Output tokens", bOut, uOut, maxOut, formatTokens, "what the model wrote")}
     ${barPair("Cache-read tokens", bCache, uCache, maxCache, formatTokens, "context re-read per turn; 2% of output price")}
     ${barPair("Total tokens", bTokens, uTokens, maxTokens, formatTokens, "all classes summed — not cost-proportional")}
@@ -841,6 +879,18 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       ${n} changed ${(a as ArmResult).diffStats.filesChanged} file${(a as ArmResult).diffStats.filesChanged === 1 ? "" : "s"} without any Edit/Write call — see "Bash (writes files)" for the shell commands that did it. The diff below is the ground truth.
     </div>`).join("")}
   </div>
+
+  ${hasAttr ? `
+  <div class="section">
+    <div class="section-title">Turn Attribution</div>
+    <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">
+      Each turn labelled by ${escapeHtml(b.attribution!.analystModel)} as task work, verification, or housekeeping (tidying, committing, redundant reruns).
+      "Through task" removes housekeeping from both arms with the same rule. Every excluded turn is listed so the call can be checked.
+      Analyst cost: ${formatCost(b.attribution!.analystCostUsd + u.attribution!.analystCostUsd)} (not included in arm costs).
+    </div>
+    ${attributionSection("Baseline", b)}
+    ${attributionSection("With Unblocked", u)}
+  </div>` : ""}
 
   ${hasToolTiming ? `
   <div class="section">

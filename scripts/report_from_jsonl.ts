@@ -1,5 +1,5 @@
 // Generate a comparison report from two existing stream-json transcripts.
-// Usage: bun scripts/report_from_jsonl.ts <baseline.jsonl> <unblocked.jsonl> [result.json | model] [branch] [task]
+// Usage: bun scripts/report_from_jsonl.ts <baseline.jsonl> <unblocked.jsonl> [result.json | model] [branch] [task] [--attribute[=model]]
 // Token usage and tool calls are always re-parsed from the transcripts. The
 // task prompt, branch, and code diffs are not recorded in stream-json output:
 // pass the run's original result.json (third argument, detected by .json
@@ -10,6 +10,7 @@ import path from "node:path";
 import { parseStreamJson } from "../src/claude.ts";
 import { printReport, writeHtmlReport, writeJsonResult } from "../src/report.ts";
 import { estimateCost } from "../src/util.ts";
+import { attribute } from "../src/attribution.ts";
 import type { ArmResult, ComparisonResult, Condition, UnblockedCall } from "../src/types.ts";
 
 interface InitInfo { cwd?: string; model?: string }
@@ -80,7 +81,10 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
   };
 }
 
-const [,, baseFile, ubFile, thirdArg, branchArg, ...taskArg] = process.argv;
+// --attribute[=model] runs the per-turn attribution pass (default model: opus).
+const attrFlag = process.argv.find(a => a.startsWith("--attribute"));
+const analystModel = attrFlag ? (attrFlag.split("=")[1] || "opus") : null;
+const [,, baseFile, ubFile, thirdArg, branchArg, ...taskArg] = process.argv.filter(a => !a.startsWith("--attribute"));
 const orig: ComparisonResult | undefined = thirdArg?.endsWith(".json")
   ? JSON.parse(fs.readFileSync(thirdArg, "utf8"))
   : undefined;
@@ -92,6 +96,12 @@ const task = orig?.task ?? (taskArg.join(" ") || "(task not recorded in transcri
 const repo = orig?.repo ?? repoFromCwd(init.cwd) ?? "(from transcripts)";
 const baseline = arm("baseline", baseFile, model, orig?.baseline);
 const unblocked = arm("unblocked", ubFile, model, orig?.unblocked);
+if (analystModel) {
+  for (const a of [baseline, unblocked]) {
+    const attr = attribute(a.run.jsonlPath, task, a.run.totalCostUsd ?? a.estimatedCost, analystModel, a.condition);
+    if (attr) a.attribution = attr;
+  }
+}
 
 const result: ComparisonResult = {
   repo,
