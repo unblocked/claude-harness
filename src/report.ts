@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ArmResult, ComparisonResult, Met, ToolCall } from "./types.ts";
-import { costAt, formatCost, formatDiffSummary, formatDuration, formatTokens, padLeft, padRight, priceFor, totalTokens, uncachedTokens } from "./util.ts";
+import { formatCost, formatDiffSummary, formatDuration, formatTokens, modelCost, padLeft, padRight, priceFor, totalTokens, uncachedTokens } from "./util.ts";
 import type { TokenUsage } from "./types.ts";
 
 const W = 78;
@@ -32,7 +32,7 @@ const BASH_WRITE_RE = new RegExp([
   String.raw`\btee\s+(?:-a\s+)?(?!/dev/)[\w./-]+`,                                                          // tee file
   String.raw`\bgit\s+apply\b`,
   String.raw`(?:^|[\s;&|])patch\s+(?:-p\d\s+)?[<\w]`,
-  String.raw`(?:^|[^\w<>=&$])>{1,2}\s*(?!/dev/|&)['"]?[\w./~-]+`,                                             // echo x > file; not 2>, =>, >&, /dev/null
+  String.raw`(?:^|[^\w<>=&$-])>{1,2}\s*(?!/dev/|&)['"]?[\w./~-]+`,                                             // echo x > file; not 2>, =>, >&, /dev/null
 ].join("|"), "m");
 
 function bashWritesFiles(cmd: string): boolean {
@@ -76,20 +76,9 @@ function hasTiming(arm: ArmResult): boolean {
   return arm.run.toolCalls.some(tc => (tc.durationMs ?? 0) > 0);
 }
 
-// Tool wall time inside core turns only (union, subagent calls excluded).
-function coreToolTimeMs(arm: ArmResult): number {
-  const a = arm.attribution;
-  if (!a) return toolTimeMs(arm);
-  const windows = a.turns.filter(t => t.label !== "housekeeping" && t.startMs > 0).map(t => [t.startMs, t.startMs + t.durationMs] as const);
-  const inCore = (tc: ToolCall) => windows.some(([s, e]) => tc.timestamp >= s && tc.timestamp < e);
-  return unionMs(arm.run.toolCalls.filter(inCore));
-}
-
-function coreModelTimeMs(arm: ArmResult): number {
-  const a = arm.attribution;
-  if (!a) return modelTimeMs(arm);
-  return Math.max(0, a.core.durationMs - coreToolTimeMs(arm));
-}
+// Core model/tool time straight from the per-message windows (attribution.ts).
+function coreToolTimeMs(arm: ArmResult): number { return arm.attribution ? arm.attribution.core.toolMs : toolTimeMs(arm); }
+function coreModelTimeMs(arm: ArmResult): number { return arm.attribution ? arm.attribution.core.modelMs : modelTimeMs(arm); }
 
 // Short description of what the housekeeping turns were, for the summary line.
 function housekeepingKinds(arm: ArmResult): string {
@@ -132,7 +121,7 @@ function modelTimeMs(arm: ArmResult): number {
 // meant to show where the *rest* of the wall time went (tests, CI, shell).
 function slowestTools(toolCalls: ToolCall[], n: number): ToolCall[] {
   return [...toolCalls]
-    .filter(tc => (tc.durationMs ?? 0) > 0 && toolCategory(tc) !== "Unblocked")
+    .filter(tc => (tc.durationMs ?? 0) > 0 && !tc.nested && toolCategory(tc) !== "Unblocked")
     .sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0))
     .slice(0, n);
 }
@@ -199,7 +188,7 @@ function armSummary(label: string, arm: ArmResult): string[] {
       `  ${padRight("Tokens in/out", 28)}${padLeft(formatTokens(u.inputTokens), 10)} / ${padLeft(formatTokens(u.outputTokens), 10)}`,
       `  ${padRight("  (cache r/w)", 28)}${padLeft(formatTokens(u.cacheReadTokens), 10)} / ${padLeft(formatTokens(u.cacheCreationTokens), 10)}`,
       ...modelEntries(u).map(([m, mu]) =>
-        `  ${padRight(`  ${modelLabel(m)}`, 28)}${padLeft(formatTokens(uncachedTokens(mu)), 10)}  ${padLeft(formatTokens(mu.cacheReadTokens), 10)} cached  ${padLeft(formatCost(costAt(priceFor(m), mu)), 8)}`),
+        `  ${padRight(`  ${modelLabel(m)}`, 28)}${padLeft(formatTokens(uncachedTokens(mu)), 10)}  ${padLeft(formatTokens(mu.cacheReadTokens), 10)} cached  ${padLeft(formatCost(modelCost(m, mu)), 8)}`),
     ] : []),
     `  ${padRight("Tool calls", 28)}${padLeft(String(arm.run.toolCalls.length), 10)}  Unblocked: ${arm.unblockedCalls.length}${shellOnlyEdits(arm) ? "  (all edits via shell)" : ""}`,
     `  ${padRight("Diff", 28)}${formatDiffSummary(arm.diffStats)}`,
@@ -283,7 +272,7 @@ export function printReport(result: ComparisonResult): void {
   }
 
   lines.push(blank());
-  lines.push(r(`  Total experiment time: ${formatDuration(result.totalDurationMs)}    Cost: ${formatCost(result.totalEstimatedCost)}`));
+  lines.push(r(`  Longest arm: ${formatDuration(result.totalDurationMs)}    Arms cost: ${formatCost(result.totalEstimatedCost)}${result.analysisCostUsd ? `    Analysis: ${formatCost(result.analysisCostUsd)}` : ""}`));
   lines.push("╚" + "═".repeat(W + 2) + "╝");
   lines.push("");
 
@@ -329,11 +318,6 @@ function barWidth(value: number, max: number): number {
 export function writeHtmlReport(result: ComparisonResult, outDir: string): string {
   const b = result.baseline;
   const u = result.unblocked;
-  const bTokens = totalTokens(b.run.tokenUsage);
-  const uTokens = totalTokens(u.run.tokenUsage);
-  const bHasTokens = totalTokens(b.run.tokenUsage) > 0;
-  const uHasTokens = totalTokens(u.run.tokenUsage) > 0;
-
   const toolsB = toolBreakdown(b.run.toolCalls);
   const toolsU = toolBreakdown(u.run.toolCalls);
   const timeB = toolTimeBreakdown(b.run.toolCalls);
@@ -341,6 +325,8 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   const allTools = [...new Set([...Object.keys(toolsB), ...Object.keys(toolsU)])].sort();
   const hasToolTiming = hasTiming(b) || hasTiming(u);
   const hasAttr = !!(b.attribution && u.attribution);
+  // Old transcripts carry no per-event timestamps; then durations are 0 and time rows are meaningless.
+  const hasCoreTiming = hasAttr && (b.attribution!.raw.durationMs > 0 || u.attribution!.raw.durationMs > 0);
   const timeCell = (ms: number | undefined) => ms ? formatDuration(ms) : `<span style="color: var(--text-muted)">–</span>`;
 
   const armModels = (tools: Record<string, Record<string, number>>) =>
@@ -359,11 +345,12 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
 
 
   const heroCard = (label: string, bVal: number, uVal: number, fmt: (n: number) => string) => {
-    const better = uVal < bVal;
+    const pct = pctChange(bVal, uVal);
+    const cls = pct === "N/A" || /^[+-]?0%$/.test(pct) ? " neutral" : uVal < bVal ? " positive" : " negative";
     return `
-    <div class="hero-card${better ? " positive" : " negative"}">
+    <div class="hero-card${cls}">
       <div class="hero-label">${label}</div>
-      <div class="hero-value${better ? " positive" : " negative"}">${pctChange(bVal, uVal)}</div>
+      <div class="hero-value${cls}">${pct}</div>
       <div class="hero-detail">${fmt(bVal)} &rarr; ${fmt(uVal)}</div>
     </div>`;
   };
@@ -442,7 +429,6 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
 
   const maxTime = Math.max(b.run.durationMs, u.run.durationMs, 1);
   const maxCost = Math.max(b.estimatedCost, u.estimatedCost, 0.0001);
-  const maxTokens = Math.max(bTokens, uTokens, 1);
   const bOut = b.run.tokenUsage.outputTokens, uOut = u.run.tokenUsage.outputTokens;
   const bCache = b.run.tokenUsage.cacheReadTokens, uCache = u.run.tokenUsage.cacheReadTokens;
   const maxOut = Math.max(bOut, uOut, 1);
@@ -483,7 +469,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
         <td>${formatTokens(mu.outputTokens)}</td>
         <td>${formatTokens(mu.cacheReadTokens)}</td>
         <td>${formatTokens(mu.cacheCreationTokens)}</td>
-        <td>${formatCost(costAt(priceFor(m), mu))}</td>
+        <td>${formatCost(modelCost(m, mu))}${typeof mu.costUsd === "number" ? "" : " (est.)"}</td>
       </tr>`).join("");
   const modelBreakdownRows = perModelRows("Baseline", b) + perModelRows("With Unblocked", u);
 
@@ -501,6 +487,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
         <td>$${p.output.toFixed(2)}</td>
         <td>$${p.cacheRead.toFixed(2)}</td>
         <td>$${p.cacheWrite.toFixed(2)}</td>
+        <td>$${p.cacheWrite1h.toFixed(2)}</td>
       </tr>`;
   }).join("");
 
@@ -638,6 +625,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   .hero-value.positive { color: var(--green); }
   .hero-value.negative { color: var(--red); }
   .hero-value.neutral { color: var(--accent-light); }
+  .hero-card.neutral::before { background: linear-gradient(90deg, var(--accent), var(--accent-light)); }
   .hero-detail {
     font-size: 14px;
     color: var(--text-muted);
@@ -874,7 +862,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     <div class="meta-item"><span class="meta-key">Repository</span><span class="meta-val">${escapeHtml(repoName(result.repo))}</span></div>
     <div class="meta-item"><span class="meta-key">Branch</span><span class="meta-val">${escapeHtml(result.branch)}</span></div>
     <div class="meta-item"><span class="meta-key">Model</span><span class="meta-val">${escapeHtml(result.model)}</span></div>
-    <div class="meta-item"><span class="meta-key">Duration</span><span class="meta-val">${formatDuration(result.totalDurationMs)}</span></div>
+    <div class="meta-item"><span class="meta-key">Arms cost / analysis</span><span class="meta-val">${formatCost(result.totalEstimatedCost)}${result.analysisCostUsd ? ` / ${formatCost(result.analysisCostUsd)}` : ""}</span></div>
   </div>
 
   <div class="section">
@@ -887,15 +875,15 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   ${hasAttr ? `
   <div class="section">
     <div class="section-title">1 · Core task work</div>
-    <div class="section-note">Information gathering, writing code, running tests. The part of a run that context can influence and that repeats across runs. Housekeeping turns (section 2) are removed from both arms by the same rule.</div>
+    <div class="section-note">Information gathering, writing code, running tests. The part of a run that context can influence and that repeats across runs. Housekeeping messages (section 2) are removed from both arms by the same rule.${(b.attribution!.outputExact && u.attribution!.outputExact) ? "" : " Per-message output tokens are shared out from the run total by content size (transcript recorded without --include-partial-messages); run totals are exact."}</div>
     <div class="hero-grid hero-3">
       ${heroCard("Cost", b.attribution!.core.costUsd, u.attribution!.core.costUsd, formatCost)}
-      ${heroCard("Time", b.attribution!.core.durationMs, u.attribution!.core.durationMs, formatDuration)}
+      ${hasCoreTiming ? heroCard("Time", b.attribution!.core.durationMs, u.attribution!.core.durationMs, formatDuration) : ""}
       ${heroCard("Output tokens", b.attribution!.core.outputTokens, u.attribution!.core.outputTokens, formatTokens)}
     </div>
     ${barPair("Cost", b.attribution!.core.costUsd, u.attribution!.core.costUsd, maxCost, formatCost)}
-    ${barPair("Model time", coreModelTimeMs(b), coreModelTimeMs(u), maxTime, formatDuration, "thinking + generation")}
-    ${barPair("Tool time", coreToolTimeMs(b), coreToolTimeMs(u), maxTime, formatDuration, "tests, CI, MCP, shell")}
+    ${hasCoreTiming ? barPair("Model time", coreModelTimeMs(b), coreModelTimeMs(u), maxTime, formatDuration, "thinking + generation") : ""}
+    ${hasCoreTiming ? barPair("Tool time", coreToolTimeMs(b), coreToolTimeMs(u), maxTime, formatDuration, "tests, CI, MCP, shell") : ""}
     ${barPair("Output tokens", b.attribution!.core.outputTokens, u.attribution!.core.outputTokens, Math.max(b.attribution!.core.outputTokens, u.attribution!.core.outputTokens, 1), formatTokens, "what the model wrote")}
     ${barPair("Cache-read tokens", b.attribution!.core.cacheReadTokens, u.attribution!.core.cacheReadTokens, Math.max(b.attribution!.core.cacheReadTokens, u.attribution!.core.cacheReadTokens, 1), formatTokens, "context re-read per turn; 2% of output price")}
     ${barPair("Turns", b.attribution!.core.turns, u.attribution!.core.turns, Math.max(b.attribution!.core.turns, u.attribution!.core.turns, 1), String)}
@@ -985,10 +973,10 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   </div>` : ""}
 
   <div class="section">
-    <div class="section-title">Pricing &mdash; $ per million tokens</div>
+    <div class="section-title">Pricing &mdash; $ per million tokens <span class="section-sub">reference only; arm costs are what the CLI billed</span></div>
     <div class="tool-table-wrap">
       <table class="tool-table">
-        <thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Cache Read</th><th>Cache Write</th></tr></thead>
+        <thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Cache Read</th><th>Cache Write (5m)</th><th>Cache Write (1h)</th></tr></thead>
         <tbody>${pricingRows}</tbody>
       </table>
     </div>

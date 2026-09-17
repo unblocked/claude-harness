@@ -14,6 +14,8 @@ interface ModelUsage {
   outputTokens?: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
+  costUSD?: number;
+  thinkingTokens?: number;
 }
 
 interface ContentBlock {
@@ -32,6 +34,7 @@ interface ParsedStream {
   finalResponse: string;
   sessionId?: string;
   totalCostUsd: number | null;
+  cliDurationMs: number | null;
 }
 
 function parseToolName(name: string): { isMcp: boolean; mcpServer?: string } {
@@ -56,10 +59,11 @@ export function parseStreamJson(jsonl: string): ParsedStream {
   const toolCalls: ToolCall[] = [];
   // tool_use id -> the ToolCall awaiting its tool_result, so we can attribute wall time.
   const pending = new Map<string, ToolCall>();
-  let assistantTurns = 0;
+  const messageIds = new Set<string>();
   let finalResponse = "";
   let sessionId: string | undefined;
   let totalCostUsd: number | null = null;
+  let cliDurationMs: number | null = null;
 
   for (const e of events) {
     const eventMs = typeof e?.timestamp === "string" ? Date.parse(e.timestamp) : NaN;
@@ -82,7 +86,7 @@ export function parseStreamJson(jsonl: string): ParsedStream {
     }
 
     if (e?.type === "assistant") {
-      assistantTurns++;
+      if (typeof e.parent_tool_use_id !== "string") messageIds.add(String(e.message?.id ?? `evt-${messageIds.size}`));
       const content: ContentBlock[] = e.message?.content ?? [];
       for (const block of content) {
         if (block.type === "text" && typeof block.text === "string") {
@@ -115,6 +119,8 @@ export function parseStreamJson(jsonl: string): ParsedStream {
             outputTokens: mu.outputTokens ?? 0,
             cacheReadTokens: mu.cacheReadInputTokens ?? 0,
             cacheCreationTokens: mu.cacheCreationInputTokens ?? 0,
+            ...(typeof mu.costUSD === "number" ? { costUsd: mu.costUSD } : {}),
+            ...(typeof mu.thinkingTokens === "number" ? { thinkingTokens: mu.thinkingTokens } : {}),
           };
           byModel[model] = m;
           usage.inputTokens += m.inputTokens;
@@ -133,11 +139,12 @@ export function parseStreamJson(jsonl: string): ParsedStream {
       if (typeof e.total_cost_usd === "number") {
         totalCostUsd = e.total_cost_usd;
       }
+      if (typeof e.duration_ms === "number") cliDurationMs = e.duration_ms;
       if (e.session_id) sessionId = e.session_id;
     }
   }
 
-  return { tokenUsage: usage, toolCalls, assistantTurns, finalResponse, sessionId, totalCostUsd };
+  return { tokenUsage: usage, toolCalls, assistantTurns: messageIds.size, finalResponse, sessionId, totalCostUsd, cliDurationMs };
 }
 
 function isUnblockedTool(name: string): boolean {
@@ -165,43 +172,37 @@ export function createWorktree(repoPath: string, name: string, branch: string): 
   return { path: wtPath, baseSha };
 }
 
-// Branch names the worktree's HEAD ever pointed at, from its own reflog
-// ("checkout: moving from A to B"). Read before the worktree is removed, since
-// the reflog goes with it. Only the agent could have moved this HEAD, so this
-// is the set of branches it touched — nothing the user did elsewhere is here.
-function branchesVisitedByWorktree(wtPath: string): Set<string> {
-  const visited = new Set<string>();
-  const out = tryGit(wtPath, ["reflog", "show", "--format=%gs", "HEAD"], "reading worktree reflog for cleanup");
-  for (const line of (out ?? "").split("\n")) {
-    const m = line.match(/^checkout: moving from (\S+) to (\S+)$/);
-    if (m) { visited.add(m[1]); visited.add(m[2]); }
-  }
-  return visited;
-}
-
-// Removes the worktree, then any branch the agent created in it: a branch that
-// did not exist when the run started AND that this worktree's HEAD actually
-// checked out. Both conditions are required, so a branch the user made in their
-// own checkout while the run was in progress is never touched, and neither is
-// a pre-existing branch the agent merely looked at. Runs after the diff is
-// captured. Not called under --keep-worktrees.
-export function removeWorktree(repoPath: string, name: string, refsBefore: Map<string, string> | null): void {
+// Removes the worktree and undoes what the agent did to the repo's refs, using
+// the set of commits the agent made (see runner.ts agentCommits):
+//   - a branch that did not exist at run start and whose tip is an agent commit
+//     is deleted: the agent created it and it holds only the agent's work;
+//   - a branch that did exist and now points at an agent commit was moved by
+//     the agent (it checked it out and committed): it is reset to its pre-run
+//     sha, and the agent's tip is logged so it can be recovered;
+//   - anything else is left alone, including a branch the user created mid-run
+//     that the agent merely checked out.
+// Runs after the diff is captured. Not called under --keep-worktrees.
+export function removeWorktree(repoPath: string, name: string, refsBefore: Map<string, string> | null, agentCommits: Set<string>): void {
   const wtPath = worktreePath(repoPath, name);
-  const visited = fs.existsSync(wtPath) ? branchesVisitedByWorktree(wtPath) : new Set<string>();
-
   if (tryGit(repoPath, ["worktree", "remove", "--force", wtPath], `removing worktree ${name}`) === null) {
     tryGit(repoPath, ["worktree", "prune"], "pruning worktrees");
   }
+  if (!refsBefore) { log(`Skipping branch cleanup for ${name}: no ref snapshot from run start`); return; }
+  if (agentCommits.size === 0) return;
 
-  if (!refsBefore) {
-    log(`Skipping branch cleanup for ${name}: no ref snapshot from run start`);
-    return;
-  }
-  for (const b of visited) {
-    if (refsBefore.has(`refs/heads/${b}`)) continue; // existed before the run: not ours to delete
-    if (tryGit(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${b}`], `checking branch ${b}`) === null) continue; // not a local branch (detached sha, or already gone)
-    if (tryGit(repoPath, ["branch", "-D", b], `deleting agent-created branch ${b}`) !== null) {
-      log(`Deleted agent-created branch: ${b}`);
+  const now = tryGit(repoPath, ["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads"], "listing branches after run") ?? "";
+  for (const line of now.split("\n")) {
+    const sp = line.indexOf(" ");
+    if (sp <= 0) continue;
+    const sha = line.slice(0, sp), ref = line.slice(sp + 1), short = ref.replace(/^refs\/heads\//, "");
+    if (!agentCommits.has(sha)) continue;
+    const before = refsBefore.get(ref);
+    if (before === undefined) {
+      if (tryGit(repoPath, ["branch", "-D", short], `deleting agent-created branch ${short}`) !== null) log(`Deleted agent-created branch ${short} (was ${sha.slice(0, 7)})`);
+    } else if (before !== sha) {
+      if (tryGit(repoPath, ["update-ref", ref, before, sha], `resetting ${short} to its pre-run sha`) !== null) {
+        log(`Agent moved pre-existing branch ${short} to ${sha.slice(0, 7)}; reset to ${before.slice(0, 7)}. The agent's commit is still reachable by sha for a while.`);
+      }
     }
   }
 }
@@ -228,6 +229,9 @@ export async function runClaude(opts: {
     "-p",
     "--output-format", "stream-json",
     "--verbose",
+    // message_delta events carry each API message's exact output token count
+    // (thinking included); without them per-message output is an estimate.
+    "--include-partial-messages",
     "--dangerously-skip-permissions",
     "--model", opts.model,
   ];
@@ -372,8 +376,10 @@ export async function runClaude(opts: {
   const jsonl = fs.readFileSync(jsonlPath, "utf8");
   const parsed = parseStreamJson(jsonl);
 
+  const wallMs = Date.now() - started;
   return {
-    durationMs: Date.now() - started,
+    durationMs: parsed.cliDurationMs ?? wallMs,
+    wallMs,
     tokenUsage: parsed.tokenUsage,
     toolCalls: parsed.toolCalls,
     assistantTurns: parsed.assistantTurns,
