@@ -7,6 +7,7 @@ import { runClaude, createWorktree, removeWorktree } from "./claude.ts";
 import { printReport, writeJsonResult, writeHtmlReport } from "./report.ts";
 import { estimateCost, formatCost, formatDiffSummary, formatDuration, log } from "./util.ts";
 import { commitsBetween, git, isAncestor, refsContaining, snapshotRefs, tryGit } from "./git.ts";
+import { attribute } from "./attribution.ts";
 
 // The most recent commit in this worktree's HEAD reflog that descends from the
 // base and is not already part of history that existed before the run. Used only
@@ -247,6 +248,13 @@ export async function run(config: Config): Promise<ComparisonResult> {
         if (!arm) continue;
         removeWorktree(config.repo, path.basename(arm.run.worktreePath), refsBefore);
       }
+    }
+  }
+
+  if (config.analystModel) {
+    for (const arm of [baseline, unblocked]) {
+      const a = attribute(arm.run.jsonlPath, config.task, arm.run.totalCostUsd ?? arm.estimatedCost, config.analystModel, arm.condition);
+      if (a) arm.attribution = a;
     }
   }
 

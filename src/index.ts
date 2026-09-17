@@ -23,7 +23,10 @@ program
   .option("--timeout <seconds>", "Max seconds per arm", "3600")
   .option("--branch <name>", "Branch to base worktree on (default: current HEAD)")
   .option("--keep-worktrees", "Don't clean up worktrees after run", false)
-  .option("--cli", "Use Unblocked CLI via Bash tool instead of MCP", false);
+  .option("--cli", "Use Unblocked CLI via Bash tool instead of MCP", false)
+  // opus by default: fable's input safeguards declined 6 of 7 first attempts on ordinary CI transcripts.
+  .option("--analyst-model <model>", "Model that labels each turn as work/verify/housekeeping", "opus")
+  .option("--no-attribution", "Skip the per-turn attribution pass");
 
 program.parse();
 const opts = program.opts();
@@ -42,6 +45,7 @@ const config: Config = {
   branch: opts.branch ?? getCurrentBranch(repoPath),
   keepWorktrees: opts.keepWorktrees,
   cliMode: opts.cli,
+  analystModel: opts.attribution === false ? null : opts.analystModel,
 };
 
 run(config).catch((err) => {

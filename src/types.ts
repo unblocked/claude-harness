@@ -52,6 +52,31 @@ export interface DiffStats {
 
 export type Condition = "baseline" | "unblocked";
 
+export type TurnLabelKind = "work" | "verify" | "housekeeping";
+
+export interface TurnLabel {
+  turn: number;
+  label: TurnLabelKind;
+  // Turn this one redundantly repeats (e.g. a second CI run with no change in between), else null.
+  repeatOf: number | null;
+  reason: string;
+}
+
+export interface AttributionTotals { costUsd: number; durationMs: number; turns: number }
+
+// Per-turn labels from an analyst model plus the rollup. `throughTask` is the
+// run with housekeeping turns removed: the number to compare arms on when the
+// tail of tidying, committing and redundant reruns should not count.
+export interface Attribution {
+  analystModel: string;
+  analystCostUsd: number;
+  taskCompleteTurn: number;
+  raw: AttributionTotals;
+  throughTask: AttributionTotals;
+  housekeeping: AttributionTotals;
+  turns: (TurnLabel & { costUsd: number; durationMs: number; summary: string })[];
+}
+
 export interface ArmResult {
   condition: Condition;
   run: RunResult;
@@ -59,6 +84,7 @@ export interface ArmResult {
   diffStats: DiffStats;
   unblockedCalls: UnblockedCall[];
   estimatedCost: number;
+  attribution?: Attribution;
 }
 
 export interface ComparisonResult {
@@ -80,4 +106,6 @@ export interface Config {
   branch: string;
   keepWorktrees: boolean;
   cliMode: boolean;
+  // Analyst model for per-turn attribution; null disables the pass.
+  analystModel: string | null;
 }
