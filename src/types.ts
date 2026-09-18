@@ -244,6 +244,7 @@ export interface Config {
   analystModel: string | null;
   // Model for the quality judge and context-impact passes.
   judgeModel: string;
-  // Simulated review-and-fix rounds per arm before analysis (0 = none).
+  // Cap on review-and-fix rounds per arm (0 = no review). Rounds stop early
+  // once the reviewer finds every task requirement met or waived.
   reviewRounds: number;
 }
