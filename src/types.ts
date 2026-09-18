@@ -176,6 +176,19 @@ export interface ContextImpact {
   economics: { cost: string; time: string; tokens: string };
 }
 
+export interface ReviewComment { file: string; severity: "must-fix" | "should-fix" | "nit"; comment: string }
+
+// One simulated review-and-fix round (--review). The reviewer saw only this
+// arm's draft; the fix pass resumed the agent's own session.
+export interface ReviewRound {
+  reviewModel: string;
+  reviewCostUsd: number;
+  summary: string;
+  comments: ReviewComment[];
+  draft: { diffStats: DiffStats; costUsd: number; durationMs: number; messages: number };
+  fix: { costUsd: number; durationMs: number; messages: number; exitCode: number | null; timedOut: boolean } | null;
+}
+
 export interface ArmResult {
   condition: Condition;
   run: RunResult;
@@ -184,6 +197,7 @@ export interface ArmResult {
   unblockedCalls: UnblockedCall[];
   estimatedCost: number;
   attribution?: Attribution;
+  review?: ReviewRound;
 }
 
 export interface ComparisonResult {
@@ -215,4 +229,6 @@ export interface Config {
   analystModel: string | null;
   // Model for the quality judge and context-impact passes.
   judgeModel: string;
+  // One simulated review-and-fix round per arm before analysis.
+  review: boolean;
 }

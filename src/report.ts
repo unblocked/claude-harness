@@ -962,6 +962,24 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     ${barPair("Cache-read tokens", bCache, uCache, maxCache, formatTokens, "context re-read per turn; 2% of output price")}
   </div>`}
 
+  ${b.review || u.review ? `
+  <div class="section">
+    <div class="section-title">Review round <span class="section-sub">one simulated review and fix per arm, reviewer ${escapeHtml((b.review ?? u.review)!.reviewModel)}</span></div>
+    <div class="section-note">Each draft was reviewed on its own; the agent then resumed its session to address the comments. Numbers elsewhere on this page include the fix pass.</div>
+    ${[["Baseline", b], ["With Unblocked", u]].map(([label, arm]) => {
+      const rv = (arm as ArmResult).review;
+      if (!rv) return "";
+      return `
+      <div class="arm-section">
+        <div class="arm-header"><span class="arm-name">${escapeHtml(label as string)}</span>
+          <span style="font-size: 12px; color: var(--text-muted);">draft ${escapeHtml(formatDiffSummary(rv.draft.diffStats))} → final ${escapeHtml(formatDiffSummary((arm as ArmResult).diffStats))}${rv.fix ? ` · fix pass ${formatCost(rv.fix.costUsd)}, ${formatDuration(rv.fix.durationMs)}, ${rv.fix.messages} msgs` : " · no fix pass"}</span></div>
+        <div class="arm-tokens">${escapeHtml(rv.summary)}</div>
+        ${rv.comments.length ? `<table class="tool-table"><thead><tr><th>Severity</th><th>File</th><th>Comment</th></tr></thead><tbody>${rv.comments.map(c => `
+          <tr><td><span class="met ${c.severity === "must-fix" ? "met-unmet" : c.severity === "should-fix" ? "met-partial" : ""}">${c.severity}</span></td><td style="font-family: 'SF Mono', 'Fira Code', Consolas, monospace; font-size: 12px;">${escapeHtml(c.file)}</td><td style="font-size: 13px;">${escapeHtml(c.comment)}</td></tr>`).join("")}</tbody></table>` : ""}
+      </div>`;
+    }).join("")}
+  </div>` : ""}
+
   ${result.quality ? `
   <div class="section">
     <div class="section-title">3 · Quality analysis <span class="section-sub">blinded judge: ${escapeHtml(result.quality.judgeModel)}</span></div>

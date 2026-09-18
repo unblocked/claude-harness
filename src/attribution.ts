@@ -64,7 +64,7 @@ const tsOf = (e: { timestamp?: unknown }): number => typeof e.timestamp === "str
 // scaled so the messages sum to the billed total.
 export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[] {
   const events = jsonl.split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-  interface Row extends WalkTurn { id: string; rawCost: number; chars: number; thinkingEst: number; usage: Record<string, number>; cache1h: number; model: string; lastBlockMs: number; lastResultMs: number }
+  interface Row extends WalkTurn { id: string; rawCost: number; chars: number; thinkingEst: number; usage: Record<string, number>; cache1h: number; model: string; lastBlockMs: number; lastResultMs: number; segmentStartMs: number }
   const rows: Row[] = [];
   const byId = new Map<string, Row>();
   const pending = new Map<string, { tool: WalkTool; row: Row }>();
@@ -74,6 +74,7 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
   let totalThinking = 0;
   let pendingThinking = 0;   // thinking_tokens deltas seen since the last message started
   let firstTs = NaN;
+  let segmentStartMs = NaN;  // harness session_start marker; a second one is the resumed fix pass, and the gap before it (the review call) is not agent time
 
   for (const e of events) {
     const t = tsOf(e);
@@ -88,6 +89,7 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
     }
     // The CLI's running estimate of thinking tokens, emitted while a message is being generated.
     if (e.type === "system" && e.subtype === "thinking_tokens") { pendingThinking += e.estimated_tokens_delta ?? 0; continue; }
+    if (e.type === "harness" && e.subtype === "session_start" && !Number.isNaN(t)) { segmentStartMs = t; continue; }
 
     if (typeof e.parent_tool_use_id === "string") {
       // Subagent traffic: charge its usage to the main-thread message that issued the Agent call.
@@ -130,7 +132,7 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
           outputTokens: 0, outputExact: false, cacheReadTokens: u.cache_read_input_tokens ?? 0,
           rawCost: 0, chars: 0, thinkingEst: pendingThinking, usage: u, cache1h: u.cache_creation?.ephemeral_1h_input_tokens ?? 0,
           model: typeof e.message?.model === "string" ? e.message.model : "opus",
-          lastBlockMs: NaN, lastResultMs: NaN,
+          lastBlockMs: NaN, lastResultMs: NaN, segmentStartMs,
         };
         pendingThinking = 0;
         rows.push(row); byId.set(id, row);
@@ -162,6 +164,7 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
   // Windows: each message runs from the previous message's end to its own end.
   let prevEnd = firstTs;
   for (const r of rows) {
+    if (!Number.isNaN(r.segmentStartMs) && r.segmentStartMs > prevEnd) prevEnd = r.segmentStartMs; // gap between sessions (the review call) is not agent time
     const end = Number.isNaN(r.lastResultMs) ? r.lastBlockMs : Math.max(r.lastBlockMs, r.lastResultMs);
     if (!Number.isNaN(prevEnd) && !Number.isNaN(end)) {
       r.startMs = prevEnd;
@@ -201,7 +204,7 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
   const rawSum = rows.reduce((a, r) => a + r.rawCost, 0);
   const scale = totalCostUsd && rawSum > 0 ? totalCostUsd / rawSum : 1;
   for (const r of rows) r.costUsd = r.rawCost * scale;
-  return rows.map(({ id: _id, rawCost: _rc, chars: _c, thinkingEst: _te, usage: _u, cache1h: _h, model: _m, lastBlockMs: _lb, lastResultMs: _lr, ...t }) => t);
+  return rows.map(({ id: _id, rawCost: _rc, chars: _c, thinkingEst: _te, usage: _u, cache1h: _h, model: _m, lastBlockMs: _lb, lastResultMs: _lr, segmentStartMs: _ss, ...t }) => t);
 }
 
 function renderWalk(walk: WalkTurn[]): string {

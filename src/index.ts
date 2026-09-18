@@ -27,7 +27,8 @@ program
   // opus by default: fable's input safeguards declined 6 of 7 first attempts on ordinary CI transcripts.
   .option("--analyst-model <model>", "Model that labels each message as work/verify/housekeeping", "opus")
   .option("--judge-model <model>", "Model for the quality judge and context-impact passes", "fable")
-  .option("--no-attribution", "Skip the per-turn attribution pass");
+  .option("--no-attribution", "Skip the per-turn attribution pass")
+  .option("--review", "One simulated review-and-fix round per arm before analysis (reviewer = judge model)", false);
 
 program.parse();
 const opts = program.opts();
@@ -48,6 +49,7 @@ const config: Config = {
   cliMode: opts.cli,
   analystModel: opts.attribution === false ? null : opts.analystModel,
   judgeModel: opts.judgeModel,
+  review: opts.review,
 };
 
 run(config).catch((err) => {

@@ -1,4 +1,7 @@
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { log } from "./util.ts";
 
 // One way to ask a model for structured output: a single-turn `claude -p` call
@@ -33,6 +36,12 @@ interface RawOut { structured_output?: unknown; result?: string; total_cost_usd?
 const DEBUG_DIR = process.env.HARNESS_DEBUG_DIR;
 let debugSeq = 0;
 
+// Analyst calls run from an empty directory. With the harness as cwd, Claude
+// Code loads this repo's CLAUDE.md into the model's system prompt, and the
+// judge learns the experiment's premise ("with and without Unblocked").
+const ANALYST_CWD = path.join(os.tmpdir(), "claude-harness-analyst");
+fs.mkdirSync(ANALYST_CWD, { recursive: true });
+
 function callOnce(prompt: string, model: string, schema: object, timeoutMs: number): { out: RawOut | null; declined: boolean; error: string } {
   // --max-turns 3, not 1: structured output is returned through a tool round
   // trip, and with 1 the CLI ends in error_max_turns before the JSON arrives.
@@ -40,7 +49,7 @@ function callOnce(prompt: string, model: string, schema: object, timeoutMs: numb
     "-p", "--model", model, "--max-turns", "3", "--tools", "", "--strict-mcp-config", "--no-session-persistence",
     "--output-format", "json", "--json-schema", JSON.stringify(schema),
   ];
-  const res = spawnSync(BINARY, args, { input: prompt, stdio: ["pipe", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs });
+  const res = spawnSync(BINARY, args, { cwd: ANALYST_CWD, input: prompt, stdio: ["pipe", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs });
   if (DEBUG_DIR) {
     try {
       const base = `${DEBUG_DIR}/analyst-${Date.now()}-${++debugSeq}`;

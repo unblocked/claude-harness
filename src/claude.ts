@@ -227,11 +227,19 @@ export async function runClaude(opts: {
   timeoutMs: number;
   outDir: string;
   blockUnblocked: boolean;
+  // Continue an earlier session in the same worktree (the review fix pass).
+  resumeSessionId?: string;
+  // Transcript file name; defaults to <condition>.jsonl.
+  jsonlName?: string;
 }): Promise<RunResult> {
-  const jsonlPath = path.join(opts.outDir, `${opts.condition}.jsonl`);
+  const jsonlPath = path.join(opts.outDir, opts.jsonlName ?? `${opts.condition}.jsonl`);
 
+  // The prompt goes in argv, not stdin: the CLI gives up on stdin after 3s,
+  // and a synchronous step elsewhere in the harness (the other arm's worktree
+  // setup) can hold the event loop longer than that before the pipe flushes.
   const args = [
-    "-p",
+    "-p", opts.prompt,
+    ...(opts.resumeSessionId ? ["--resume", opts.resumeSessionId] : []),
     "--output-format", "stream-json",
     "--verbose",
     // message_delta events carry each API message's exact output token count
@@ -256,9 +264,12 @@ export async function runClaude(opts: {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    p.stdin.end(opts.prompt);
+    p.stdin.end();
 
     const out = fs.createWriteStream(jsonlPath);
+    // Harness marker: when this session started, so a transcript assembled from
+    // a draft pass and a resumed fix pass shows where agent time resumes.
+    out.write(JSON.stringify({ type: "harness", subtype: "session_start", timestamp: new Date().toISOString(), condition: opts.condition, resume: !!opts.resumeSessionId }) + "\n");
     let partial = "";
     let toolCount = 0;
     let editCount = 0;
@@ -268,7 +279,7 @@ export async function runClaude(opts: {
 
     let unblockedCallSeen = false;
 
-    const unblockedDeadline = opts.condition === "unblocked"
+    const unblockedDeadline = opts.condition === "unblocked" && !opts.resumeSessionId
       ? setTimeout(() => {
           if (!unblockedCallSeen && !killed) {
             log(`[${tag}] ⛔ Unblocked not called within 120s — killing run`);

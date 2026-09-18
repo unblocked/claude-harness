@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import type { ArmResult, ComparisonResult, Condition, Config, DiffStats, UnblockedCall } from "./types.ts";
+import type { ArmResult, ComparisonResult, Condition, Config, DiffStats, ReviewRound, RunResult, TokenUsage, UnblockedCall } from "./types.ts";
 import { runClaude, createWorktree, removeWorktree } from "./claude.ts";
 import { printReport, writeJsonResult, writeHtmlReport } from "./report.ts";
 import { estimateCost, formatCost, formatDiffSummary, formatDuration, log } from "./util.ts";
@@ -11,6 +11,7 @@ import { attribute } from "./attribution.ts";
 import { assessQuality } from "./quality.ts";
 import { assessImpact } from "./impact.ts";
 import { economics } from "./economics.ts";
+import { fixPrompt, reviewDraft } from "./review.ts";
 
 // The commits the agent made: everything reachable from any commit this
 // worktree's HEAD ever pointed at (its reflog, plus HEAD now) that was not
@@ -228,18 +229,83 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
   });
   log(`[${condition}] Done: ${formatDuration(runResult.durationMs)}, ${runResult.assistantTurns} turns, exit=${runResult.exitCode}${runResult.timedOut ? " (TIMED OUT)" : ""}`);
 
-  const { diff, stats: diffStats, agent } = captureDiff(wtPath, baseSha, refsBefore);
+  let { diff, stats: diffStats, agent } = captureDiff(wtPath, baseSha, refsBefore);
   log(`[${condition}] Diff: ${formatDiffSummary(diffStats)}`);
+
+  let run: RunResult = { ...runResult, worktreePath: wtPath };
+  let review: ReviewRound | undefined;
+
+  if (config.review && run.assistantTurns === 0) {
+    log(`[${condition}] Review: skipped, the run produced no messages (exit ${run.exitCode})`);
+  } else if (config.review) {
+    const draftArm: ArmResult = { condition, run, diff, diffStats, unblockedCalls: [], estimatedCost: run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage) };
+    const r = reviewDraft(config.task, draftArm, config.judgeModel);
+    if (r) {
+      review = {
+        reviewModel: r.model, reviewCostUsd: r.costUsd, summary: r.summary, comments: r.comments,
+        draft: { diffStats, costUsd: draftArm.estimatedCost, durationMs: run.durationMs, messages: run.assistantTurns },
+        fix: null,
+      };
+      if (r.comments.length > 0 && run.sessionId) {
+        // Keep the draft transcript; the fix pass gets its own file; the combined file is what analysis reads.
+        const draftPath = path.join(outDir, `${condition}.draft.jsonl`);
+        fs.copyFileSync(run.jsonlPath, draftPath);
+        log(`[${condition}] Review fix pass: resuming session ${run.sessionId.slice(0, 8)} with ${r.comments.length} comment(s)…`);
+        const fixRun = await runClaude({
+          prompt: (condition === "baseline" ? BASELINE_FIX_PREAMBLE : "") + fixPrompt(r.comments, r.summary),
+          worktreePath: wtPath, model: config.model, condition, timeoutMs: config.timeoutSeconds * 1000, outDir,
+          blockUnblocked: condition === "baseline", resumeSessionId: run.sessionId, jsonlName: `${condition}.fix.jsonl`,
+        });
+        log(`[${condition}] Fix pass done: ${formatDuration(fixRun.durationMs)}, ${fixRun.assistantTurns} msgs, exit=${fixRun.exitCode}`);
+        fs.writeFileSync(run.jsonlPath, fs.readFileSync(draftPath, "utf8") + fs.readFileSync(fixRun.jsonlPath, "utf8"));
+        review.fix = { costUsd: fixRun.totalCostUsd ?? estimateCost(config.model, fixRun.tokenUsage), durationMs: fixRun.durationMs, messages: fixRun.assistantTurns, exitCode: fixRun.exitCode, timedOut: fixRun.timedOut };
+        run = mergeRuns(run, fixRun, run.jsonlPath);
+        ({ diff, stats: diffStats, agent } = captureDiff(wtPath, baseSha, refsBefore));
+        log(`[${condition}] Diff after review: ${formatDiffSummary(diffStats)}`);
+      } else {
+        log(`[${condition}] Review: no comments${run.sessionId ? "" : " (no session id to resume)"}; draft stands`);
+      }
+    }
+  }
   agentCommitsByArm.set(condition, agent);
 
-  const unblockedCalls = extractUnblockedCalls(runResult.toolCalls);
+  const unblockedCalls = extractUnblockedCalls(run.toolCalls);
   if (unblockedCalls.length > 0) {
     log(`[${condition}] Unblocked calls: ${unblockedCalls.length}`);
   }
 
-  const cost = runResult.totalCostUsd ?? estimateCost(config.model, runResult.tokenUsage);
+  const cost = run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage);
 
-  return { condition, run: { ...runResult, worktreePath: wtPath }, diff, diffStats, unblockedCalls, estimatedCost: cost };
+  return { condition, run, diff, diffStats, unblockedCalls, estimatedCost: cost, review };
+}
+
+const BASELINE_FIX_PREAMBLE = "IMPORTANT: as before, do NOT use any Unblocked tools, Unblocked skills, or Unblocked CLI commands.\n\n";
+
+// The draft run plus the fix pass as one run: sums for time, tokens and cost;
+// the fix pass's final response; the combined transcript.
+function mergeRuns(a: RunResult, b: RunResult, jsonlPath: string): RunResult {
+  const addUsage = (x: TokenUsage, y: TokenUsage): TokenUsage => ({
+    inputTokens: x.inputTokens + y.inputTokens, outputTokens: x.outputTokens + y.outputTokens,
+    cacheCreationTokens: x.cacheCreationTokens + y.cacheCreationTokens, cacheReadTokens: x.cacheReadTokens + y.cacheReadTokens,
+    ...(x.costUsd !== undefined || y.costUsd !== undefined ? { costUsd: (x.costUsd ?? 0) + (y.costUsd ?? 0) } : {}),
+    ...(x.thinkingTokens !== undefined || y.thinkingTokens !== undefined ? { thinkingTokens: (x.thinkingTokens ?? 0) + (y.thinkingTokens ?? 0) } : {}),
+  });
+  const byModel: Record<string, TokenUsage> = { ...(a.tokenUsage.byModel ?? {}) };
+  for (const [m, mu] of Object.entries(b.tokenUsage.byModel ?? {})) byModel[m] = byModel[m] ? addUsage(byModel[m], mu) : mu;
+  return {
+    durationMs: a.durationMs + b.durationMs,
+    wallMs: (a.wallMs ?? a.durationMs) + (b.wallMs ?? b.durationMs),
+    tokenUsage: { ...addUsage(a.tokenUsage, b.tokenUsage), byModel },
+    toolCalls: [...a.toolCalls, ...b.toolCalls],
+    assistantTurns: a.assistantTurns + b.assistantTurns,
+    finalResponse: b.finalResponse || a.finalResponse,
+    sessionId: a.sessionId,
+    exitCode: b.exitCode ?? a.exitCode,
+    timedOut: a.timedOut || b.timedOut,
+    jsonlPath,
+    worktreePath: a.worktreePath,
+    totalCostUsd: a.totalCostUsd === null && b.totalCostUsd === null ? null : (a.totalCostUsd ?? 0) + (b.totalCostUsd ?? 0),
+  };
 }
 
 export async function run(config: Config): Promise<ComparisonResult> {
@@ -299,7 +365,7 @@ export async function run(config: Config): Promise<ComparisonResult> {
     const im = assessImpact(result, config.judgeModel);
     if (im) result.impact = im;
   }
-  result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0);
+  result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0) + (baseline.review?.reviewCostUsd ?? 0) + (unblocked.review?.reviewCostUsd ?? 0);
   log(`Experiment wall time ${formatDuration(Date.now() - startTime)} incl. analysis`);
 
   printReport(result);
