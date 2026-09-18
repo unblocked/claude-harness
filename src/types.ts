@@ -193,7 +193,7 @@ export interface ReviewPass {
   fix: { costUsd: number; durationMs: number; messages: number; exitCode: number | null; timedOut: boolean; disputed: string } | null;
 }
 
-// Simulated review-and-fix rounds (--review-rounds N). The reviewer saw only
+// Simulated review-and-fix rounds (--review, capped by --max-review-rounds). The reviewer saw only
 // this arm; each fix pass resumed the agent's own session. Stops when the
 // reviewer calls the change mergeable (every requirement met or waived) or
 // the round limit is reached.
