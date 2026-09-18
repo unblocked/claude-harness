@@ -27,7 +27,7 @@ export const CRITERIA = [
 // its paths, packages and files carry the word.
 function neutralise(s: string): string {
   return s
-    .replace(/\bUnblocked (MCP|context|research|tool|search|CLI|skill)s?\b/gi, "the research tool")
+    .replace(/\b(the )?Unblocked (MCP|context|research|tool|search|CLI|skill)s?( tool)?\b/gi, "the research tool")
     .replace(/mcp__unblocked__\w+/g, "research_tool")
     .replace(/\bcontext_(research|get_urls|get_rules|search_\w+)\b/g, "research_tool");
 }
