@@ -24,7 +24,11 @@ export function agentCommits(cwd: string, baseSha: string, refsBefore: Map<strin
   if (head) heads.add(head);
   for (const sha of (tryGit(cwd, ["reflog", "show", "--format=%H", "HEAD"], "reading worktree reflog") ?? "").split("\n")) if (sha.trim()) heads.add(sha.trim());
   if (heads.size === 0) return new Set();
-  const exclude = new Set<string>([baseSha, ...(refsBefore ? refsBefore.values() : [])]);
+  // Exclude everything reachable from a pre-run ref, and from any remote-tracking
+  // ref as it stands now: an agent that fetches during its run pulls in upstream
+  // commits that were not in the snapshot, and those are not its work either.
+  const remoteTips = (tryGit(cwd, ["for-each-ref", "--format=%(objectname)", "refs/remotes"], "listing remote refs") ?? "").split("\n").map(l => l.trim()).filter(Boolean);
+  const exclude = new Set<string>([baseSha, ...(refsBefore ? refsBefore.values() : []), ...remoteTips]);
   const out = tryGit(cwd, ["rev-list", ...heads, "--not", ...exclude], "listing agent commits");
   return new Set((out ?? "").split("\n").map(l => l.trim()).filter(Boolean));
 }
