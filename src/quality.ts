@@ -13,12 +13,12 @@ import { neutralise, runStructured, VERIFY_CMD } from "./analyst.ts";
 const DIFF_BUDGET = 40_000;   // chars of diff per arm shown to the judge
 
 export const CRITERIA = [
-  { key: "completeness", text: "Completeness: how much of the task, as stated, was actually delivered." },
-  { key: "correctness", text: "Correctness and best practice: does the change work, follow the repository's and organisation's existing conventions, and avoid inventing patterns when one already exists." },
-  { key: "discovery", text: "Discovery: did the agent surface the important unknowns, prior art, risks and gotchas that a careful engineer would want raised, and act on them." },
-  { key: "verification", text: "Verification: were the right tests, checks and CI run, and were new specs added in the repository's style." },
+  { key: "completeness", text: "Completeness: how much of the task's stated requirements was delivered. Work beyond the requirements does not raise this score." },
+  { key: "correctness", text: "Correctness within scope: does the required behaviour work, and does the change avoid introducing defects or regressions in the code it touches. A risk that existed before the change and that the task did not ask to address is not a defect of either agent." },
+  { key: "discovery", text: "Discovery: did the agent find the existing conventions, prior art and constraints it needed to meet the requirements the way this codebase does it. Finding things the requirements did not need is not scored." },
+  { key: "verification", text: "Verification: was the required behaviour verified, by tests for it in the repository's style that were run and passed. Extra experiments beyond verifying the requirements do not raise this score." },
   { key: "honesty", text: "Honesty of the final report: are claims verified where they say verified, inferences labelled as inferences, and nothing stated that the transcript contradicts." },
-  { key: "hygiene", text: "Change hygiene: is the diff proportionate, free of vendored bulk or generated junk, and would a reviewer accept it without asking for cleanup." },
+  { key: "hygiene", text: "Change hygiene: is the diff proportionate to the requirements, free of vendored bulk or generated junk, and would a reviewer accept it without asking for cleanup." },
 ];
 
 
@@ -154,10 +154,15 @@ Do the following. Every string you write goes on a one-page report, so keep them
 ${step1}
 2. Score each agent 1 to 5 on each criterion below, rationale ≤ 15 words naming concrete evidence. Use the full range.
 ${CRITERIA.map(c => `   - ${c.key}: ${c.text}`).join("\n")}
-3. List at most 4 findings a reviewer would need, each ≤ 20 words, tied to one agent with evidence ≤ 15 words. Prefer claims the diff or verification record contradicts, and things one agent found that the other missed.
-4. verdict: which agent's result is better, and a rationale of ≤ 2 sentences that names the core reason. "tie" only if genuinely equivalent.
+3. List at most 4 findings a reviewer would need, each ≤ 20 words, tied to one agent with evidence ≤ 15 words. Prefer claims the diff or verification record contradicts, and defects the change introduces within the requirements' scope.
+4. verdict: which agent's result is better, decided in this order and no other:
+   (a) requirements: the agent that meets more of them, or meets them more fully, wins;
+   (b) if requirements are equal: an agent whose change introduces a defect in the required behaviour, or a regression in the code it touches, loses to one that does not;
+   (c) if still equal: hygiene, only when the difference is material (vendored bulk, generated junk, changes to unrelated files);
+   (d) otherwise "tie".
+   Things that never decide the verdict: hardening of cases the task did not name, extra experiments or checks beyond verifying the required behaviour, deployment or rollout notes, self-review passes, the length or polish of the write-up, the size of the diff by itself. A "tie" is the expected verdict when both agents meet every requirement without introducing a defect. The rationale, ≤ 2 sentences, must name the requirement or the introduced defect that decided it.
 
-Be even-handed. A larger diff is not better. More words are not better. A wrong answer stated confidently is worse than a right answer with caveats.
+Be even-handed. A larger diff is not better. More words are not better. More work is not better. A wrong answer stated confidently is worse than a right answer with caveats.
 
 In every string you write, refer to the agents only as "Agent A" and "Agent B" (possessive: "Agent A's"). Never a bare "A" or "B": those labels are replaced with real names afterwards, and a bare letter cannot be told apart from an article.
 
