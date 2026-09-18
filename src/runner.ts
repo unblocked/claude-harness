@@ -175,7 +175,8 @@ const RESEARCH_DISCIPLINE = `How to research, whatever tools you use:
 - Before writing code, look for the convention this organisation already uses for this class of problem: prior art in this repository, in other repositories, in build images and shared actions, in docs, tickets and past discussions.
 - After planning, check for operational risks, previous incidents, deployment gotchas and rejected approaches related to your plan. Before implementing an unfamiliar pattern, verify conventions and team decisions.
 - A search that returns nothing is not a finding. If a source returns nothing on a question that matters, check a second source before concluding that nothing exists: a code search across the organisation's repositories, the file a comment or ticket points at, a runbook.
-- In your final response, say where each decisive fact came from, and say plainly when you are inferring.`;
+- Do not end your turn while a command you started in the background is still running: wait for it, read its output, and report the result.
+- Your final response is the PR description a reviewer will read: what changed, what you verified and how, and any part of the task you deliberately left out, with the reason. Say where each decisive fact came from, and say plainly when you are inferring.`;
 
 const BASELINE_NUDGE = `IMPORTANT: Do NOT use any Unblocked tools, Unblocked skills, or Unblocked CLI commands. Do NOT call context_research, context_get_urls, or any tool with "unblocked" in its name. Do NOT run the "unblocked" CLI binary. You may use all other tools, MCP servers, plugins, and skills, including code search across the organisation's repositories.
 
