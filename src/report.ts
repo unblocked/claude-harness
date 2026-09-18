@@ -1027,7 +1027,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     <div class="section-title">3 · Quality analysis <span class="section-sub">blinded judge: ${escapeHtml(result.quality.judgeModel)}</span></div>
     <div class="section-note">Blinded judge: saw task, final responses, tests run, diffs and the checker's final record as A/B in random order. Grades the same requirement list as the checker. The verdict is decided by requirements met, then by defects the change introduces within that scope, then by a decisive discovery (a fact that materially improved the delivered outcome, or invalidated a requirement for both agents), then by material hygiene; other work beyond the task does not count.</div>
     <div class="verdict ${result.quality.verdict.better === "unblocked" ? "positive" : result.quality.verdict.better === "baseline" ? "negative" : ""}">
-      <div class="verdict-head">Verdict: ${result.quality.verdict.better === "tie" ? "tie" : result.quality.verdict.better === "unblocked" ? "With Unblocked" : "Baseline"}</div>
+      <div class="verdict-head">Verdict: ${result.quality.verdict.better === "tie" ? "tie" : result.quality.verdict.better === "unblocked" ? "With Unblocked" : "Baseline"}${result.impact ? ` <span class="verdict-conf">· driver: ${result.impact.impact.outcomeDriver === "context" ? "the Unblocked context" : result.impact.impact.outcomeDriver === "agent" ? "agent behaviour, not context" : "context and agent behaviour"}</span>` : ""}</div>
       <div>${escapeHtml(result.quality.verdict.rationale)}</div>
     </div>
     ${result.quality.discoveries ? `<div class="findings" style="margin-bottom: 16px;">${(["baseline", "unblocked"] as const).map(a => {
