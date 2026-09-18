@@ -377,7 +377,7 @@ function mergeRuns(a: RunResult, b: RunResult, jsonlPath: string, model: string)
   };
 }
 
-export async function run(config: Config, outDirOverride?: string): Promise<ComparisonResult> {
+export async function run(config: Config, outDirOverride?: string, sharedSpec?: ReviewSpec): Promise<ComparisonResult> {
   const startTime = Date.now();
   const ctx: RunContext = { agentCommitsByArm: new Map(), worktreeByArm: new Map(), reviewSpec: null };
 
@@ -396,7 +396,9 @@ export async function run(config: Config, outDirOverride?: string): Promise<Comp
   warnIfBehindUpstream(config.repo, config.branch);
   keepMachineAwake();
   if (config.reviewRounds > 0) {
-    ctx.reviewSpec = await extractRequirements(config.task, config.checkerModel);
+    // Repeats of one task share the requirement list (extracted once by the
+    // batch) so their verdicts are comparable; adjudications are per run.
+    ctx.reviewSpec = sharedSpec ? { ...sharedSpec, adjudications: [], costUsd: 0 } : await extractRequirements(config.task, config.checkerModel);
     if (!ctx.reviewSpec) throw new Error("Review: could not extract the task's requirements; not running the arms without a shared review standard");
   }
   const reviewSpec = ctx.reviewSpec;
@@ -490,6 +492,13 @@ export async function runBatch(config: Config): Promise<{ batchDir: string; resu
   const batchDir = path.join(process.cwd(), "results", `batch-${timestamp}`);
   fs.mkdirSync(batchDir, { recursive: true });
   log(`Batch: ${config.repeat} repeats, ${config.concurrency} at a time → ${batchDir}`);
+  let sharedSpec: ReviewSpec | undefined;
+  if (config.reviewRounds > 0) {
+    const spec = await extractRequirements(config.task, config.checkerModel);
+    if (!spec) throw new Error("Review: could not extract the task's requirements; not running the batch without a shared review standard");
+    sharedSpec = spec;
+    fs.writeFileSync(path.join(batchDir, "requirements.json"), JSON.stringify(spec, null, 2));
+  }
   const results: (ComparisonResult | null)[] = new Array(config.repeat).fill(null);
   let next = 0;
   const worker = async () => {
@@ -497,7 +506,7 @@ export async function runBatch(config: Config): Promise<{ batchDir: string; resu
       const i = next++;
       const dir = path.join(batchDir, `run-${i + 1}`);
       try {
-        results[i] = await run(config, dir);
+        results[i] = await run(config, dir, sharedSpec);
         log(`Batch: run ${i + 1}/${config.repeat} done`);
       } catch (err) {
         log(`Batch: run ${i + 1}/${config.repeat} failed: ${(err as Error).message}`);
