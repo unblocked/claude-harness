@@ -163,6 +163,7 @@ const result: ComparisonResult = {
   unblocked,
   totalDurationMs: Math.max(baseline.run.durationMs, unblocked.run.durationMs),
   totalEstimatedCost: baseline.estimatedCost + unblocked.estimatedCost,
+  ...(orig?.reviewSpec ? { reviewSpec: orig.reviewSpec } : {}),
 };
 
 // The judge and impact passes are the expensive, non-deterministic steps; a
@@ -175,7 +176,8 @@ result.economics = economics(result);
 if (impactModel) result.impact = assessImpact(result, impactModel) ?? orig?.impact;
 else if (orig?.impact) result.impact = orig.impact;
 
-result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0);
+const reviewCost = (a: ArmResult) => (a.review?.passes ?? []).reduce((s, p) => s + p.reviewCostUsd, 0);
+result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0) + reviewCost(baseline) + reviewCost(unblocked) + (result.reviewSpec?.costUsd ?? 0);
 
 const outDir = path.join(process.cwd(), "results", "regenerated");
 fs.mkdirSync(outDir, { recursive: true });

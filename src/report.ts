@@ -93,6 +93,24 @@ function coreModelTimeMs(arm: ArmResult): number { return arm.attribution ? arm.
 // Short description of what the housekeeping turns were, for the summary line.
 // Wall time inside a model wait that no model call can account for (the
 // machine slept, or the API was down): excluded from every time figure.
+// Final status of every shared requirement for both arms, from each arm's
+// last review pass, with the adjudicated disputes underneath.
+function sharedRequirementsTable(result: ComparisonResult): string {
+  const spec = result.reviewSpec;
+  if (!spec) return "";
+  const last = (arm: ArmResult) => arm.review?.passes[arm.review.passes.length - 1];
+  const cell = (arm: ArmResult, i: number) => {
+    const r = last(arm)?.requirements.find(x => x.index === i);
+    if (!r) return "<td>–</td>";
+    return `<td><span class="met ${r.status === "met" ? "met-met" : r.status === "waived" ? "met-partial" : "met-unmet"}">${r.status}</span><div class="evidence">${escapeHtml(r.note)}</div></td>`;
+  };
+  const adj = spec.adjudications.map(a => `<li>Requirement ${a.index + 1}, disputed by ${a.disputedBy === "unblocked" ? "the Unblocked arm" : "the baseline arm"} in round ${a.round}: <b>${a.waived ? "waived for both arms" : "dispute rejected"}</b>. ${escapeHtml(a.reason)}</li>`).join("");
+  return `<div class="tool-table-wrap"><table class="tool-table">
+      <thead><tr><th>Requirement (same list for both arms)</th><th>Baseline</th><th>With Unblocked</th></tr></thead>
+      <tbody>${spec.requirements.map((req, i) => `<tr><td>${i + 1}. ${escapeHtml(req)}</td>${cell(result.baseline, i)}${cell(result.unblocked, i)}</tr>`).join("")}</tbody>
+    </table></div>${adj ? `<ul class="section-note" style="margin: 8px 0 0 18px;">${adj}</ul>` : ""}`;
+}
+
 function stallNote(b: ArmResult, u: ArmResult): string {
   const bs = b.attribution?.raw.stallMs ?? 0, us = u.attribution?.raw.stallMs ?? 0;
   if (bs <= 0 && us <= 0) return "";
@@ -975,7 +993,8 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   ${b.review || u.review ? `
   <div class="section">
     <div class="section-title">Review rounds <span class="section-sub">simulated review and fix, reviewer ${escapeHtml((b.review ?? u.review)!.passes[0]?.reviewModel ?? "")}, up to ${(b.review ?? u.review)!.maxRounds} round(s)</span></div>
-    <div class="section-note">Each draft was reviewed on its own against the task's requirements; the agent resumed its session to address unmet ones, and could dispute a requirement. Rounds stop when the reviewer calls the change mergeable. Numbers elsewhere on this page include every fix pass.</div>
+    <div class="section-note">One requirement list for the run, extracted from the task before either arm started; each draft was reviewed on its own against it, and the agent resumed its session to address unmet ones. A disputed requirement is decided once, blind to the arm, and a waiver applies to both. Rounds stop when every requirement is met or waived and nothing is must-fix. Numbers elsewhere on this page include every fix pass.</div>
+    ${sharedRequirementsTable(result)}
     ${[["Baseline", b], ["With Unblocked", u]].map(([label, arm]) => {
       const rv = (arm as ArmResult).review;
       if (!rv) return "";
@@ -984,7 +1003,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       <div class="arm-section">
         <div class="arm-header"><span class="arm-name">${escapeHtml(label as string)} <span class="met ${rv.finalMergeable ? "met-met" : "met-unmet"}">${rv.finalMergeable ? "mergeable" : "not mergeable"}</span></span>
           <span style="font-size: 12px; color: var(--text-muted);">draft ${escapeHtml(formatDiffSummary(rv.draft.diffStats))} → final ${escapeHtml(formatDiffSummary((arm as ArmResult).diffStats))} · ${rv.passes.filter(p => p.fix).length} fix pass(es), ${formatCost(rv.passes.reduce((s2, p) => s2 + (p.fix?.costUsd ?? 0), 0))}, ${formatDuration(rv.passes.reduce((s2, p) => s2 + (p.fix?.durationMs ?? 0), 0))}</span></div>
-        ${last ? `<table class="tool-table"><thead><tr><th>Requirement</th><th>Final status</th></tr></thead><tbody>${last.requirements.map(r => `
+        ${last && !result.reviewSpec ? `<table class="tool-table"><thead><tr><th>Requirement</th><th>Final status</th></tr></thead><tbody>${last.requirements.map(r => `
           <tr><td>${escapeHtml(r.requirement)}</td><td><span class="met ${r.status === "met" ? "met-met" : r.status === "waived" ? "met-partial" : "met-unmet"}">${r.status}</span><div class="evidence">${escapeHtml(r.note)}</div></td></tr>`).join("")}</tbody></table>` : ""}
         ${rv.passes.map(p => `
         <div class="arm-tokens" style="display:block;"><b>Round ${p.round}</b> · ${p.mergeable ? "mergeable" : "not mergeable"} · ${escapeHtml(p.summary)}${p.fix ? ` · fix: ${formatCost(p.fix.costUsd)}, ${formatDuration(p.fix.durationMs)}, ${p.fix.messages} msgs${p.fix.disputed ? ` · <span class="met met-partial">disputed</span> ${escapeHtml(p.fix.disputed.slice(0, 200))}` : ""}` : ""}

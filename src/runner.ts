@@ -2,7 +2,7 @@ import { execSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import type { ArmResult, ComparisonResult, Condition, Config, DiffStats, ReviewPass, ReviewRound, RunResult, TokenUsage, UnblockedCall } from "./types.ts";
+import type { ArmResult, ComparisonResult, Condition, Config, DiffStats, ReviewPass, ReviewRound, ReviewSpec, RunResult, TokenUsage, UnblockedCall } from "./types.ts";
 import { runClaude, createWorktree, removeWorktree } from "./claude.ts";
 import { printReport, writeJsonResult, writeHtmlReport } from "./report.ts";
 import { estimateCost, formatCost, formatDiffSummary, formatDuration, log } from "./util.ts";
@@ -11,7 +11,7 @@ import { attribute } from "./attribution.ts";
 import { assessQuality } from "./quality.ts";
 import { assessImpact } from "./impact.ts";
 import { economics } from "./economics.ts";
-import { disputedSection, fixPrompt, reviewDraft } from "./review.ts";
+import { adjudicateDisputes, applyWaivers, disputedSection, extractRequirements, fixPrompt, reviewDraft } from "./review.ts";
 
 // The commits the agent made: everything reachable from any commit this
 // worktree's HEAD ever pointed at (its reflog, plus HEAD now) that was not
@@ -233,6 +233,10 @@ function keepMachineAwake(): void {
 // Agent commits per arm, kept for branch cleanup after the diff is captured.
 const agentCommitsByArm = new Map<Condition, Set<string>>();
 
+// The run's shared review standard (see review.ts); set once in run() before
+// the arms start, mutated by adjudications from either arm.
+let reviewSpec: ReviewSpec | null = null;
+
 async function runArm(config: Config, condition: Condition, outDir: string, refsBefore: Map<string, string> | null): Promise<ArmResult> {
   let nudge: string;
   if (condition === "baseline") {
@@ -271,7 +275,8 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
 
   if (config.reviewRounds > 0 && run.assistantTurns === 0) {
     log(`[${condition}] Review: skipped, the run produced no messages (exit ${run.exitCode})`);
-  } else if (config.reviewRounds > 0) {
+  } else if (config.reviewRounds > 0 && reviewSpec) {
+    const spec = reviewSpec;
     const draftCost = run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage);
     review = { maxRounds: config.reviewRounds, passes: [], draft: { diffStats, costUsd: draftCost, durationMs: run.durationMs, messages: run.assistantTurns }, finalMergeable: false };
     const draftPath = path.join(outDir, `${condition}.draft.jsonl`);
@@ -280,7 +285,7 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
     for (let round = 1; round <= config.reviewRounds; round++) {
       const armNow: ArmResult = { condition, run, diff, diffStats, unblockedCalls: [], estimatedCost: run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage) };
       const prev = review.passes[review.passes.length - 1] ?? null;
-      const r = reviewDraft(config.task, armNow, config.judgeModel, round, prev, disputed);
+      const r = reviewDraft(config.task, armNow, config.judgeModel, round, prev, spec);
       if (!r) break;
       const pass: ReviewPass = { round, reviewModel: r.model, reviewCostUsd: r.costUsd, mergeable: r.mergeable, summary: r.summary, requirements: r.requirements, comments: r.comments, before: diffStats, fix: null };
       review.passes.push(pass);
@@ -295,6 +300,7 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
       log(`[${condition}] Fix pass ${round} done: ${formatDuration(fixRun.durationMs)}, ${fixRun.assistantTurns} msgs, exit=${fixRun.exitCode}`);
       fs.appendFileSync(run.jsonlPath, fs.readFileSync(fixRun.jsonlPath, "utf8"));
       disputed = disputedSection(fixRun.finalResponse);
+      if (disputed) adjudicateDisputes(config.task, spec, disputed, condition, round, config.judgeModel);
       pass.fix = { costUsd: fixRun.totalCostUsd ?? estimateCost(config.model, fixRun.tokenUsage), durationMs: fixRun.durationMs, messages: fixRun.assistantTurns, exitCode: fixRun.exitCode, timedOut: fixRun.timedOut, disputed };
       run = mergeRuns(run, fixRun, run.jsonlPath);
       ({ diff, stats: diffStats, agent } = captureDiff(wtPath, baseSha, refsBefore));
@@ -303,7 +309,7 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
     if (!review.finalMergeable && review.passes.length === config.reviewRounds && review.passes[review.passes.length - 1].fix) {
       // Rounds exhausted after a fix: one more review to record the final state, no fix.
       const armNow: ArmResult = { condition, run, diff, diffStats, unblockedCalls: [], estimatedCost: run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage) };
-      const r = reviewDraft(config.task, armNow, config.judgeModel, config.reviewRounds + 1, review.passes[review.passes.length - 1], disputed);
+      const r = reviewDraft(config.task, armNow, config.judgeModel, config.reviewRounds + 1, review.passes[review.passes.length - 1], spec);
       if (r) { review.passes.push({ round: config.reviewRounds + 1, reviewModel: r.model, reviewCostUsd: r.costUsd, mergeable: r.mergeable, summary: r.summary, requirements: r.requirements, comments: r.comments, before: diffStats, fix: null }); review.finalMergeable = r.mergeable; }
     }
   }
@@ -364,6 +370,10 @@ export async function run(config: Config): Promise<ComparisonResult> {
   const refsBefore = snapshotRefs(config.repo);
   warnIfBehindUpstream(config.repo, config.branch);
   keepMachineAwake();
+  if (config.reviewRounds > 0) {
+    reviewSpec = extractRequirements(config.task, config.judgeModel);
+    if (!reviewSpec) throw new Error("Review: could not extract the task's requirements; not running the arms without a shared review standard");
+  }
 
   let baseline: ArmResult;
   let unblocked: ArmResult;
@@ -383,6 +393,11 @@ export async function run(config: Config): Promise<ComparisonResult> {
     }
   }
 
+  if (reviewSpec) {
+    for (const arm of [baseline, unblocked]) applyWaivers(arm, reviewSpec);
+    if (reviewSpec.adjudications.some(a => a.waived)) log(`Review: waived for both arms — ${reviewSpec.adjudications.filter(a => a.waived).map(a => `${a.index + 1}. ${reviewSpec!.requirements[a.index]} (disputed by ${a.disputedBy}, round ${a.round})`).join("; ")}`);
+  }
+
   if (config.analystModel) {
     for (const arm of [baseline, unblocked]) {
       const a = attribute(arm.run.jsonlPath, config.task, arm.run.totalCostUsd ?? arm.estimatedCost, config.analystModel, arm.condition);
@@ -399,6 +414,7 @@ export async function run(config: Config): Promise<ComparisonResult> {
     unblocked,
     totalDurationMs: Math.max(baseline.run.durationMs, unblocked.run.durationMs),
     totalEstimatedCost: baseline.estimatedCost + unblocked.estimatedCost,
+    ...(reviewSpec ? { reviewSpec } : {}),
   };
   if (config.analystModel) {
     const q = assessQuality(result, config.judgeModel);
@@ -408,7 +424,7 @@ export async function run(config: Config): Promise<ComparisonResult> {
     if (im) result.impact = im;
   }
   const reviewCost = (a: ArmResult) => (a.review?.passes ?? []).reduce((s, p) => s + p.reviewCostUsd, 0);
-  result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0) + reviewCost(baseline) + reviewCost(unblocked);
+  result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0) + reviewCost(baseline) + reviewCost(unblocked) + (reviewSpec?.costUsd ?? 0);
   log(`Experiment wall time ${formatDuration(Date.now() - startTime)} incl. analysis`);
 
   printReport(result);

@@ -180,7 +180,15 @@ export interface ContextImpact {
 
 export interface ReviewComment { file: string; severity: "must-fix" | "should-fix" | "nit"; comment: string }
 
-export interface ReviewRequirement { requirement: string; status: "met" | "unmet" | "waived"; note: string }
+// `index` is the position in ReviewSpec.requirements; absent on results from
+// before the list was shared.
+export interface ReviewRequirement { index?: number; requirement: string; status: "met" | "unmet" | "waived"; note: string }
+
+// The task's requirements, extracted once per run and checked by every
+// review of both arms. Disputes from either arm are adjudicated once, blind
+// to the arm, and a waiver applies to both.
+export interface ReviewAdjudication { index: number; waived: boolean; reason: string; disputedBy: Condition; round: number }
+export interface ReviewSpec { model: string; costUsd: number; requirements: string[]; adjudications: ReviewAdjudication[] }
 
 // One review pass and, if it was not mergeable, the fix pass that followed.
 export interface ReviewPass {
@@ -229,6 +237,7 @@ export interface ComparisonResult {
   // Both arms' billed cost. Analysis (attribution + judge) is separate.
   totalEstimatedCost: number;
   analysisCostUsd?: number;
+  reviewSpec?: ReviewSpec;
   quality?: QualityAssessment;
   impact?: ContextImpact;
   economics?: EconomicsBreakdown;
