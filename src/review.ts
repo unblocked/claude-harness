@@ -210,11 +210,12 @@ Make the change meet each of them. Do not take on work beyond what these require
 // The "Disputed:" section of a fix-pass response, if any.
 export function disputedSection(finalResponse: string): string {
   const m = finalResponse.match(/(?:^|\n)\s*(?:#+\s*)?\**Disputed:?\**\s*\n?([\s\S]{0,2000})/i);
-  // The section ends at the next heading or bold title line, or a blank line
-  // followed by a non-list line; without that, the summary that follows
-  // would be sent to the adjudicator as part of the dispute.
+  // The section ends at the next heading, bold title line, or "Title:" line
+  // on its own; without that, the summary that follows would be sent to the
+  // adjudicator as part of the dispute. Blank lines do not end it: agents
+  // write the dispute as a title, a blank line, then paragraphs.
   let text = m ? m[1] : "";
-  const end = text.search(/\n\s*(#+\s|\*\*[^*\n]+\*\*:?\s*\n)|\n\s*\n(?![ \t]*[-*\d])/);
+  const end = text.search(/\n\s*(#+\s|\*\*[^*\n]{1,80}\*\*:?\s*\n|[A-Z][A-Za-z ]{2,40}:\s*\n)/);
   if (end >= 0) text = text.slice(0, end);
   text = text.trim();
   // "Disputed: none." is not a dispute.
