@@ -203,7 +203,11 @@ export interface ReviewRequirement { index?: number; requirement: string; status
 // The task's requirements, extracted once per run and checked by every
 // review of both arms. Disputes from either arm are adjudicated once, blind
 // to the arm, and a waiver applies to both.
-export interface ReviewAdjudication { index: number; waived: boolean; reason: string; disputedBy: Condition; round: number }
+// A ruling on a disputed requirement. `waived`: the requirement does not
+// apply at all. `excludes`: the requirement stands but does not cover the
+// named case (for example "hidden reviews"); every later check of either
+// arm reads it that way. Neither: the dispute was rejected.
+export interface ReviewAdjudication { index: number; waived: boolean; excludes?: string; reason: string; disputedBy: Condition; round: number }
 export interface ReviewSpec { model: string; costUsd: number; requirements: string[]; adjudications: ReviewAdjudication[] }
 
 // One review pass and, if it was not mergeable, the fix pass that followed.

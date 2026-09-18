@@ -109,7 +109,7 @@ function sharedRequirementsTable(result: ComparisonResult): string {
   const paidFor = (arm: ArmResult, index: number) => (arm.review?.passes ?? []).filter(p => p.fix && !(p.waiversInForce ?? []).includes(index) && p.requirements.some(r => r.index === index && (r.status === "unmet" || r.status === "partial"))).length;
   const adj = spec.adjudications.map(a => {
     const cost = a.waived ? [["Baseline", result.baseline], ["With Unblocked", result.unblocked]].map(([n, arm]) => [n, paidFor(arm as ArmResult, a.index)] as const).filter(([, k]) => k > 0).map(([n, k]) => `${n} had already spent ${k} fix pass(es) on it before the waiver`).join("; ") : "";
-    return `<li>Requirement ${a.index + 1}, disputed by ${a.disputedBy === "unblocked" ? "the Unblocked arm" : "the baseline arm"} in round ${a.round}: <b>${a.waived ? "waived for both arms" : "dispute rejected"}</b>. ${escapeHtml(a.reason)}${cost ? ` <span class="met met-partial">${escapeHtml(cost)}</span>` : ""}</li>`;
+    return `<li>Requirement ${a.index + 1}, disputed by ${a.disputedBy === "unblocked" ? "the Unblocked arm" : "the baseline arm"} in round ${a.round}: <b>${a.waived ? "waived for both arms" : a.excludes ? `stands, but does not cover ${escapeHtml(a.excludes)} (both arms)` : "dispute rejected"}</b>. ${escapeHtml(a.reason)}${cost ? ` <span class="met met-partial">${escapeHtml(cost)}</span>` : ""}</li>`;
   }).join("");
   return `<div class="tool-table-wrap"><table class="tool-table">
       <thead><tr><th>Requirement (same list for both arms)</th><th>Baseline</th><th>With Unblocked</th></tr></thead>

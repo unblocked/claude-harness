@@ -48,6 +48,7 @@ ${task}
 }
 
 const waivedIndices = (spec: ReviewSpec) => new Set(spec.adjudications.filter(a => a.waived).map(a => a.index));
+const exclusionsFor = (spec: ReviewSpec, i: number) => spec.adjudications.filter(a => a.index === i && !a.waived && a.excludes).map(a => a.excludes as string);
 
 // ---- One review pass --------------------------------------------------------
 
@@ -67,8 +68,8 @@ const SCHEMA = {
 function prompt(task: string, arm: ArmResult, round: number, previous: ReviewPass | null, spec: ReviewSpec, disputed: string): string {
   const diff = arm.diff.length > DIFF_BUDGET ? arm.diff.slice(0, DIFF_BUDGET) + "\n… (diff truncated)" : arm.diff;
   const waived = waivedIndices(spec);
-  const list = spec.requirements.map((r, i) => `${i + 1}. ${r}${waived.has(i) ? "   [WAIVED — do not check; report it as met]" : ""}`).join("\n");
-  const waiverNotes = spec.adjudications.map(a => `- Requirement ${a.index + 1}: ${a.waived ? "waived" : "dispute rejected, still required"} — ${a.reason}`).join("\n");
+  const list = spec.requirements.map((r, i) => `${i + 1}. ${r}${waived.has(i) ? "   [WAIVED — do not check; report it as met]" : exclusionsFor(spec, i).length ? `   [does not cover: ${exclusionsFor(spec, i).join("; ")}]` : ""}`).join("\n");
+  const waiverNotes = spec.adjudications.map(a => `- Requirement ${a.index + 1}: ${a.waived ? "waived" : a.excludes ? `stands, but does not cover ${a.excludes}` : "dispute rejected, still required"} — ${a.reason}`).join("\n");
   const prior = previous ? `
 This is round ${round}. In round ${previous.round} you marked: ${previous.requirements.map((r, i) => `${i + 1} ${r.status}${r.status === "met" || r.status === "waived" ? "" : ` (${r.note})`}`).join("; ")}. Judge the current state, not the history.${disputed ? `
 The engineer disputes part of that: """${neutralise(disputed)}""". Where they say a requirement is already satisfied, re-check it against the diff and description and grade what you find. Where they say a requirement should not apply, that is decided elsewhere; grade it as you find it.` : ""}` : "";
@@ -128,8 +129,11 @@ export async function reviewDraft(task: string, arm: ArmResult, model: string, r
 const DISPUTE_SCHEMA = {
   type: "object",
   properties: { decisions: { type: "array", items: { type: "object", properties: {
-    index: { type: "integer" }, waive: { type: "boolean" }, reason: { type: "string" },
-  }, required: ["index", "waive", "reason"] } } },
+    index: { type: "integer" },
+    ruling: { type: "string", enum: ["waive", "exclude", "reject"] },
+    excludes: { type: "string" },
+    reason: { type: "string" },
+  }, required: ["index", "ruling", "excludes", "reason"] } } },
   required: ["decisions"],
 };
 
@@ -138,27 +142,38 @@ const DISPUTE_SCHEMA = {
 // to its diff: only the task, the list and the engineer's argument. Returns
 // the call's cost.
 export async function adjudicateDisputes(task: string, spec: ReviewSpec, disputed: string, by: Condition, round: number, model: string): Promise<number> {
-  const open = spec.requirements.map((_, i) => i).filter(i => !spec.adjudications.some(a => a.index === i));
+  // A requirement can be disputed more than once, on different cases; only a
+  // waiver or a rejected dispute closes it.
+  const closed = new Set(spec.adjudications.filter(a => a.waived || !a.excludes).map(a => a.index));
+  const open = spec.requirements.map((_, i) => i).filter(i => !closed.has(i));
   if (!open.length || !disputed.trim()) return 0;
   log(`[${by}] Review round ${round}: the agent disputed part of the review; adjudicating with ${model}…`);
-  const p = `A task was given to an engineer, whose pull request is being reviewed against the numbered requirements below. In their latest revision the engineer disputes part of the review. Decide, for each requirement their dispute addresses, whether to waive it. A waiver means the requirement does not apply to this task at all, for anyone. Waive only when the dispute shows the requirement is wrong for this codebase, contradicts another requirement, or would do harm if implemented. Do not waive because the engineer says it is already satisfied: you cannot see the diff, and the next check will re-verify that. "It is out of scope", "the wording does not fit" or "it can be a follow-up" are not grounds when the task states the requirement. Return one decision per requirement the dispute addresses (by number); leave the others out. reason ≤ 25 words. Your decision will bind every check of this task from now on.
+  const prior = spec.adjudications.map(a => `- Requirement ${a.index + 1}: ${a.waived ? "waived" : a.excludes ? `does not cover ${a.excludes}` : "dispute rejected"} — ${a.reason}`).join("\n");
+  const p = `A task was given to an engineer, whose change is being checked against the numbered requirements below. In their latest revision the engineer disputes part of the check. Rule on each requirement the dispute addresses, by number:
+- "waive": the requirement does not apply to this task at all, for anyone. Only when the dispute shows it is wrong for this codebase, contradicts another requirement, or would do harm if implemented.
+- "exclude": the requirement stands, but a specific case the engineer names is outside it. Name that case in "excludes", in ≤ 8 words (for example "hidden reviews", "cancelled reviews"). Use this when the dispute shows the case cannot occur under the task's trigger, or that covering it would break an existing rule of the codebase, and the rest of the requirement is unaffected.
+- "reject": the dispute does not hold; the requirement stands in full.
+Do not rule on "already satisfied": you cannot see the diff, and the next check will re-verify that. "It is out of scope", "the wording does not fit" or "it can be a follow-up" are not grounds when the task states the requirement. Return one decision per requirement the dispute addresses; leave the others out; for "waive" and "reject" set "excludes" to an empty string. reason ≤ 25 words. Your ruling will bind every check of this task, for every engineer, from now on.
 
 =================== TASK ===================
 ${task}
 
 =================== REQUIREMENTS ===================
 ${spec.requirements.map((r, i) => `${i + 1}. ${r}${open.includes(i) ? "" : "   (already decided)"}`).join("\n")}
-
+${prior ? `\nEarlier rulings:\n${prior}\n` : ""}
 =================== THE ENGINEER'S DISPUTE ===================
 ${neutralise(disputed)}
 `;
-  const res = await runStructured<{ decisions: { index: number; waive: boolean; reason: string }[] }>(`Adjudicate:${by}:${round}`, p, model, DISPUTE_SCHEMA, 5 * 60 * 1000, false);
-  if (!res) return 0;
+  const res = await runStructured<{ decisions: { index: number; ruling: "waive" | "exclude" | "reject"; excludes: string; reason: string }[] }>(`Adjudicate:${by}:${round}`, p, model, DISPUTE_SCHEMA, 5 * 60 * 1000, false);
+  if (!res) { log(`[${by}] Review round ${round}: adjudication failed; the requirements stand as checked`); return 0; }
+  if (!res.data.decisions.length) log(`[${by}] Review round ${round}: adjudicator returned no decision; the requirements stand as checked`);
   for (const d of res.data.decisions) {
     const i = d.index - 1;
-    if (!open.includes(i) || spec.adjudications.some(a => a.index === i)) continue;
-    spec.adjudications.push({ index: i, waived: d.waive, reason: d.reason, disputedBy: by, round });
-    log(`[${by}] Review round ${round}: requirement ${i + 1} "${spec.requirements[i]}" ${d.waive ? "WAIVED for both arms" : "dispute rejected"} — ${d.reason}`);
+    if (!open.includes(i)) { log(`[${by}] Review round ${round}: adjudicator ruled on requirement ${d.index}, which is not open; ignored`); continue; }
+    const excludes = d.ruling === "exclude" ? d.excludes.trim() : "";
+    if (d.ruling === "exclude" && !excludes) continue;
+    spec.adjudications.push({ index: i, waived: d.ruling === "waive", ...(excludes ? { excludes } : {}), reason: d.reason, disputedBy: by, round });
+    log(`[${by}] Review round ${round}: requirement ${i + 1} "${spec.requirements[i]}" ${d.ruling === "waive" ? "WAIVED for both arms" : d.ruling === "exclude" ? `does not cover "${excludes}" (both arms)` : "dispute rejected"} — ${d.reason}`);
   }
   spec.costUsd += res.costUsd;
   return res.costUsd;
