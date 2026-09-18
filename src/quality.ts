@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import type { ArmResult, ComparisonResult, Condition, QualityAssessment, ReviewSpec } from "./types.ts";
 import { formatCost, log } from "./util.ts";
-import { runStructured, VERIFY_CMD } from "./analyst.ts";
+import { neutralise, runStructured, VERIFY_CMD } from "./analyst.ts";
 
 // Blinded quality judgement of the two arms' output. The judge sees the task,
 // each arm's final response, diff, and verification record, labelled A and B
@@ -21,16 +21,6 @@ export const CRITERIA = [
   { key: "hygiene", text: "Change hygiene: is the diff proportionate, free of vendored bulk or generated junk, and would a reviewer accept it without asking for cleanup." },
 ];
 
-// Hide the treatment, not the repository. Only the tool's own names go:
-// "Unblocked MCP/context/research/CLI", the MCP tool names. A bare
-// "unblocked" stays, because the repository under test is called that and
-// its paths, packages and files carry the word.
-function neutralise(s: string): string {
-  return s
-    .replace(/\b(the )?Unblocked (MCP|context|research|tool|search|CLI|skill)s?( tool)?\b/gi, "the research tool")
-    .replace(/mcp__unblocked__\w+/g, "research_tool")
-    .replace(/\bcontext_(research|get_urls|get_rules|search_\w+)\b/g, "research_tool");
-}
 
 function verificationRecord(arm: ArmResult, jsonl: string): string {
   // Test/CI commands and the tail of their output, straight from the transcript.
@@ -164,7 +154,7 @@ type Raw = {
   verdict: { better: "A" | "B" | "tie"; rationale: string };
 };
 
-export function assessQuality(result: ComparisonResult, model: string): QualityAssessment | null {
+export async function assessQuality(result: ComparisonResult, model: string): Promise<QualityAssessment | null> {
   // A placeholder where the diff should be means the judge would be grading a sentinel.
   for (const arm of [result.baseline, result.unblocked]) {
     if (!arm.diff || arm.diff.startsWith("(")) { log(`Quality: skipping judge, ${arm.condition} arm has no diff to judge (${arm.diff.slice(0, 60)})`); return null; }
@@ -179,7 +169,7 @@ export function assessQuality(result: ComparisonResult, model: string): QualityA
   const prompt = judgePrompt(result.task, first, second, result.reviewSpec);
   log(`Quality: judging with ${model} (${Math.round(prompt.length / 1000)}k chars, arm A = ${aIsBaseline ? "baseline" : "unblocked"})…`);
   // Unredacted: the judge must see digests, env var names and auth headers as written.
-  const res = runStructured<Raw>("Quality", prompt, model, SCHEMA, 15 * 60 * 1000, false);
+  const res = await runStructured<Raw>("Quality", prompt, model, SCHEMA, 15 * 60 * 1000, false);
   if (!res) return null;
   const raw = res.data;
 
@@ -191,6 +181,7 @@ export function assessQuality(result: ComparisonResult, model: string): QualityA
   const q: QualityAssessment = {
     judgeModel: res.modelUsed,
     judgeCostUsd: res.costUsd,
+    armA: aIsBaseline ? "baseline" : "unblocked",
     requirements: raw.requirements.map(r => {
       const i = r.index - 1;
       const shared = result.reviewSpec && i >= 0 && i < result.reviewSpec.requirements.length;

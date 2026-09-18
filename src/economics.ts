@@ -47,14 +47,29 @@ function researchCarried(arm: ArmResult): { calls: number; payloadTokens: number
   };
 }
 
-function toolWaitByCategory(arm: ArmResult): Record<string, number> {
-  // Wall time of tool calls by kind, core messages only when attribution
-  // exists, so the per-kind rows add up to the core tool-wait headline.
-  const windows = arm.attribution?.turns.filter(t => t.label !== "housekeeping" && t.startMs > 0).map(t => [t.startMs, t.startMs + t.durationMs] as const);
-  const inCore = (tc: ToolCall) => !windows || windows.some(([s, e]) => tc.timestamp >= s && tc.timestamp < e);
-  const out: Record<string, number> = {};
+// Union of intervals, in ms.
+function unionMs(spans: [number, number][]): number {
+  const sorted = [...spans].sort((a, b) => a[0] - b[0]);
+  let total = 0, curStart = -1, curEnd = -1;
+  for (const [s, e] of sorted) {
+    if (s > curEnd) { if (curEnd > curStart) total += curEnd - curStart; curStart = s; curEnd = e; }
+    else if (e > curEnd) curEnd = e;
+  }
+  if (curEnd > curStart) total += curEnd - curStart;
+  return total;
+}
+
+function toolWaitByCategory(arm: ArmResult, core: boolean): Record<string, number> {
+  // Wall time of tool calls by kind: each call clipped to the core message
+  // windows (when attribution is the basis) and unioned within its kind, so
+  // two parallel calls of one kind count once and a kind never exceeds the
+  // window it ran in. Kinds can still overlap each other, so the rows are a
+  // breakdown of where waiting happened, not an exact partition of the
+  // headline tool wait.
+  const windows = core ? arm.attribution!.turns.filter(t => t.label !== "housekeeping" && t.startMs > 0).map(t => [t.startMs, t.startMs + t.durationMs + t.stallMs] as const) : null;
+  const spansByKind: Record<string, [number, number][]> = {};
   for (const tc of arm.run.toolCalls) {
-    if (tc.nested || !(tc.durationMs ?? 0) || !inCore(tc)) continue;
+    if (tc.nested || !(tc.durationMs ?? 0) || tc.timestamp <= 0) continue;
     const cmd = String(tc.args.command ?? "");
     const kind = tc.isMcp ? (tc.mcpServer?.toLowerCase().includes("unblocked") ? "research" : "mcp")
       : tc.name !== "Bash" ? "file ops"
@@ -64,15 +79,23 @@ function toolWaitByCategory(arm: ArmResult): Record<string, number> {
       : /git submodule/.test(cmd) ? "git submodule"
       : /^git\b|&& git\b|; git\b/.test(cmd) ? "git"
       : "shell";
-    out[kind] = (out[kind] ?? 0) + (tc.durationMs ?? 0);
+    const s0 = tc.timestamp, e0 = tc.timestamp + (tc.durationMs as number);
+    if (!windows) { (spansByKind[kind] ??= []).push([s0, e0]); continue; }
+    for (const [ws, we] of windows) {
+      const s = Math.max(s0, ws), e = Math.min(e0, we);
+      if (e > s) (spansByKind[kind] ??= []).push([s, e]);
+    }
   }
-  return out;
+  return Object.fromEntries(Object.entries(spansByKind).map(([k, spans]) => [k, unionMs(spans)]));
 }
 
-function armSide(arm: ArmResult) {
+// One side of the comparison. `core` selects the attribution's core totals
+// (housekeeping removed); the same basis is used for both arms, decided by
+// the caller, so a core figure is never set against a whole-run one.
+function armSide(arm: ArmResult, core: boolean) {
   const a = arm.attribution;
   const u = arm.run.tokenUsage;
-  const totals = a ? a.core : { costUsd: arm.estimatedCost, durationMs: arm.run.durationMs, modelMs: 0, toolMs: 0, stallMs: 0, turns: arm.run.assistantTurns, outputTokens: u.outputTokens, cacheReadTokens: u.cacheReadTokens };
+  const totals = core && a ? a.core : { costUsd: arm.estimatedCost, inputTokens: u.inputTokens, cacheWriteTokens: u.cacheCreationTokens, durationMs: arm.run.durationMs, modelMs: 0, toolMs: 0, stallMs: 0, turns: arm.run.assistantTurns, outputTokens: u.outputTokens, cacheReadTokens: u.cacheReadTokens };
   const models = Object.entries(u.byModel ?? {});
   const thinking = models.reduce((s, [, m]) => s + (m.thinkingTokens ?? 0), 0);
   const scale = u.outputTokens > 0 ? totals.outputTokens / u.outputTokens : 1; // core share of the run's output
@@ -85,17 +108,18 @@ function armSide(arm: ArmResult) {
     thinkingTokens: Math.round(thinking * scale),
     visibleTokens: Math.round(totals.outputTokens - thinking * scale),
     cacheReadTokens: totals.cacheReadTokens,
-    cacheWriteTokens: u.cacheCreationTokens,
-    inputTokens: u.inputTokens,
+    cacheWriteTokens: totals.cacheWriteTokens,
+    inputTokens: totals.inputTokens,
     contextPerMessage: totals.turns ? Math.round(totals.cacheReadTokens / totals.turns) : 0,
     research,
-    toolWait: toolWaitByCategory(arm),
+    toolWait: toolWaitByCategory(arm, core && !!a),
   };
 }
 
 export function economics(result: ComparisonResult): EconomicsBreakdown {
-  const b = armSide(result.baseline);
-  const u = armSide(result.unblocked);
+  const core = !!(result.baseline.attribution && result.unblocked.attribution);
+  const b = armSide(result.baseline, core);
+  const u = armSide(result.unblocked, core);
   const price = priceFor(result.model);
   const perM = (n: number, rate: number) => (n / 1_000_000) * rate;
   // Cost delta by term, at the model's list rates (the billed total is what
@@ -108,6 +132,7 @@ export function economics(result: ComparisonResult): EconomicsBreakdown {
   };
   const explained = Object.values(costTerms).reduce((s, v) => s + v, 0);
   return {
+    basis: core ? "core" : "raw",
     baseline: b, unblocked: u,
     cost: { deltaUsd: u.costUsd - b.costUsd, terms: costTerms, unexplainedUsd: (u.costUsd - b.costUsd) - explained },
     cacheRead: {
@@ -129,9 +154,10 @@ export function describeEconomics(e: EconomicsBreakdown): string {
   const min = (ms: number) => (ms >= 0 ? "+" : "-") + (Math.abs(ms) / 60000).toFixed(1) + " min";
   const side = (label: string, s: EconomicsBreakdown["baseline"]) =>
     `${label}: cost $${s.costUsd.toFixed(2)}; time ${(s.durationMs / 60000).toFixed(1)} min (model ${(s.modelMs / 60000).toFixed(1)}, tool wait ${(s.toolMs / 60000).toFixed(1)}); ${s.messages} messages; output ${s.outputTokens.toLocaleString()} (thinking ${s.thinkingTokens.toLocaleString()}, visible ${s.visibleTokens.toLocaleString()}); cache-read ${s.cacheReadTokens.toLocaleString()} (avg context ${s.contextPerMessage.toLocaleString()}/message); research: ${s.research.calls} calls returning ~${s.research.payloadTokens.toLocaleString()} tokens, carried ~${s.research.carriedTokens.toLocaleString()} token-reads; tool wait by kind: ${Object.entries(s.toolWait).map(([k, v]) => `${k} ${(v / 60000).toFixed(1)} min`).join(", ") || "none"}`;
+  const basis = e.basis === "core" ? "core work" : "whole run; attribution missing for at least one arm";
   return [
-    side("BASELINE (core work)", e.baseline),
-    side("UNBLOCKED (core work)", e.unblocked),
+    side(`BASELINE (${basis})`, e.baseline),
+    side(`UNBLOCKED (${basis})`, e.unblocked),
     `COST delta ${usd(e.cost.deltaUsd)} = output ${usd(e.cost.terms.output)} + cache-read ${usd(e.cost.terms.cacheRead)} + cache-write ${usd(e.cost.terms.cacheWrite)} + input ${usd(e.cost.terms.input)} (residual ${usd(e.cost.unexplainedUsd)} from rate/scaling differences)`,
     `CACHE-READ delta ${f(e.cacheRead.deltaTokens)} tokens; research context carried accounts for ~${f(e.cacheRead.researchCarriedTokens)}; average context per message ${f(e.cacheRead.contextPerMessageDelta)}; messages ${f(e.cacheRead.messagesDelta)}`,
     `OUTPUT delta ${f(e.output.deltaTokens)} tokens = thinking ${f(e.output.thinkingDelta)} + visible ${f(e.output.visibleDelta)}`,

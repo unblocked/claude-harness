@@ -40,10 +40,11 @@ export function padLeft(str: string, width: number): string {
 // Anthropic API per-token pricing ($/M tokens)
 export interface ModelPrice { input: number; output: number; cacheRead: number; cacheWrite: number; cacheWrite1h: number }
 
-// Rates are only used for the cost-estimate FALLBACK (when the SDK does not
-// emit total_cost_usd / per-model costUSD). Opus 4.8 and Haiku 4.5 rates were
-// verified to the cent by solving against the SDK's reported costUSD on real
-// runs. cacheRead = 0.1x input, cacheWrite = 1.25x input (5-minute TTL), cacheWrite1h = 2x input (1-hour TTL).
+// Rates are used for the cost-estimate FALLBACK (when the CLI does not emit
+// total_cost_usd / per-model costUSD), for per-message cost before scaling to
+// the billed total, and for the economics decomposition. Verified to the cent
+// against the CLI's reported costUSD on real runs. cacheRead = 0.1x input,
+// cacheWrite = 1.25x input (5-minute TTL), cacheWrite1h = 2x input (1-hour TTL).
 const OPUS_PRICE: ModelPrice = { input: 5, output: 25, cacheRead: 0.50, cacheWrite: 6.25, cacheWrite1h: 10 };
 const SONNET_PRICE: ModelPrice = { input: 3, output: 15, cacheRead: 0.30, cacheWrite: 3.75, cacheWrite1h: 6 };
 const HAIKU_PRICE: ModelPrice = { input: 1, output: 5, cacheRead: 0.10, cacheWrite: 1.25, cacheWrite1h: 2 };
@@ -100,11 +101,16 @@ export function uncachedTokens(u: TokenUsageLike): number {
   return u.inputTokens + u.outputTokens;
 }
 
+// Cache creation is priced at the 1-hour rate: Claude Code writes its
+// prompt cache with the 1-hour TTL, and against the CLI's own per-model
+// costUSD on every saved run the 1h rate reproduces the bill to the cent while
+// the 5-minute rate is 9–26% low. Callers with the per-TTL split (attribution)
+// price each part at its own rate.
 export function costAt(p: ModelPrice, u: TokenUsageLike): number {
   return (u.inputTokens / 1_000_000) * p.input
     + (u.outputTokens / 1_000_000) * p.output
     + (u.cacheReadTokens / 1_000_000) * p.cacheRead
-    + (u.cacheCreationTokens / 1_000_000) * p.cacheWrite;
+    + (u.cacheCreationTokens / 1_000_000) * p.cacheWrite1h;
 }
 
 // Billed cost where the CLI reported it per model, else the rate-table estimate.

@@ -38,9 +38,15 @@ export interface RunResult {
   sessionId?: string;
   exitCode: number | null;
   timedOut: boolean;
+  // Why the harness killed the process, if it did: a baseline that called
+  // Unblocked, an Unblocked arm that never did within the deadline, or the
+  // per-arm timeout. A killed run is not a finished comparison.
+  killedReason?: string;
   jsonlPath: string;
   worktreePath: string;
   totalCostUsd: number | null;
+  // True when any pass lacked a billed total and the rate table filled in.
+  costEstimated?: boolean;
 }
 
 export interface UnblockedCall {
@@ -73,6 +79,8 @@ export interface TurnLabel {
 
 export interface AttributionTotals {
   costUsd: number;
+  inputTokens: number;   // fresh (uncached) input
+  cacheWriteTokens: number;
   durationMs: number;    // modelMs + toolMs
   modelMs: number;       // generation incl. thinking
   toolMs: number;        // waiting on tool results
@@ -91,6 +99,8 @@ export interface AttributedTurn extends TurnLabel {
   stallMs: number;
   outputTokens: number;
   cacheReadTokens: number;
+  inputTokens: number;
+  cacheWriteTokens: number;
   summary: string;
 }
 
@@ -132,6 +142,8 @@ export interface QualityCriterion {
 export interface QualityAssessment {
   judgeModel: string;
   judgeCostUsd: number;
+  // Which arm was shown as "Agent A" (random per run), so a blinding failure can be audited.
+  armA?: Condition;
   requirements: QualityRequirement[];
   criteria: QualityCriterion[];
   findings: { arm: Condition; finding: string; evidence: string }[];
@@ -147,6 +159,9 @@ export interface EconomicsSide {
   toolWait: Record<string, number>;
 }
 export interface EconomicsBreakdown {
+  // "core" when both arms have attribution (housekeeping removed); "raw" when
+  // either lacks it, so both sides are whole-run figures.
+  basis: "core" | "raw";
   baseline: EconomicsSide;
   unblocked: EconomicsSide;
   cost: { deltaUsd: number; terms: { output: number; cacheRead: number; cacheWrite: number; input: number }; unexplainedUsd: number };
@@ -199,6 +214,9 @@ export interface ReviewPass {
   mergeable: boolean;
   summary: string;
   requirements: ReviewRequirement[];
+  // Indices waived (for both arms) at the time this check ran. A requirement
+  // this arm fixed before it was waived cost it a round the other arm skipped.
+  waiversInForce?: number[];
   comments?: ReviewComment[];   // pre-classifier reviewer only; the check no longer comments
   before: DiffStats;
   fix: { costUsd: number; durationMs: number; messages: number; exitCode: number | null; timedOut: boolean; disputed: string } | null;
@@ -211,6 +229,9 @@ export interface ReviewPass {
 export interface ReviewRound {
   maxRounds: number;
   passes: ReviewPass[];
+  // Set when a check call itself failed (declined, timed out) in this round;
+  // the loop stopped there, so the last pass may predate the last fix.
+  checkFailed?: number;
   draft: { diffStats: DiffStats; costUsd: number; durationMs: number; messages: number };
   finalMergeable: boolean;
 }

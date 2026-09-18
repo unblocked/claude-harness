@@ -139,7 +139,7 @@ export function captureDiff(cwd: string, baseSha: string, refsBefore: Map<string
   return { diff: text || "(no changes)", stats, agent };
 }
 
-function extractUnblockedCalls(toolCalls: { name: string; args: Record<string, unknown>; mcpServer?: string }[]): UnblockedCall[] {
+export function extractUnblockedCalls(toolCalls: { name: string; args: Record<string, unknown>; mcpServer?: string }[]): UnblockedCall[] {
   const calls: UnblockedCall[] = [];
   for (const tc of toolCalls) {
     const isUbMcp = tc.mcpServer?.toLowerCase().includes("unblocked")
@@ -259,13 +259,17 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
   worktreeByArm.set(condition, wtName);
   log(`[${condition}] Worktree at: ${wtPath} (base ${baseSha.slice(0, 7)})`);
 
+  // --timeout budgets the arm: the draft and every fix pass share it.
+  const deadline = Date.now() + config.timeoutSeconds * 1000;
+  const remainingMs = () => Math.max(60_000, deadline - Date.now());
+
   log(`[${condition}] Running Claude Code...`);
   const runResult = await runClaude({
     prompt,
     worktreePath: wtPath,
     model: config.model,
     condition,
-    timeoutMs: config.timeoutSeconds * 1000,
+    timeoutMs: remainingMs(),
     outDir,
     blockUnblocked: condition === "baseline",
   });
@@ -286,35 +290,42 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
     const draftPath = path.join(outDir, `${condition}.draft.jsonl`);
     fs.copyFileSync(run.jsonlPath, draftPath);
     let disputed = "";
+    const toPass = (round: number, r: NonNullable<Awaited<ReturnType<typeof reviewDraft>>>): ReviewPass =>
+      ({ round, reviewModel: r.model, reviewCostUsd: r.costUsd, mergeable: r.mergeable, summary: r.summary, requirements: r.requirements, waiversInForce: r.waiversInForce, before: diffStats, fix: null });
     for (let round = 1; round <= config.reviewRounds; round++) {
       const armNow: ArmResult = { condition, run, diff, diffStats, unblockedCalls: [], estimatedCost: run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage) };
       const prev = review.passes[review.passes.length - 1] ?? null;
-      const r = reviewDraft(config.task, armNow, config.checkerModel, round, prev, spec, disputed);
-      if (!r) break;
-      const pass: ReviewPass = { round, reviewModel: r.model, reviewCostUsd: r.costUsd, mergeable: r.mergeable, summary: r.summary, requirements: r.requirements, before: diffStats, fix: null };
+      const r = await reviewDraft(config.task, armNow, config.checkerModel, round, prev, spec, disputed);
+      if (!r) { review.checkFailed = round; log(`[${condition}] Review round ${round}: the check itself failed; stopping this arm's loop (recorded, not a verdict on the change)`); break; }
+      const pass = toPass(round, r);
       review.passes.push(pass);
       if (r.mergeable) { review.finalMergeable = true; log(`[${condition}] Review round ${round}: mergeable, stopping`); break; }
       if (!run.sessionId) { log(`[${condition}] Review: no session id to resume; stopping`); break; }
+      if (run.killedReason) { log(`[${condition}] Review: the draft run was killed (${run.killedReason}); no fix pass`); break; }
       log(`[${condition}] Review round ${round}: fix pass, resuming session ${run.sessionId.slice(0, 8)}…`);
       const fixRun = await runClaude({
         prompt: (condition === "baseline" ? BASELINE_FIX_PREAMBLE : "") + fixPrompt(round, r),
-        worktreePath: wtPath, model: config.model, condition, timeoutMs: config.timeoutSeconds * 1000, outDir,
+        worktreePath: wtPath, model: config.model, condition, timeoutMs: remainingMs(), outDir,
         blockUnblocked: condition === "baseline", resumeSessionId: run.sessionId, jsonlName: `${condition}.fix${round}.jsonl`,
       });
-      log(`[${condition}] Fix pass ${round} done: ${formatDuration(fixRun.durationMs)}, ${fixRun.assistantTurns} msgs, exit=${fixRun.exitCode}`);
+      log(`[${condition}] Fix pass ${round} done: ${formatDuration(fixRun.durationMs)}, ${fixRun.assistantTurns} msgs, exit=${fixRun.exitCode}${fixRun.killedReason ? ` (killed: ${fixRun.killedReason})` : ""}`);
       fs.appendFileSync(run.jsonlPath, fs.readFileSync(fixRun.jsonlPath, "utf8"));
       disputed = disputedSection(fixRun.finalResponse);
-      if (disputed) adjudicateDisputes(config.task, spec, disputed, condition, round, config.checkerModel);
+      if (disputed) await adjudicateDisputes(config.task, spec, disputed, condition, round, config.checkerModel);
       pass.fix = { costUsd: fixRun.totalCostUsd ?? estimateCost(config.model, fixRun.tokenUsage), durationMs: fixRun.durationMs, messages: fixRun.assistantTurns, exitCode: fixRun.exitCode, timedOut: fixRun.timedOut, disputed };
-      run = mergeRuns(run, fixRun, run.jsonlPath);
+      run = mergeRuns(run, fixRun, run.jsonlPath, config.model);
       ({ diff, stats: diffStats, agent } = captureDiff(wtPath, baseSha, refsBefore));
       log(`[${condition}] Diff after fix ${round}: ${formatDiffSummary(diffStats)}${disputed ? " (agent disputed part of the review)" : ""}`);
+      if (fixRun.killedReason) break;
     }
-    if (!review.finalMergeable && review.passes.length === config.reviewRounds && review.passes[review.passes.length - 1].fix) {
-      // Rounds exhausted after a fix: one more review to record the final state, no fix.
+    const last = review.passes[review.passes.length - 1];
+    if (!review.finalMergeable && !review.checkFailed && last?.fix) {
+      // The loop ended after a fix (rounds exhausted, or the fix pass was
+      // killed): one more check to record the final state, no fix.
       const armNow: ArmResult = { condition, run, diff, diffStats, unblockedCalls: [], estimatedCost: run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage) };
-      const r = reviewDraft(config.task, armNow, config.checkerModel, config.reviewRounds + 1, review.passes[review.passes.length - 1], spec, disputed);
-      if (r) { review.passes.push({ round: config.reviewRounds + 1, reviewModel: r.model, reviewCostUsd: r.costUsd, mergeable: r.mergeable, summary: r.summary, requirements: r.requirements, before: diffStats, fix: null }); review.finalMergeable = r.mergeable; }
+      const r = await reviewDraft(config.task, armNow, config.checkerModel, last.round + 1, last, spec, disputed);
+      if (r) { review.passes.push(toPass(last.round + 1, r)); review.finalMergeable = r.mergeable; }
+      else review.checkFailed = last.round + 1;
     }
   }
   agentCommitsByArm.set(condition, agent);
@@ -333,7 +344,7 @@ const BASELINE_FIX_PREAMBLE = "IMPORTANT: as before, do NOT use any Unblocked to
 
 // The draft run plus the fix pass as one run: sums for time, tokens and cost;
 // the fix pass's final response; the combined transcript.
-function mergeRuns(a: RunResult, b: RunResult, jsonlPath: string): RunResult {
+function mergeRuns(a: RunResult, b: RunResult, jsonlPath: string, model: string): RunResult {
   const addUsage = (x: TokenUsage, y: TokenUsage): TokenUsage => ({
     inputTokens: x.inputTokens + y.inputTokens, outputTokens: x.outputTokens + y.outputTokens,
     cacheCreationTokens: x.cacheCreationTokens + y.cacheCreationTokens, cacheReadTokens: x.cacheReadTokens + y.cacheReadTokens,
@@ -341,7 +352,11 @@ function mergeRuns(a: RunResult, b: RunResult, jsonlPath: string): RunResult {
     ...(x.thinkingTokens !== undefined || y.thinkingTokens !== undefined ? { thinkingTokens: (x.thinkingTokens ?? 0) + (y.thinkingTokens ?? 0) } : {}),
   });
   const byModel: Record<string, TokenUsage> = { ...(a.tokenUsage.byModel ?? {}) };
-  for (const [m, mu] of Object.entries(b.tokenUsage.byModel ?? {})) byModel[m] = byModel[m] ? addUsage(byModel[m], mu) : mu;
+  for (const [m, mu] of Object.entries(b.tokenUsage.byModel ?? {})) byModel[m] = byModel[m] ? addUsage(byModel[m], mu) : { ...mu };
+  // A pass without a billed total is priced from the rate table before the
+  // sum, so a missing draft cost never becomes 0 + fix cost.
+  const costOf = (x: RunResult) => x.totalCostUsd ?? estimateCost(model, x.tokenUsage);
+  const anyEstimated = !!(a.costEstimated || b.costEstimated || a.totalCostUsd === null || b.totalCostUsd === null);
   return {
     durationMs: a.durationMs + b.durationMs,
     wallMs: (a.wallMs ?? a.durationMs) + (b.wallMs ?? b.durationMs),
@@ -349,12 +364,14 @@ function mergeRuns(a: RunResult, b: RunResult, jsonlPath: string): RunResult {
     toolCalls: [...a.toolCalls, ...b.toolCalls],
     assistantTurns: a.assistantTurns + b.assistantTurns,
     finalResponse: b.finalResponse || a.finalResponse,
-    sessionId: a.sessionId,
+    sessionId: b.sessionId ?? a.sessionId,
     exitCode: b.exitCode ?? a.exitCode,
     timedOut: a.timedOut || b.timedOut,
+    ...(b.killedReason ?? a.killedReason ? { killedReason: b.killedReason ?? a.killedReason } : {}),
     jsonlPath,
     worktreePath: a.worktreePath,
-    totalCostUsd: a.totalCostUsd === null && b.totalCostUsd === null ? null : (a.totalCostUsd ?? 0) + (b.totalCostUsd ?? 0),
+    totalCostUsd: costOf(a) + costOf(b),
+    ...(anyEstimated ? { costEstimated: true } : {}),
   };
 }
 
@@ -372,10 +389,11 @@ export async function run(config: Config): Promise<ComparisonResult> {
   // --detach` creates no refs, so both arms share it. Used to separate the
   // agent's commits from pre-existing history and to find branches it created.
   const refsBefore = snapshotRefs(config.repo);
+  if (!refsBefore) throw new Error("Could not snapshot the repository's refs; without it the agent's commits cannot be told from existing history");
   warnIfBehindUpstream(config.repo, config.branch);
   keepMachineAwake();
   if (config.reviewRounds > 0) {
-    reviewSpec = extractRequirements(config.task, config.checkerModel);
+    reviewSpec = await extractRequirements(config.task, config.checkerModel);
     if (!reviewSpec) throw new Error("Review: could not extract the task's requirements; not running the arms without a shared review standard");
   }
 
@@ -403,7 +421,7 @@ export async function run(config: Config): Promise<ComparisonResult> {
 
   if (config.analystModel) {
     for (const arm of [baseline, unblocked]) {
-      const a = attribute(arm.run.jsonlPath, config.task, arm.run.totalCostUsd ?? arm.estimatedCost, config.analystModel, arm.condition);
+      const a = await attribute(arm.run.jsonlPath, config.task, arm.run.totalCostUsd ?? arm.estimatedCost, config.analystModel, arm.condition);
       if (a) arm.attribution = a;
     }
   }
@@ -419,12 +437,16 @@ export async function run(config: Config): Promise<ComparisonResult> {
     totalEstimatedCost: baseline.estimatedCost + unblocked.estimatedCost,
     ...(reviewSpec ? { reviewSpec } : {}),
   };
-  if (config.analystModel) {
-    const q = assessQuality(result, config.judgeModel);
+  const killed = [baseline, unblocked].filter(a => a.run.killedReason);
+  if (killed.length) log(`⚠ ${killed.map(a => `${a.condition} was killed (${a.run.killedReason})`).join("; ")}: no quality or impact verdict for an unfinished comparison`);
+  if (config.analystModel && !killed.length) {
+    const q = await assessQuality(result, config.judgeModel);
     if (q) result.quality = q;
     result.economics = economics(result);
-    const im = assessImpact(result, config.judgeModel);
-    if (im) result.impact = im;
+    if (q) { const im = await assessImpact(result, config.judgeModel); if (im) result.impact = im; }
+    else log("Impact: skipped, no quality verdict to assess against");
+  } else if (config.analystModel) {
+    result.economics = economics(result);
   }
   const reviewCost = (a: ArmResult) => (a.review?.passes ?? []).reduce((s, p) => s + p.reviewCostUsd, 0);
   result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0) + reviewCost(baseline) + reviewCost(unblocked) + (reviewSpec?.costUsd ?? 0);

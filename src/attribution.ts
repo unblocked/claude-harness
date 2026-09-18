@@ -23,6 +23,8 @@ export interface WalkTurn {
   outputTokens: number;
   outputExact: boolean;
   cacheReadTokens: number;
+  inputTokens: number;
+  cacheWriteTokens: number;
 }
 
 
@@ -72,7 +74,7 @@ const tsOf = (e: { timestamp?: unknown }): number => typeof e.timestamp === "str
 // scaled so the messages sum to the billed total.
 export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[] {
   const events = jsonl.split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-  interface Row extends WalkTurn { id: string; rawCost: number; chars: number; thinkingEst: number; usage: Record<string, number>; cache1h: number; model: string; lastBlockMs: number; lastResultMs: number; segmentStartMs: number }
+  interface Row extends WalkTurn { id: string; rawCost: number; chars: number; thinkingEst: number; usage: Record<string, number>; cache1h: number; model: string; lastBlockMs: number; lastResultMs: number; segmentStartMs: number; nestedOutput: number }
   const rows: Row[] = [];
   const byId = new Map<string, Row>();
   const pending = new Map<string, { tool: WalkTool; row: Row }>();
@@ -86,10 +88,17 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
   const flushSegment = () => { totalOutput += segOutput; totalThinking += segThinking; segOutput = 0; segThinking = 0; };
   let pendingThinking = 0;   // thinking_tokens deltas seen since the last message started
   let firstTs = NaN;
-  let segmentStartMs = NaN;  // harness session_start marker; a second one is the resumed fix pass, and the gap before it (the review call) is not agent time
+  // Segment start: the first CLI event after the harness session_start
+  // marker, not the marker itself, so process spawn and MCP connection are
+  // not charged to the first message as model time. A second marker is the
+  // resumed fix pass; the gap before it (the check) is not agent time.
+  let segmentStartMs = NaN;
+  let awaitingFirstEvent = false;
 
   for (const e of events) {
     const t = tsOf(e);
+    if (e.type === "harness" && e.subtype === "session_start") { flushSegment(); awaitingFirstEvent = true; continue; }
+    if (!Number.isNaN(t) && awaitingFirstEvent) { segmentStartMs = t; awaitingFirstEvent = false; }
     if (!Number.isNaN(t) && Number.isNaN(firstTs)) firstTs = t;
     if (e.type === "result") {
       let out = 0, think = 0;
@@ -103,10 +112,13 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
     }
     // The CLI's running estimate of thinking tokens, emitted while a message is being generated.
     if (e.type === "system" && e.subtype === "thinking_tokens") { pendingThinking += e.estimated_tokens_delta ?? 0; continue; }
-    if (e.type === "harness" && e.subtype === "session_start") { flushSegment(); if (!Number.isNaN(t)) segmentStartMs = t; continue; }
 
     if (typeof e.parent_tool_use_id === "string") {
       // Subagent traffic: charge its usage to the main-thread message that issued the Agent call.
+      if (e.type === "stream_event" && e.event?.type === "message_delta" && typeof e.event.usage?.output_tokens === "number") {
+        const parent = pending.get(String(e.parent_tool_use_id))?.row;
+        if (parent) parent.nestedOutput += e.event.usage.output_tokens;
+      }
       if (e.type === "assistant") {
         const parent = pending.get(String(e.parent_tool_use_id))?.row;
         if (parent) {
@@ -118,6 +130,8 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
           if (!byId.has(key)) {
             byId.set(key, parent);
             parent.cacheReadTokens += u.cache_read_input_tokens ?? 0;
+            parent.inputTokens += u.input_tokens ?? 0;
+            parent.cacheWriteTokens += u.cache_creation_input_tokens ?? 0;
             parent.rawCost += costAt(price, { inputTokens: u.input_tokens ?? 0, outputTokens: 0, cacheReadTokens: u.cache_read_input_tokens ?? 0, cacheCreationTokens: (u.cache_creation_input_tokens ?? 0) - oneH }) + (oneH / 1_000_000) * price.cacheWrite1h;
           }
           for (const block of e.message?.content ?? []) {
@@ -144,7 +158,8 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
         row = {
           id, turn: rows.length + 1, text: "", tools: [], startMs: 0, costUsd: 0, durationMs: 0, modelMs: 0, toolMs: 0, stallMs: 0,
           outputTokens: 0, outputExact: false, cacheReadTokens: u.cache_read_input_tokens ?? 0,
-          rawCost: 0, chars: 0, thinkingEst: pendingThinking, usage: u, cache1h: u.cache_creation?.ephemeral_1h_input_tokens ?? 0,
+          inputTokens: u.input_tokens ?? 0, cacheWriteTokens: u.cache_creation_input_tokens ?? 0,
+          rawCost: 0, chars: 0, thinkingEst: pendingThinking, usage: u, cache1h: u.cache_creation?.ephemeral_1h_input_tokens ?? 0, nestedOutput: 0,
           model: typeof e.message?.model === "string" ? e.message.model : "opus",
           lastBlockMs: NaN, lastResultMs: NaN, segmentStartMs,
         };
@@ -197,7 +212,7 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
   // is excluded from every time total.
   const typical = median(rows.filter(r => r.modelMs > 0 && r.modelMs <= STALL_MS).map(r => r.modelMs));
   for (const r of rows) {
-    if (r.modelMs <= STALL_MS) continue;
+    if (r.modelMs <= STALL_MS || typical <= 0) continue;  // no ordinary waits to compare against: leave the run unadjusted
     r.stallMs = r.modelMs - typical;
     r.modelMs = typical;
     r.durationMs = r.modelMs + r.toolMs;
@@ -208,7 +223,7 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
   // the visible remainder by content size.
   let exactSum = 0, inexactChars = 0, inexactThinking = 0;
   for (const r of rows) {
-    if (exactOutput.has(r.id)) { r.outputTokens = exactOutput.get(r.id)!; r.outputExact = true; exactSum += r.outputTokens; }
+    if (exactOutput.has(r.id)) { r.outputTokens = exactOutput.get(r.id)! + r.nestedOutput; r.outputExact = true; exactSum += r.outputTokens; }
     else { inexactChars += r.chars; inexactThinking += r.thinkingEst; }
   }
   const remaining = Math.max(0, totalOutput - exactSum);
@@ -226,13 +241,13 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
     const price = priceFor(r.model);
     r.rawCost += costAt(price, {
       inputTokens: r.usage.input_tokens ?? 0, outputTokens: r.outputTokens,
-      cacheReadTokens: r.usage.cache_read_input_tokens ?? 0, cacheCreationTokens: (r.usage.cache_creation_input_tokens ?? 0) - r.cache1h,
-    }) + (r.cache1h / 1_000_000) * price.cacheWrite1h;
+      cacheReadTokens: r.usage.cache_read_input_tokens ?? 0, cacheCreationTokens: 0,
+    }) + (((r.usage.cache_creation_input_tokens ?? 0) - r.cache1h) / 1_000_000) * price.cacheWrite + (r.cache1h / 1_000_000) * price.cacheWrite1h;
   }
   const rawSum = rows.reduce((a, r) => a + r.rawCost, 0);
   const scale = totalCostUsd && rawSum > 0 ? totalCostUsd / rawSum : 1;
   for (const r of rows) r.costUsd = r.rawCost * scale;
-  return rows.map(({ id: _id, rawCost: _rc, chars: _c, thinkingEst: _te, usage: _u, cache1h: _h, model: _m, lastBlockMs: _lb, lastResultMs: _lr, segmentStartMs: _ss, ...t }) => t);
+  return rows.map(({ id: _id, rawCost: _rc, chars: _c, thinkingEst: _te, usage: _u, cache1h: _h, model: _m, lastBlockMs: _lb, lastResultMs: _lr, segmentStartMs: _ss, nestedOutput: _no, ...t }) => t);
 }
 
 function renderWalk(walk: WalkTurn[]): string {
@@ -292,8 +307,8 @@ ${renderWalk(walk)}
 
 type RawLabels = { turns: { turn: number; label: TurnLabel["label"]; repeat_of: number | null; reason: string }[] };
 
-export function classifyTurns(walk: WalkTurn[], task: string, model: string): { labels: TurnLabel[]; analystCostUsd: number; modelUsed: string } | null {
-  const res = runStructured<RawLabels>("Attribution", analystPrompt(task, walk), model, SCHEMA, 10 * 60 * 1000);
+export async function classifyTurns(walk: WalkTurn[], task: string, model: string): Promise<{ labels: TurnLabel[]; analystCostUsd: number; modelUsed: string } | null> {
+  const res = await runStructured<RawLabels>("Attribution", analystPrompt(task, walk), model, SCHEMA, 10 * 60 * 1000);
   if (!res) return null;
   const labels: TurnLabel[] = res.data.turns.map(t => ({ turn: t.turn, label: t.label, repeatOf: t.repeat_of ?? null, reason: t.reason }));
   return { labels, analystCostUsd: res.costUsd, modelUsed: res.modelUsed };
@@ -302,7 +317,8 @@ export function classifyTurns(walk: WalkTurn[], task: string, model: string): { 
 function totals(rows: AttributedTurn[]): AttributionTotals {
   const sum = (f: (r: AttributedTurn) => number) => rows.reduce((a, r) => a + f(r), 0);
   return {
-    costUsd: sum(r => r.costUsd), durationMs: sum(r => r.durationMs), modelMs: sum(r => r.modelMs), toolMs: sum(r => r.toolMs), stallMs: sum(r => r.stallMs),
+    costUsd: sum(r => r.costUsd), inputTokens: sum(r => r.inputTokens), cacheWriteTokens: sum(r => r.cacheWriteTokens),
+    durationMs: sum(r => r.durationMs), modelMs: sum(r => r.modelMs), toolMs: sum(r => r.toolMs), stallMs: sum(r => r.stallMs),
     turns: rows.length, outputTokens: sum(r => r.outputTokens), cacheReadTokens: sum(r => r.cacheReadTokens),
   };
 }
@@ -312,7 +328,7 @@ export function rollup(walk: WalkTurn[], labels: TurnLabel[], analystModel: stri
   const rows: AttributedTurn[] = walk.map(t => {
     const l = byTurn.get(t.turn) ?? { turn: t.turn, label: "work" as const, repeatOf: null, reason: "(unlabelled by analyst; counted as work)" };
     const summary = t.tools.length ? t.tools.map(x => `${x.name} ${x.args}`).join("; ").slice(0, 160) : (t.text.slice(0, 160) || "(thinking only)");
-    return { ...l, startMs: t.startMs, costUsd: t.costUsd, durationMs: t.durationMs, modelMs: t.modelMs, toolMs: t.toolMs, stallMs: t.stallMs, outputTokens: t.outputTokens, cacheReadTokens: t.cacheReadTokens, summary };
+    return { ...l, startMs: t.startMs, costUsd: t.costUsd, durationMs: t.durationMs, modelMs: t.modelMs, toolMs: t.toolMs, stallMs: t.stallMs, outputTokens: t.outputTokens, cacheReadTokens: t.cacheReadTokens, inputTokens: t.inputTokens, cacheWriteTokens: t.cacheWriteTokens, summary };
   });
   const housekeeping = rows.filter(r => r.label === "housekeeping");
   const core = rows.filter(r => r.label !== "housekeeping");
@@ -322,11 +338,11 @@ export function rollup(walk: WalkTurn[], labels: TurnLabel[], analystModel: stri
   };
 }
 
-export function attribute(jsonlPath: string, task: string, totalCostUsd: number | null, model: string, tag: string): Attribution | null {
+export async function attribute(jsonlPath: string, task: string, totalCostUsd: number | null, model: string, tag: string): Promise<Attribution | null> {
   const walk = buildWalk(fs.readFileSync(jsonlPath, "utf8"), totalCostUsd);
   if (walk.length === 0) { log(`[${tag}] Attribution: no messages in transcript`); return null; }
   log(`[${tag}] Attribution: labelling ${walk.length} messages with ${model}…`);
-  const res = classifyTurns(walk, task, model);
+  const res = await classifyTurns(walk, task, model);
   if (!res) return null;
   const a = rollup(walk, res.labels, res.modelUsed, res.analystCostUsd);
   log(`[${tag}] Attribution: core ${formatCost(a.core.costUsd)} / ${formatDuration(a.core.durationMs)} (${a.core.turns} msgs); housekeeping ${formatCost(a.housekeeping.costUsd)} / ${formatDuration(a.housekeeping.durationMs)} (${a.housekeeping.turns} msgs)${a.raw.stallMs > 0 ? `; stalled ${formatDuration(a.raw.stallMs)} (machine sleep or API outage, excluded)` : ""}; analyst ${formatCost(res.analystCostUsd)} via ${res.modelUsed}${a.outputExact ? "" : "; per-message output estimated"}`);

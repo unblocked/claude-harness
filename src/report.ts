@@ -104,7 +104,13 @@ function sharedRequirementsTable(result: ComparisonResult): string {
     if (!r) return "<td>–</td>";
     return `<td><span class="met ${r.status === "met" ? "met-met" : r.status === "unmet" ? "met-unmet" : "met-partial"}">${r.status}</span><div class="evidence">${escapeHtml(r.note)}</div></td>`;
   };
-  const adj = spec.adjudications.map(a => `<li>Requirement ${a.index + 1}, disputed by ${a.disputedBy === "unblocked" ? "the Unblocked arm" : "the baseline arm"} in round ${a.round}: <b>${a.waived ? "waived for both arms" : "dispute rejected"}</b>. ${escapeHtml(a.reason)}</li>`).join("");
+  // A waiver granted after an arm had already been sent back for that
+  // requirement cost that arm a fix round the other arm did not pay for.
+  const paidFor = (arm: ArmResult, index: number) => (arm.review?.passes ?? []).filter(p => p.fix && !(p.waiversInForce ?? []).includes(index) && p.requirements.some(r => r.index === index && (r.status === "unmet" || r.status === "partial"))).length;
+  const adj = spec.adjudications.map(a => {
+    const cost = a.waived ? [["Baseline", result.baseline], ["With Unblocked", result.unblocked]].map(([n, arm]) => [n, paidFor(arm as ArmResult, a.index)] as const).filter(([, k]) => k > 0).map(([n, k]) => `${n} had already spent ${k} fix pass(es) on it before the waiver`).join("; ") : "";
+    return `<li>Requirement ${a.index + 1}, disputed by ${a.disputedBy === "unblocked" ? "the Unblocked arm" : "the baseline arm"} in round ${a.round}: <b>${a.waived ? "waived for both arms" : "dispute rejected"}</b>. ${escapeHtml(a.reason)}${cost ? ` <span class="met met-partial">${escapeHtml(cost)}</span>` : ""}</li>`;
+  }).join("");
   return `<div class="tool-table-wrap"><table class="tool-table">
       <thead><tr><th>Requirement (same list for both arms)</th><th>Baseline</th><th>With Unblocked</th></tr></thead>
       <tbody>${spec.requirements.map((req, i) => `<tr><td>${i + 1}. ${escapeHtml(req)}</td>${cell(result.baseline, i)}${cell(result.unblocked, i)}</tr>`).join("")}</tbody>
@@ -214,7 +220,7 @@ function armSummary(label: string, arm: ArmResult): string[] {
   const timedOut = arm.run.timedOut;
   const tokensAvail = totalTokens(u) > 0;
   return [
-    `  ${padRight(label.toUpperCase() + (timedOut ? " [TIMED OUT]" : ""), 28)}Time        Cost     Output   Turns`,
+    `  ${padRight(label.toUpperCase() + (arm.run.killedReason ? ` [KILLED: ${arm.run.killedReason}]` : timedOut ? " [TIMED OUT]" : ""), 28)}Time        Cost     Output   Turns`,
     `  ${"─".repeat(W - 2)}`,
     `  ${padRight("Task", 28)}${padLeft(formatDuration(arm.run.durationMs), 10)}  ${padLeft(tokensAvail ? formatCost(arm.estimatedCost) : "N/A", 10)}  ${padLeft(tokensAvail ? formatTokens(u.outputTokens) : "N/A", 8)}  ${padLeft(String(arm.run.assistantTurns), 3)}`,
     ...(hasTiming(arm) ? [
@@ -331,10 +337,11 @@ export function printReport(result: ComparisonResult): void {
 }
 
 export function writeJsonResult(result: ComparisonResult, outDir: string): void {
+  const cut = (d: string) => d.length > 100_000 ? d.slice(0, 100_000) + `\n… (diff truncated for result.json; ${d.length} chars in full)` : d;
   const clean = {
     ...result,
-    baseline: { ...result.baseline, diff: result.baseline.diff.slice(0, 100_000) },
-    unblocked: { ...result.unblocked, diff: result.unblocked.diff.slice(0, 100_000) },
+    baseline: { ...result.baseline, diff: cut(result.baseline.diff) },
+    unblocked: { ...result.unblocked, diff: cut(result.unblocked.diff) },
   };
   fs.writeFileSync(path.join(outDir, "result.json"), JSON.stringify(clean, null, 2));
 }
@@ -406,7 +413,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       <div class="finding" style="margin-bottom: 8px;"><b>${title}</b>${text ? `<div style="margin-top: 4px;">${escapeHtml(text)}</div>` : ""}<div class="evidence" style="margin-top: 6px;">${facts}</div></div>`;
     const toolKinds = Object.entries(e.time.toolWaitDelta).filter(([, v]) => Math.abs(v) >= 1000).sort((a, b2) => Math.abs(b2[1]) - Math.abs(a[1])).map(([k, v]) => `${escapeHtml(k)} ${min(v)}`).join(", ");
     return `
-    <div class="section-title" style="font-size: 15px; margin-top: 24px;">Explanation of numbers <span class="section-sub">Unblocked relative to baseline</span></div>
+    <div class="section-title" style="font-size: 15px; margin-top: 24px;">Explanation of numbers <span class="section-sub">Unblocked relative to baseline${e.basis === "raw" ? "; whole-run figures, attribution missing for at least one arm" : ""}</span></div>
     <div class="findings">
       ${para("Cost " + usd(e.cost.deltaUsd), ex?.cost, `output ${usd(e.cost.terms.output)} · cache-read ${usd(e.cost.terms.cacheRead)} · cache-write ${usd(e.cost.terms.cacheWrite)} · input ${usd(e.cost.terms.input)}${Math.abs(e.cost.unexplainedUsd) >= 0.01 ? ` · residual ${usd(e.cost.unexplainedUsd)}` : ""}`)}
       ${para("Time " + min(e.time.deltaMs), ex?.time, `model time ${min(e.time.modelDeltaMs)} · tool wait ${min(e.time.toolDeltaMs)}${toolKinds ? ` (${toolKinds})` : ""}`)}
@@ -468,12 +475,12 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     return `
     <div class="arm-section"${accent ? ` style="border-color: rgba(59, 130, 246, 0.3);"` : ""}>
       <div class="arm-header"${accent ? ` style="border-bottom-color: rgba(59, 130, 246, 0.2);"` : ""}>
-        <span class="arm-name">${escapeHtml(label)}${arm.run.timedOut ? ` <span style="color: var(--yellow); font-size: 12px;">(TIMED OUT)</span>` : ""}</span>
+        <span class="arm-name">${escapeHtml(label)}${arm.run.killedReason ? ` <span style="color: var(--red); font-size: 12px;">(KILLED: ${escapeHtml(arm.run.killedReason)})</span>` : arm.run.timedOut ? ` <span style="color: var(--yellow); font-size: 12px;">(TIMED OUT)</span>` : ""}</span>
         ${a ? `<span style="font-size: 12px; color: var(--text-muted);">core task work · raw incl. housekeeping: ${formatCost(arm.estimatedCost)}, ${formatDuration(arm.run.durationMs)}, ${formatTokens(t.outputTokens)} out</span>` : ""}
       </div>
       <div class="arm-meta">
         <div class="arm-stat"><div class="arm-stat-val">${formatDuration(head.dur)}</div><div class="arm-stat-label">${head.tag} Duration</div></div>
-        <div class="arm-stat"><div class="arm-stat-val">${has ? formatCost(head.cost) : "N/A"}</div><div class="arm-stat-label">${head.tag} Cost</div></div>
+        <div class="arm-stat"><div class="arm-stat-val">${has ? formatCost(head.cost) : "N/A"}${arm.run.costEstimated ? ` <span style="font-size: 11px; color: var(--yellow);">(est.)</span>` : ""}</div><div class="arm-stat-label">${head.tag} Cost</div></div>
         <div class="arm-stat"><div class="arm-stat-val">${has ? formatTokens(head.out) : "N/A"}</div><div class="arm-stat-label">${head.tag} Output Tokens</div></div>
         <div class="arm-stat"><div class="arm-stat-val">${head.turns}</div><div class="arm-stat-label">${head.tag} ${a ? "Messages" : "Turns"}</div></div>
       </div>
@@ -485,7 +492,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
         Cache Write: <span>${formatTokens(t.cacheCreationTokens)}</span>
       </div>` : `<div class="arm-tokens" style="color: var(--text-muted);">Token data unavailable</div>`}
       <div class="arm-tokens">
-        ${hasTiming(arm) ? `Model time: <span>${formatDuration(modelTimeMs(arm))}</span> &nbsp; Tool time: <span>${formatDuration(toolTimeMs(arm))}</span> &nbsp;` : ""}
+        ${hasTiming(arm) ? `${arm.attribution ? "" : `Model time (approx., duration minus tool wait): <span>${formatDuration(modelTimeMs(arm))}</span> &nbsp; `}Tool time: <span>${formatDuration(toolTimeMs(arm))}</span> &nbsp;` : ""}
         Diff: <span>${escapeHtml(formatDiffSummary(arm.diffStats))}</span>
       </div>
     </div>`;
@@ -1001,7 +1008,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       const last = rv.passes[rv.passes.length - 1];
       return `
       <div class="arm-section">
-        <div class="arm-header"><span class="arm-name">${escapeHtml(label as string)} <span class="met ${rv.finalMergeable ? "met-met" : "met-unmet"}">${rv.finalMergeable ? "all requirements met" : "requirements open"}</span></span>
+        <div class="arm-header"><span class="arm-name">${escapeHtml(label as string)} <span class="met ${rv.finalMergeable ? "met-met" : rv.checkFailed ? "met-partial" : "met-unmet"}">${rv.finalMergeable ? "all requirements met" : rv.checkFailed ? `check failed in round ${rv.checkFailed}; last recorded state below` : "requirements open"}</span></span>
           <span style="font-size: 12px; color: var(--text-muted);">draft ${escapeHtml(formatDiffSummary(rv.draft.diffStats))} → final ${escapeHtml(formatDiffSummary((arm as ArmResult).diffStats))} · ${rv.passes.filter(p => p.fix).length} fix pass(es), ${formatCost(rv.passes.reduce((s2, p) => s2 + (p.fix?.costUsd ?? 0), 0))}, ${formatDuration(rv.passes.reduce((s2, p) => s2 + (p.fix?.durationMs ?? 0), 0))}</span></div>
         ${last && !result.reviewSpec ? `<table class="tool-table"><thead><tr><th>Requirement</th><th>Final status</th></tr></thead><tbody>${last.requirements.map(r => `
           <tr><td>${escapeHtml(r.requirement)}</td><td><span class="met ${r.status === "met" ? "met-met" : r.status === "unmet" ? "met-unmet" : "met-partial"}">${r.status}</span><div class="evidence">${escapeHtml(r.note)}</div></td></tr>`).join("")}</tbody></table>` : ""}
@@ -1094,7 +1101,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   </div>` : ""}
 
   <div class="section">
-    <div class="section-title">Pricing &mdash; $ per million tokens <span class="section-sub">reference only; arm costs are what the CLI billed</span></div>
+    <div class="section-title">Pricing &mdash; $ per million tokens <span class="section-sub">${b.run.costEstimated || u.run.costEstimated ? "arm costs marked (est.) were priced from this table because the CLI reported no billed total for at least one pass" : "reference only; arm costs are what the CLI billed"}</span></div>
     <div class="tool-table-wrap">
       <table class="tool-table">
         <thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Cache Read</th><th>Cache Write (5m)</th><th>Cache Write (1h)</th></tr></thead>

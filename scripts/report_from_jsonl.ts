@@ -14,6 +14,7 @@ import { attribute, buildWalk, rollup } from "../src/attribution.ts";
 import { assessQuality } from "../src/quality.ts";
 import { assessImpact } from "../src/impact.ts";
 import { economics } from "../src/economics.ts";
+import { extractUnblockedCalls } from "../src/runner.ts";
 import type { ArmResult, ComparisonResult, Condition, UnblockedCall } from "../src/types.ts";
 
 interface InitInfo { cwd?: string; model?: string }
@@ -55,17 +56,6 @@ function durationMs(jsonl: string): number {
   return seen ? total : (Number.isNaN(first) ? 0 : Math.max(0, last - first));
 }
 
-function unblockedCalls(toolCalls: { name: string; args: Record<string, unknown>; mcpServer?: string }[]): UnblockedCall[] {
-  const out: UnblockedCall[] = [];
-  for (const tc of toolCalls) {
-    const isUb = tc.mcpServer?.toLowerCase().includes("unblocked") || tc.name.toLowerCase().includes("unblocked");
-    if (isUb) {
-      out.push({ tool: tc.name.split(/__|::/).pop() ?? tc.name, query: (tc.args.query as string) ?? (tc.args.url as string) ?? undefined });
-    }
-  }
-  return out;
-}
-
 function arm(condition: Condition, file: string, model: string, orig?: ArmResult): ArmResult {
   const jsonl = fs.readFileSync(file, "utf8");
   const parsed = parseStreamJson(jsonl);
@@ -76,18 +66,21 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
     assistantTurns: parsed.assistantTurns,
     finalResponse: parsed.finalResponse,
     sessionId: parsed.sessionId,
-    exitCode: 0,
-    timedOut: false,
+    // Exit state is not in the transcript; carried from the run's result.json.
+    exitCode: orig?.run.exitCode ?? 0,
+    timedOut: orig?.run.timedOut ?? false,
+    ...(orig?.run.killedReason ? { killedReason: orig.run.killedReason } : {}),
     jsonlPath: file,
-    worktreePath: "(from transcript)",
+    worktreePath: orig?.run.worktreePath ?? "(from transcript)",
     totalCostUsd: parsed.totalCostUsd,
+    ...(parsed.totalCostUsd === null ? { costEstimated: true } : {}),
   };
   const cost = run.totalCostUsd ?? estimateCost(model, run.tokenUsage);
   return {
     condition, run,
     diff: orig?.diff ?? "(not captured — generated from transcript)",
     diffStats: orig?.diffStats ?? { filesChanged: 0, linesAdded: 0, linesRemoved: 0, commits: 0 },
-    unblockedCalls: unblockedCalls(parsed.toolCalls),
+    unblockedCalls: extractUnblockedCalls(parsed.toolCalls),
     estimatedCost: cost,
     // Carried over unless --attribute recomputes it; the analyst call is the slow part.
     attribution: orig?.attribution,
@@ -102,8 +95,9 @@ function reparseReview(review: NonNullable<ArmResult["review"]>, jsonlPath: stri
   const dir = path.dirname(jsonlPath), stem = path.basename(jsonlPath, ".jsonl");
   const price = (file: string) => {
     if (!fs.existsSync(file)) return null;
-    const p = parseStreamJson(fs.readFileSync(file, "utf8"));
-    return { costUsd: p.totalCostUsd ?? estimateCost(model, p.tokenUsage), durationMs: p.cliDurationMs ?? 0, messages: p.assistantTurns };
+    const jsonl = fs.readFileSync(file, "utf8");
+    const p = parseStreamJson(jsonl);
+    return { costUsd: p.totalCostUsd ?? estimateCost(model, p.tokenUsage), durationMs: durationMs(jsonl), messages: p.assistantTurns };
   };
   const draft = price(path.join(dir, `${stem}.draft.jsonl`));
   return {
@@ -142,7 +136,7 @@ const baseline = arm("baseline", baseFile, model, orig?.baseline);
 const unblocked = arm("unblocked", ubFile, model, orig?.unblocked);
 for (const a of [baseline, unblocked]) {
   if (attrModel) {
-    const attr = attribute(a.run.jsonlPath, task, a.run.totalCostUsd ?? a.estimatedCost, attrModel, a.condition);
+    const attr = await attribute(a.run.jsonlPath, task, a.run.totalCostUsd ?? a.estimatedCost, attrModel, a.condition);
     if (attr) a.attribution = attr;
   } else if (a.attribution) {
     // Keep the analyst's labels, recompute the per-message numbers (cost,
@@ -169,11 +163,13 @@ const result: ComparisonResult = {
 // The judge and impact passes are the expensive, non-deterministic steps; a
 // previous result from the supplied result.json is kept unless re-run is asked
 // for, and a failed re-run keeps the previous result rather than dropping it.
-if (judgeModel) result.quality = assessQuality(result, judgeModel) ?? orig?.quality;
+const killed = [baseline, unblocked].filter(a => a.run.killedReason);
+if (killed.length) console.error(`⚠ ${killed.map(a => `${a.condition} was killed (${a.run.killedReason})`).join("; ")}: judge and impact are not re-run for an unfinished comparison`);
+if (judgeModel && !killed.length) result.quality = (await assessQuality(result, judgeModel)) ?? orig?.quality;
 else if (orig?.quality) result.quality = orig.quality;
 
 result.economics = economics(result);
-if (impactModel) result.impact = assessImpact(result, impactModel) ?? orig?.impact;
+if (impactModel && !killed.length && result.quality) result.impact = (await assessImpact(result, impactModel)) ?? orig?.impact;
 else if (orig?.impact) result.impact = orig.impact;
 
 const reviewCost = (a: ArmResult) => (a.review?.passes ?? []).reduce((s, p) => s + p.reviewCostUsd, 0);

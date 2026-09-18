@@ -248,6 +248,9 @@ export function removeWorktree(repoPath: string, name: string, refsBefore: Map<s
   if (!refsBefore) { log(`Skipping branch cleanup for ${name}: no ref snapshot from run start`); return; }
   if (agentCommits.size === 0) return;
 
+  // Branches checked out in some other worktree are never moved: resetting
+  // one under a live checkout leaves that worktree's index inconsistent.
+  const checkedOut = new Set((tryGit(repoPath, ["worktree", "list", "--porcelain"], "listing worktrees") ?? "").split("\n").filter(l => l.startsWith("branch ")).map(l => l.slice(7).trim()));
   const now = tryGit(repoPath, ["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads"], "listing branches after run") ?? "";
   for (const line of now.split("\n")) {
     const sp = line.indexOf(" ");
@@ -258,6 +261,7 @@ export function removeWorktree(repoPath: string, name: string, refsBefore: Map<s
     if (before === undefined) {
       if (tryGit(repoPath, ["branch", "-D", short], `deleting agent-created branch ${short}`) !== null) log(`Deleted agent-created branch ${short} (was ${sha.slice(0, 7)})`);
     } else if (before !== sha) {
+      if (checkedOut.has(ref)) { log(`Agent moved pre-existing branch ${short} to ${sha.slice(0, 7)}, but it is checked out in another worktree; left as is (pre-run sha ${before.slice(0, 7)})`); continue; }
       if (tryGit(repoPath, ["update-ref", ref, before, sha], `resetting ${short} to its pre-run sha`) !== null) {
         log(`Agent moved pre-existing branch ${short} to ${sha.slice(0, 7)}; reset to ${before.slice(0, 7)}. The agent's commit is still reachable by sha for a while.`);
       }
@@ -311,7 +315,7 @@ export async function runClaude(opts: {
 
   const started = Date.now();
 
-  const result = await new Promise<{ exitCode: number | null; timedOut: boolean }>((resolve, reject) => {
+  const result = await new Promise<{ exitCode: number | null; timedOut: boolean; killedReason?: string }>((resolve, reject) => {
     const p = spawn(BINARY, args, {
       cwd: opts.worktreePath,
       stdio: ["pipe", "pipe", "pipe"],
@@ -329,6 +333,13 @@ export async function runClaude(opts: {
     let turnCount = 0;
     const tag = opts.condition;
     let killed = false;
+    let killedReason: string | undefined;
+    const kill = (reason: string) => {
+      killed = true;
+      killedReason = reason;
+      p.kill("SIGTERM");
+      setTimeout(() => p.kill("SIGKILL"), 5_000);
+    };
 
     let unblockedCallSeen = false;
 
@@ -336,9 +347,7 @@ export async function runClaude(opts: {
       ? setTimeout(() => {
           if (!unblockedCallSeen && !killed) {
             log(`[${tag}] ⛔ Unblocked not called within 120s — killing run`);
-            killed = true;
-            p.kill("SIGTERM");
-            setTimeout(() => p.kill("SIGKILL"), 5_000);
+            kill("the Unblocked arm made no Unblocked call within 120s");
           }
         }, 120_000)
       : null;
@@ -399,9 +408,7 @@ export async function runClaude(opts: {
 
                 if (opts.condition === "baseline" && !killed && (isUbMcp || isUbCli)) {
                   log(`[${tag}] ⛔ CONTAMINATION: baseline called Unblocked — killing run`);
-                  killed = true;
-                  p.kill("SIGTERM");
-                  setTimeout(() => p.kill("SIGKILL"), 5_000);
+                  kill("contamination: the baseline called Unblocked");
                 }
 
                 if (opts.condition === "unblocked" && !unblockedCallSeen && (isUbMcp || isUbCli)) {
@@ -426,8 +433,7 @@ export async function runClaude(opts: {
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      p.kill("SIGTERM");
-      setTimeout(() => p.kill("SIGKILL"), 5_000);
+      if (!killed) kill(`timed out after ${Math.round(opts.timeoutMs / 1000)}s`);
     }, opts.timeoutMs);
 
     p.stderr.on("data", (d: Buffer) => process.stderr.write(`[claude:${opts.condition}] ${d}`));
@@ -435,8 +441,10 @@ export async function runClaude(opts: {
     p.on("close", (code) => {
       clearTimeout(timer);
       if (unblockedDeadline) clearTimeout(unblockedDeadline);
-      out.end();
-      resolve({ exitCode: code, timedOut });
+      // Resolve only once the transcript is fully on disk: the last chunk is
+      // the result event with the cost and usage, and reading before the
+      // stream has flushed loses it.
+      out.end(() => resolve({ exitCode: code, timedOut, killedReason }));
     });
 
     p.on("error", reject);
@@ -456,8 +464,10 @@ export async function runClaude(opts: {
     sessionId: parsed.sessionId,
     exitCode: result.exitCode,
     timedOut: result.timedOut,
+    ...(result.killedReason ? { killedReason: result.killedReason } : {}),
     jsonlPath,
     worktreePath: opts.worktreePath,
     totalCostUsd: parsed.totalCostUsd,
+    ...(parsed.totalCostUsd === null ? { costEstimated: true } : {}),
   };
 }

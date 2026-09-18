@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -42,55 +42,91 @@ let debugSeq = 0;
 const ANALYST_CWD = path.join(os.tmpdir(), "claude-harness-analyst");
 fs.mkdirSync(ANALYST_CWD, { recursive: true });
 
-function callOnce(prompt: string, model: string, schema: object, timeoutMs: number): { out: RawOut | null; declined: boolean; error: string } {
+// Blinding helper shared by the requirement check and the judge: hide the
+// treatment, not the repository. The tool's own names go ("Unblocked
+// MCP/context/research/CLI", the MCP tool ids, the CLI subcommands) and so
+// does the capitalised product name on its own, which is how an agent refers
+// to the tool in prose ("Unblocked surfaced…", "I did not use Unblocked").
+// Lowercase "unblocked" stays: the repository under test is called that and
+// its paths, packages and handles carry the word. A sentence that asserts
+// non-use of the tool is dropped outright, since the control arm is told not
+// to use it and says so.
+export function neutralise(s: string): string {
+  const t = s
+    .replace(/mcp__unblocked__\w+/g, "research_tool")
+    .replace(/\bunblocked\s+context[_-](research|get[_-]urls|get[_-]rules|search[_-]\w+)\b/gi, "research_tool")
+    .replace(/\bcontext[_-](research|get[_-]urls|get[_-]rules|search[_-]\w+)\b/g, "research_tool")
+    .replace(/\b(the )?Unblocked (MCP|context|research|tool|search|CLI|skill)s?( tool)?\b/gi, "the research tool")
+    .replace(/\bUnblocked('s)?\b/g, (_, poss) => poss ? "the research tool's" : "the research tool");
+  return t.replace(/[^.\n]*\b(not|n't|never|avoid\w*|without|no)\b[^.\n]*\bresearch tool\b[^.\n]*[.\n]|[^.\n]*\bresearch tool\b[^.\n]*\b(not|n't|never|avoid\w*|without)\b[^.\n]*[.\n]/gi, m => m.endsWith("\n") ? "\n" : "");
+}
+
+function callOnce(prompt: string, model: string, schema: object, timeoutMs: number): Promise<{ out: RawOut | null; declined: boolean; error: string }> {
   // --max-turns 3, not 1: structured output is returned through a tool round
   // trip, and with 1 the CLI ends in error_max_turns before the JSON arrives.
   const args = [
     "-p", "--model", model, "--max-turns", "3", "--tools", "", "--strict-mcp-config", "--no-session-persistence",
     "--output-format", "json", "--json-schema", JSON.stringify(schema),
   ];
-  const res = spawnSync(BINARY, args, { cwd: ANALYST_CWD, input: prompt, stdio: ["pipe", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs });
-  if (DEBUG_DIR) {
-    try {
-      const base = `${DEBUG_DIR}/analyst-${Date.now()}-${++debugSeq}`;
-      require("node:fs").writeFileSync(`${base}.prompt.txt`, prompt);
-      require("node:fs").writeFileSync(`${base}.stdout.json`, res.stdout ?? "");
-      require("node:fs").writeFileSync(`${base}.stderr.txt`, res.stderr ?? "");
-    } catch {}
-  }
-  if (!res.stdout?.length) return { out: null, declined: false, error: `exit ${res.status}: ${(res.stderr ?? "").toString().slice(0, 300)}` };
-  let out: RawOut;
-  try { out = JSON.parse(res.stdout.toString()); } catch (err) { return { out: null, declined: false, error: `unparseable output: ${(err as Error).message}` }; }
-  if (out.structured_output) return { out, declined: false, error: "" };
-  const msg = String(out.result ?? "");
-  const detail = `stop_reason=${out.stop_reason ?? "?"} subtype=${out.subtype ?? "?"} is_error=${out.is_error ?? "?"} turns=${out.num_turns ?? "?"} result="${msg.slice(0, 200)}"`;
-  return { out, declined: /safeguards flagged/i.test(msg), error: detail };
+  // Async, not spawnSync: these calls run while the other arm's agent is
+  // live, and a blocked event loop would defer its timers (the contamination
+  // kill, the no-research deadline, the per-arm timeout) by minutes.
+  return new Promise(resolve => {
+    const chunks: Buffer[] = [], errs: Buffer[] = [];
+    let status: number | null = null;
+    const child = spawn(BINARY, args, { cwd: ANALYST_CWD, stdio: ["pipe", "pipe", "pipe"] });
+    const timer = setTimeout(() => { child.kill("SIGTERM"); setTimeout(() => child.kill("SIGKILL"), 5000); }, timeoutMs);
+    child.stdout.on("data", (c: Buffer) => chunks.push(c));
+    child.stderr.on("data", (c: Buffer) => errs.push(c));
+    child.on("error", err => { clearTimeout(timer); resolve({ out: null, declined: false, error: `spawn failed: ${err.message}` }); });
+    child.on("close", code => {
+      clearTimeout(timer);
+      status = code;
+      const stdout = Buffer.concat(chunks).toString(), stderr = Buffer.concat(errs).toString();
+      if (DEBUG_DIR) {
+        try {
+          const base = `${DEBUG_DIR}/analyst-${Date.now()}-${++debugSeq}`;
+          fs.writeFileSync(`${base}.prompt.txt`, prompt);
+          fs.writeFileSync(`${base}.stdout.json`, stdout);
+          fs.writeFileSync(`${base}.stderr.txt`, stderr);
+        } catch {}
+      }
+      if (!stdout.length) return resolve({ out: null, declined: false, error: `exit ${status}: ${stderr.slice(0, 300)}` });
+      let out: RawOut;
+      try { out = JSON.parse(stdout); } catch (err) { return resolve({ out: null, declined: false, error: `unparseable output: ${(err as Error).message}` }); }
+      if (out.structured_output) return resolve({ out, declined: false, error: "" });
+      const msg = String(out.result ?? "");
+      const detail = `stop_reason=${out.stop_reason ?? "?"} subtype=${out.subtype ?? "?"} is_error=${out.is_error ?? "?"} turns=${out.num_turns ?? "?"} result="${msg.slice(0, 200)}"`;
+      resolve({ out, declined: /safeguards flagged/i.test(msg), error: detail });
+    });
+    child.stdin.end(prompt);
+  });
 }
 
 // Runs the prompt and returns the schema-shaped result, or null after logging
 // why. Cost includes declined attempts, which still bill. `redactInput` strips
 // strings that have tripped input safeguards; leave it off when the caller
 // needs them intact (the quality judge reads image digests and env names).
-export function runStructured<T>(what: string, prompt: string, model: string, schema: object, timeoutMs = 15 * 60 * 1000, redactInput = true): StructuredResult<T> | null {
+export async function runStructured<T>(what: string, prompt: string, model: string, schema: object, timeoutMs = 15 * 60 * 1000, redactInput = true): Promise<StructuredResult<T> | null> {
   const p = redactInput ? redact(prompt) : prompt;
   let cost = 0;
   let modelUsed = model;
-  let r = callOnce(p, model, schema, timeoutMs);
+  let r = await callOnce(p, model, schema, timeoutMs);
   cost += r.out?.total_cost_usd ?? 0;
   for (let attempt = 1; !r.out?.structured_output && r.declined && attempt <= DECLINE_RETRIES; attempt++) {
     log(`${what}: ${model} declined the input (safeguards, intermittent); retry ${attempt}/${DECLINE_RETRIES}`);
-    r = callOnce(p, model, schema, timeoutMs);
+    r = await callOnce(p, model, schema, timeoutMs);
     cost += r.out?.total_cost_usd ?? 0;
   }
   if (!r.out?.structured_output && !r.declined) {
     log(`${what}: no structured output on first attempt (${r.error}); retrying once`);
-    r = callOnce(p, model, schema, timeoutMs);
+    r = await callOnce(p, model, schema, timeoutMs);
     cost += r.out?.total_cost_usd ?? 0;
   }
   if (!r.out?.structured_output && r.declined && model !== FALLBACK_MODEL) {
     log(`${what}: ${model} still declining; falling back to ${FALLBACK_MODEL}`);
     modelUsed = `${FALLBACK_MODEL} (${model} declined)`;
-    r = callOnce(p, FALLBACK_MODEL, schema, timeoutMs);
+    r = await callOnce(p, FALLBACK_MODEL, schema, timeoutMs);
     cost += r.out?.total_cost_usd ?? 0;
   }
   if (!r.out?.structured_output) {

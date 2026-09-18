@@ -1,6 +1,6 @@
 import type { ArmResult, Condition, ReviewPass, ReviewRequirement, ReviewSpec } from "./types.ts";
 import { formatCost, log } from "./util.ts";
-import { runStructured } from "./analyst.ts";
+import { neutralise, runStructured } from "./analyst.ts";
 
 // Requirement check, held to one standard for both arms. The reviewer has
 // one job: for each of the task's requirements, say whether the change
@@ -24,12 +24,6 @@ const DIFF_BUDGET = 60_000;
 // "Unblocked MCP/context/research/CLI", the MCP tool names. A bare
 // "unblocked" stays, because the repository under test is called that and
 // its paths, packages and files carry the word.
-function neutralise(s: string): string {
-  return s
-    .replace(/\b(the )?Unblocked (MCP|context|research|tool|search|CLI|skill)s?( tool)?\b/gi, "the research tool")
-    .replace(/mcp__unblocked__\w+/g, "research_tool")
-    .replace(/\bcontext_(research|get_urls|get_rules|search_\w+)\b/g, "research_tool");
-}
 
 // ---- Requirements, once per run --------------------------------------------
 
@@ -39,14 +33,14 @@ const SPEC_SCHEMA = {
   required: ["requirements"],
 };
 
-export function extractRequirements(task: string, model: string): ReviewSpec | null {
+export async function extractRequirements(task: string, model: string): Promise<ReviewSpec | null> {
   log(`Review: extracting the task's requirements with ${model}…`);
   const prompt = `A pull request will be reviewed against this task. List every explicit requirement and acceptance criterion the task states, one per entry, ≤ 12 words each, in the order the task gives them. Include deliverables the task names (for example tests, a changelog entry) as their own entries. Do not add requirements the task does not state, and do not merge two criteria into one entry.
 
 =================== TASK ===================
 ${task}
 `;
-  const res = runStructured<{ requirements: string[] }>("Requirements", prompt, model, SPEC_SCHEMA, 5 * 60 * 1000, false);
+  const res = await runStructured<{ requirements: string[] }>("Requirements", prompt, model, SPEC_SCHEMA, 5 * 60 * 1000, false);
   if (!res) return null;
   const requirements = res.data.requirements.map(r => r.trim()).filter(Boolean);
   log(`Review: ${requirements.length} requirement(s) — ${requirements.map((r, i) => `${i + 1}. ${r}`).join("; ")}; ${formatCost(res.costUsd)} via ${res.modelUsed}`);
@@ -103,7 +97,7 @@ ${neutralise(diff)}
 `;
 }
 
-export type ReviewOutput = { requirements: ReviewRequirement[]; mergeable: boolean; summary: string; costUsd: number; model: string };
+export type ReviewOutput = { requirements: ReviewRequirement[]; waiversInForce: number[]; mergeable: boolean; summary: string; costUsd: number; model: string };
 
 // Aligns the reviewer's answers to the fixed list and applies the waivers.
 function alignRequirements(spec: ReviewSpec, answers: { index: number; status: "met" | "partial" | "unmet"; note: string }[]): ReviewRequirement[] {
@@ -119,14 +113,14 @@ function alignRequirements(spec: ReviewSpec, answers: { index: number; status: "
 export const isMergeable = (requirements: ReviewRequirement[]) =>
   requirements.every(x => x.status === "met" || x.status === "waived");
 
-export function reviewDraft(task: string, arm: ArmResult, model: string, round: number, previous: ReviewPass | null, spec: ReviewSpec, disputed = ""): ReviewOutput | null {
+export async function reviewDraft(task: string, arm: ArmResult, model: string, round: number, previous: ReviewPass | null, spec: ReviewSpec, disputed = ""): Promise<ReviewOutput | null> {
   log(`[${arm.condition}] Review round ${round}: checking requirements with ${model}…`);
-  const res = runStructured<{ requirements: { index: number; status: "met" | "partial" | "unmet"; note: string }[]; summary: string }>(`Review:${arm.condition}:${round}`, prompt(task, arm, round, previous, spec, disputed), model, SCHEMA, 15 * 60 * 1000, false);
+  const res = await runStructured<{ requirements: { index: number; status: "met" | "partial" | "unmet"; note: string }[]; summary: string }>(`Review:${arm.condition}:${round}`, prompt(task, arm, round, previous, spec, disputed), model, SCHEMA, 15 * 60 * 1000, false);
   if (!res) return null;
   const requirements = alignRequirements(spec, res.data.requirements);
   const mergeable = isMergeable(requirements);
   log(`[${arm.condition}] Review round ${round}: ${mergeable ? "all requirements met" : "not yet"}; ${requirements.filter(r => r.status === "met").length} met / ${requirements.filter(r => r.status === "partial").length} partial / ${requirements.filter(r => r.status === "unmet").length} unmet / ${requirements.filter(r => r.status === "waived").length} waived; ${formatCost(res.costUsd)} via ${res.modelUsed}`);
-  return { requirements, mergeable, summary: res.data.summary, costUsd: res.costUsd, model: res.modelUsed };
+  return { requirements, waiversInForce: [...waivedIndices(spec)].sort((a, b) => a - b), mergeable, summary: res.data.summary, costUsd: res.costUsd, model: res.modelUsed };
 }
 
 // ---- Disputes, adjudicated once for both arms -------------------------------
@@ -143,7 +137,7 @@ const DISPUTE_SCHEMA = {
 // records the decisions on the shared spec. Blind to which arm disputed and
 // to its diff: only the task, the list and the engineer's argument. Returns
 // the call's cost.
-export function adjudicateDisputes(task: string, spec: ReviewSpec, disputed: string, by: Condition, round: number, model: string): number {
+export async function adjudicateDisputes(task: string, spec: ReviewSpec, disputed: string, by: Condition, round: number, model: string): Promise<number> {
   const open = spec.requirements.map((_, i) => i).filter(i => !spec.adjudications.some(a => a.index === i));
   if (!open.length || !disputed.trim()) return 0;
   log(`[${by}] Review round ${round}: the agent disputed part of the review; adjudicating with ${model}…`);
@@ -158,7 +152,7 @@ ${spec.requirements.map((r, i) => `${i + 1}. ${r}${open.includes(i) ? "" : "   (
 =================== THE ENGINEER'S DISPUTE ===================
 ${neutralise(disputed)}
 `;
-  const res = runStructured<{ decisions: { index: number; waive: boolean; reason: string }[] }>(`Adjudicate:${by}:${round}`, p, model, DISPUTE_SCHEMA, 5 * 60 * 1000, false);
+  const res = await runStructured<{ decisions: { index: number; waive: boolean; reason: string }[] }>(`Adjudicate:${by}:${round}`, p, model, DISPUTE_SCHEMA, 5 * 60 * 1000, false);
   if (!res) return 0;
   for (const d of res.data.decisions) {
     const i = d.index - 1;
@@ -201,7 +195,13 @@ Make the change meet each of them. Do not take on work beyond what these require
 // The "Disputed:" section of a fix-pass response, if any.
 export function disputedSection(finalResponse: string): string {
   const m = finalResponse.match(/(?:^|\n)\s*(?:#+\s*)?\**Disputed:?\**\s*\n?([\s\S]{0,2000})/i);
-  const text = m ? m[1].trim() : "";
+  // The section ends at the next heading or bold title line, or a blank line
+  // followed by a non-list line; without that, the summary that follows
+  // would be sent to the adjudicator as part of the dispute.
+  let text = m ? m[1] : "";
+  const end = text.search(/\n\s*(#+\s|\*\*[^*\n]+\*\*:?\s*\n)|\n\s*\n(?![ \t]*[-*\d])/);
+  if (end >= 0) text = text.slice(0, end);
+  text = text.trim();
   // "Disputed: none." is not a dispute.
   return /^[\s*_]*(none|nothing|n\/a|no disputes?|no)\b/i.test(text) ? "" : text;
 }

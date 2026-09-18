@@ -154,10 +154,10 @@ ${result.baseline.run.finalResponse}
 `;
 }
 
-export function assessImpact(result: ComparisonResult, model: string): ContextImpact | null {
+export async function assessImpact(result: ComparisonResult, model: string): Promise<ContextImpact | null> {
   const p = prompt(result);
   log(`Impact: assessing context impact with ${model} (${Math.round(p.length / 1000)}k chars)…`);
-  const res = runStructured<Omit<ContextImpact, "model" | "costUsd">>("Impact", p, model, SCHEMA, 15 * 60 * 1000, false);
+  const res = await runStructured<Omit<ContextImpact, "model" | "costUsd">>("Impact", p, model, SCHEMA, 15 * 60 * 1000, false);
   if (!res) return null;
   const out: ContextImpact = { ...res.data, model: res.modelUsed, costUsd: res.costUsd };
   log(`Impact: outcome ${out.impact.outcome}, context ${out.impact.contextEffect}, driver ${out.impact.outcomeDriver}${out.loss && out.loss.unblockedFailure !== "n/a" ? `; loss: ${out.loss.unblockedFailure}` : ""}; ${formatCost(out.costUsd)} via ${res.modelUsed}`);
