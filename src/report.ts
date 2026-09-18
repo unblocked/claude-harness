@@ -964,18 +964,23 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
 
   ${b.review || u.review ? `
   <div class="section">
-    <div class="section-title">Review round <span class="section-sub">one simulated review and fix per arm, reviewer ${escapeHtml((b.review ?? u.review)!.reviewModel)}</span></div>
-    <div class="section-note">Each draft was reviewed on its own; the agent then resumed its session to address the comments. Numbers elsewhere on this page include the fix pass.</div>
+    <div class="section-title">Review rounds <span class="section-sub">simulated review and fix, reviewer ${escapeHtml((b.review ?? u.review)!.passes[0]?.reviewModel ?? "")}, up to ${(b.review ?? u.review)!.maxRounds} round(s)</span></div>
+    <div class="section-note">Each draft was reviewed on its own against the task's requirements; the agent resumed its session to address unmet ones, and could dispute a requirement. Rounds stop when the reviewer calls the change mergeable. Numbers elsewhere on this page include every fix pass.</div>
     ${[["Baseline", b], ["With Unblocked", u]].map(([label, arm]) => {
       const rv = (arm as ArmResult).review;
       if (!rv) return "";
+      const last = rv.passes[rv.passes.length - 1];
       return `
       <div class="arm-section">
-        <div class="arm-header"><span class="arm-name">${escapeHtml(label as string)}</span>
-          <span style="font-size: 12px; color: var(--text-muted);">draft ${escapeHtml(formatDiffSummary(rv.draft.diffStats))} → final ${escapeHtml(formatDiffSummary((arm as ArmResult).diffStats))}${rv.fix ? ` · fix pass ${formatCost(rv.fix.costUsd)}, ${formatDuration(rv.fix.durationMs)}, ${rv.fix.messages} msgs` : " · no fix pass"}</span></div>
-        <div class="arm-tokens">${escapeHtml(rv.summary)}</div>
-        ${rv.comments.length ? `<table class="tool-table"><thead><tr><th>Severity</th><th>File</th><th>Comment</th></tr></thead><tbody>${rv.comments.map(c => `
-          <tr><td><span class="met ${c.severity === "must-fix" ? "met-unmet" : c.severity === "should-fix" ? "met-partial" : ""}">${c.severity}</span></td><td style="font-family: 'SF Mono', 'Fira Code', Consolas, monospace; font-size: 12px;">${escapeHtml(c.file)}</td><td style="font-size: 13px;">${escapeHtml(c.comment)}</td></tr>`).join("")}</tbody></table>` : ""}
+        <div class="arm-header"><span class="arm-name">${escapeHtml(label as string)} <span class="met ${rv.finalMergeable ? "met-met" : "met-unmet"}">${rv.finalMergeable ? "mergeable" : "not mergeable"}</span></span>
+          <span style="font-size: 12px; color: var(--text-muted);">draft ${escapeHtml(formatDiffSummary(rv.draft.diffStats))} → final ${escapeHtml(formatDiffSummary((arm as ArmResult).diffStats))} · ${rv.passes.filter(p => p.fix).length} fix pass(es), ${formatCost(rv.passes.reduce((s2, p) => s2 + (p.fix?.costUsd ?? 0), 0))}, ${formatDuration(rv.passes.reduce((s2, p) => s2 + (p.fix?.durationMs ?? 0), 0))}</span></div>
+        ${last ? `<table class="tool-table"><thead><tr><th>Requirement</th><th>Final status</th></tr></thead><tbody>${last.requirements.map(r => `
+          <tr><td>${escapeHtml(r.requirement)}</td><td><span class="met ${r.status === "met" ? "met-met" : r.status === "waived" ? "met-partial" : "met-unmet"}">${r.status}</span><div class="evidence">${escapeHtml(r.note)}</div></td></tr>`).join("")}</tbody></table>` : ""}
+        ${rv.passes.map(p => `
+        <div class="arm-tokens" style="display:block;"><b>Round ${p.round}</b> · ${p.mergeable ? "mergeable" : "not mergeable"} · ${escapeHtml(p.summary)}${p.fix ? ` · fix: ${formatCost(p.fix.costUsd)}, ${formatDuration(p.fix.durationMs)}, ${p.fix.messages} msgs${p.fix.disputed ? ` · <span class="met met-partial">disputed</span> ${escapeHtml(p.fix.disputed.slice(0, 200))}` : ""}` : ""}
+          ${p.comments.length ? `<table class="tool-table" style="margin-top: 6px;"><tbody>${p.comments.map(c => `
+            <tr><td style="width: 90px;"><span class="met ${c.severity === "must-fix" ? "met-unmet" : c.severity === "should-fix" ? "met-partial" : ""}">${c.severity}</span></td><td style="font-family: 'SF Mono', 'Fira Code', Consolas, monospace; font-size: 12px; width: 220px;">${escapeHtml(c.file.split("/").slice(-2).join("/"))}</td><td style="font-size: 13px;">${escapeHtml(c.comment)}</td></tr>`).join("")}</tbody></table>` : ""}
+        </div>`).join("")}
       </div>`;
     }).join("")}
   </div>` : ""}

@@ -28,7 +28,8 @@ program
   .option("--analyst-model <model>", "Model that labels each message as work/verify/housekeeping", "opus")
   .option("--judge-model <model>", "Model for the quality judge and context-impact passes", "fable")
   .option("--no-attribution", "Skip the per-turn attribution pass")
-  .option("--review", "One simulated review-and-fix round per arm before analysis (reviewer = judge model)", false);
+  .option("--review-rounds <n>", "Simulated review-and-fix rounds per arm, until mergeable or n (reviewer = judge model)", "0")
+  .option("--review", "Shorthand for --review-rounds 1", false);
 
 program.parse();
 const opts = program.opts();
@@ -49,7 +50,7 @@ const config: Config = {
   cliMode: opts.cli,
   analystModel: opts.attribution === false ? null : opts.analystModel,
   judgeModel: opts.judgeModel,
-  review: opts.review,
+  reviewRounds: Math.max(parseInt(opts.reviewRounds, 10) || 0, opts.review ? 1 : 0),
 };
 
 run(config).catch((err) => {

@@ -178,15 +178,30 @@ export interface ContextImpact {
 
 export interface ReviewComment { file: string; severity: "must-fix" | "should-fix" | "nit"; comment: string }
 
-// One simulated review-and-fix round (--review). The reviewer saw only this
-// arm's draft; the fix pass resumed the agent's own session.
-export interface ReviewRound {
+export interface ReviewRequirement { requirement: string; status: "met" | "unmet" | "waived"; note: string }
+
+// One review pass and, if it was not mergeable, the fix pass that followed.
+export interface ReviewPass {
+  round: number;
   reviewModel: string;
   reviewCostUsd: number;
+  mergeable: boolean;
   summary: string;
+  requirements: ReviewRequirement[];
   comments: ReviewComment[];
+  before: DiffStats;
+  fix: { costUsd: number; durationMs: number; messages: number; exitCode: number | null; timedOut: boolean; disputed: string } | null;
+}
+
+// Simulated review-and-fix rounds (--review-rounds N). The reviewer saw only
+// this arm; each fix pass resumed the agent's own session. Stops when the
+// reviewer calls the change mergeable (every requirement met or waived) or
+// the round limit is reached.
+export interface ReviewRound {
+  maxRounds: number;
+  passes: ReviewPass[];
   draft: { diffStats: DiffStats; costUsd: number; durationMs: number; messages: number };
-  fix: { costUsd: number; durationMs: number; messages: number; exitCode: number | null; timedOut: boolean } | null;
+  finalMergeable: boolean;
 }
 
 export interface ArmResult {
@@ -229,6 +244,6 @@ export interface Config {
   analystModel: string | null;
   // Model for the quality judge and context-impact passes.
   judgeModel: string;
-  // One simulated review-and-fix round per arm before analysis.
-  review: boolean;
+  // Simulated review-and-fix rounds per arm before analysis (0 = none).
+  reviewRounds: number;
 }
