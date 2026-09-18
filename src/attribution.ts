@@ -80,6 +80,10 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
   let streamMsgId = "";
   let totalOutput = 0;
   let totalThinking = 0;
+  // Result events within one process are cumulative (see claude.ts); keep the
+  // last one per segment and add segments up.
+  let segOutput = 0, segThinking = 0;
+  const flushSegment = () => { totalOutput += segOutput; totalThinking += segThinking; segOutput = 0; segThinking = 0; };
   let pendingThinking = 0;   // thinking_tokens deltas seen since the last message started
   let firstTs = NaN;
   let segmentStartMs = NaN;  // harness session_start marker; a second one is the resumed fix pass, and the gap before it (the review call) is not agent time
@@ -88,16 +92,18 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
     const t = tsOf(e);
     if (!Number.isNaN(t) && Number.isNaN(firstTs)) firstTs = t;
     if (e.type === "result") {
+      let out = 0, think = 0;
       for (const mu of Object.values((e.modelUsage ?? {}) as Record<string, { outputTokens?: number; thinkingTokens?: number }>)) {
-        totalOutput += mu.outputTokens ?? 0;
-        totalThinking += mu.thinkingTokens ?? 0;
+        out += mu.outputTokens ?? 0;
+        think += mu.thinkingTokens ?? 0;
       }
-      if (!totalOutput && e.usage?.output_tokens) totalOutput = e.usage.output_tokens;
+      if (!out && e.usage?.output_tokens) out = e.usage.output_tokens;
+      segOutput = out; segThinking = think;
       continue;
     }
     // The CLI's running estimate of thinking tokens, emitted while a message is being generated.
     if (e.type === "system" && e.subtype === "thinking_tokens") { pendingThinking += e.estimated_tokens_delta ?? 0; continue; }
-    if (e.type === "harness" && e.subtype === "session_start" && !Number.isNaN(t)) { segmentStartMs = t; continue; }
+    if (e.type === "harness" && e.subtype === "session_start") { flushSegment(); if (!Number.isNaN(t)) segmentStartMs = t; continue; }
 
     if (typeof e.parent_tool_use_id === "string") {
       // Subagent traffic: charge its usage to the main-thread message that issued the Agent call.
@@ -168,6 +174,8 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
       }
     }
   }
+
+  flushSegment();
 
   // Windows: each message runs from the previous message's end to its own end.
   let prevEnd = firstTs;

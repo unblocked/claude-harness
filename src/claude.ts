@@ -146,10 +146,13 @@ export function parseStreamJson(jsonl: string): ParsedStream {
     }
 
     if (e?.type === "assistant") {
-      if (typeof e.parent_tool_use_id !== "string") messageIds.add(String(e.message?.id ?? `evt-${messageIds.size}`));
+      const nested = typeof e.parent_tool_use_id === "string";
+      if (!nested) messageIds.add(String(e.message?.id ?? `evt-${messageIds.size}`));
       const content: ContentBlock[] = e.message?.content ?? [];
       for (const block of content) {
-        if (block.type === "text" && typeof block.text === "string") {
+        // The final response is the main thread's last text; a sub-agent's
+        // text must not replace it. The result event's own text wins below.
+        if (!nested && block.type === "text" && typeof block.text === "string") {
           finalResponse = block.text;
         }
         if (block.type === "tool_use" && block.name) {
@@ -183,6 +186,7 @@ export function parseStreamJson(jsonl: string): ParsedStream {
       continue;
     }
     if (e?.type === "result") {
+      if (typeof e.result === "string" && e.result.trim()) finalResponse = e.result;
       if (e.modelUsage && typeof e.modelUsage === "object") segLast = e.modelUsage as Record<string, ModelUsage>;
       else if (e.usage) segFallback = addFallback(segFallback, e.usage);
       if (e.usage) segUsage = addFallback(segUsage, e.usage);

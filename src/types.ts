@@ -256,6 +256,8 @@ export interface Config {
   analystModel: string | null;
   // Model for the quality judge and context-impact passes.
   judgeModel: string;
+  // Requirement check (review.ts): a classifier, so a cheaper model than the judge.
+  checkerModel: string;
   // Cap on review-and-fix rounds per arm (0 = no review). Rounds stop early
   // once the reviewer finds every task requirement met or waived.
   reviewRounds: number;
