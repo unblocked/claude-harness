@@ -155,13 +155,22 @@ export interface DecisiveDiscovery {
 export interface QualityAssessment {
   judgeModel: string;
   judgeCostUsd: number;
+  // Candidate decisive discoveries, one per arm, recorded blind. Whether the
+  // Unblocked arm's candidate counts is decided by the impact pass (was it
+  // led by the context?); see verdict.tieBreaker.
   discoveries?: { baseline: DecisiveDiscovery; unblocked: DecisiveDiscovery };
   // Which arm was shown as "Agent A" (random per run), so a blinding failure can be audited.
   armA?: Condition;
   requirements: QualityRequirement[];
   criteria: QualityCriterion[];
   findings: { arm: Condition; finding: string; evidence: string }[];
-  verdict: { better: Condition | "tie"; rationale: string };
+  // `better` is the final verdict. `blinded` is what the judge decided on its
+  // own (requirements, introduced defects, material hygiene, else tie); when
+  // that is a tie and the impact pass finds the Unblocked arm's candidate
+  // discovery was led by the context, the tie-breaker applies and `better`
+  // becomes "unblocked". Baseline discoveries never break a tie: with no
+  // context they measure model variance, not the treatment.
+  verdict: { better: Condition | "tie"; rationale: string; blinded?: Condition | "tie"; tieBreaker?: { applied: boolean; reason: string } };
 }
 
 // Deterministic decomposition of the cost/time/token deltas (src/economics.ts).
@@ -189,6 +198,10 @@ export interface ContextImpact {
   model: string;
   costUsd: number;
   research: { turn: number; query: string; itemsReturned: number; itemsUsed: { item: string; use: string }[]; value: "decisive" | "useful" | "unused" | "misleading"; note: string }[];
+  // Whether the Unblocked arm's candidate discovery (from the blinded judge)
+  // was led by the research context: a research result contained or pointed
+  // to the fact before the agent acted on it.
+  discoveryAttribution?: { contextLed: boolean; evidence: string };
   impact: {
     outcome: "better" | "worse" | "similar";          // the Unblocked arm's result vs baseline, per the blinded judge
     contextEffect: "helped" | "hurt" | "mixed" | "none"; // what the research context itself did to that result
@@ -300,4 +313,10 @@ export interface Config {
   // Cap on review-and-fix rounds per arm (0 = no review). Rounds stop early
   // once the reviewer finds every task requirement met or waived.
   reviewRounds: number;
+  // Full comparisons to run for this task (each with both arms); the batch
+  // summary aggregates them. One run cannot separate agent variance from
+  // the treatment effect.
+  repeat: number;
+  // How many repeats run at once.
+  concurrency: number;
 }

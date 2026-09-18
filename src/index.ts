@@ -4,7 +4,7 @@ import { program } from "commander";
 import fs from "node:fs";
 import path from "node:path";
 import type { Config } from "./types.ts";
-import { run } from "./runner.ts";
+import { runBatch } from "./runner.ts";
 
 function getCurrentBranch(repoPath: string): string {
   try {
@@ -30,7 +30,9 @@ program
   .option("--checker-model <model>", "Model for the requirement check: extracts the list, classifies each requirement per round, adjudicates disputes", "sonnet")
   .option("--no-attribution", "Skip the per-turn attribution pass")
   .option("--review", "Requirement-check-and-fix rounds per arm until every task requirement is met, or the cap", false)
-  .option("--max-review-rounds <n>", "Cap on review-and-fix rounds when --review is on", "3");
+  .option("--max-review-rounds <n>", "Cap on review-and-fix rounds when --review is on", "3")
+  .option("--repeat <n>", "Full comparisons to run for this task; the batch summary aggregates them", "2")
+  .option("--concurrency <n>", "Repeats to run at once", "2");
 
 program.parse();
 const opts = program.opts();
@@ -59,9 +61,11 @@ const config: Config = {
   judgeModel: opts.judgeModel,
   checkerModel: opts.checkerModel,
   reviewRounds: opts.review ? Math.max(1, parseInt(opts.maxReviewRounds, 10) || 3) : 0,
+  repeat: Math.max(1, parseInt(opts.repeat, 10) || 2),
+  concurrency: Math.max(1, parseInt(opts.concurrency, 10) || 2),
 };
 
-run(config).catch((err) => {
+runBatch(config).catch((err) => {
   console.error("Run failed:", err instanceof Error ? err.message : err);
   process.exit(1);
 });

@@ -163,17 +163,16 @@ ${step1}
 2. Score each agent 1 to 5 on each criterion below, rationale ≤ 15 words naming concrete evidence. Use the full range.
 ${CRITERIA.map(c => `   - ${c.key}: ${c.text}`).join("\n")}
 3. List at most 4 findings a reviewer would need, each ≤ 20 words, tied to one agent with evidence ≤ 15 words. Prefer claims the diff or verification record contradicts, and defects the change introduces within the requirements' scope.
-4. discoveries: for each agent, at most one decisive discovery, or "none". A discovery is decisive only if it changed the outcome, in one of two ways:
+4. discoveries: for each agent, at most one candidate decisive discovery, or "none". These do not enter your verdict; whether one counts is decided afterwards by a pass that can see where the fact came from. A discovery is a candidate only if it changed the outcome, in one of two ways:
    - "improved-outcome": the agent found a fact (a convention, a prior decision, an incident, a code path, a constraint) and because of it the delivered change is materially better in outcome than it would otherwise be, beyond what the requirements ask. The effect must be visible in the diff and named concretely ("prevents a duplicate reply on redelivery", not "more robust"). Finding a fact, citing it, or confirming a fix that would have been the same anyway does not qualify.
    - "invalidated-requirement": the agent produced strong contradictory evidence that a numbered requirement is wrong, unreachable under the task's trigger, or harmful to implement in this codebase. Set requirementIndex to that requirement's number. When either agent has one, treat that requirement as not applying to BOTH agents: grade it "met" for both in step 1 with the evidence "invalidated by Agent X: <fact>", and do not count implementing it as a defect unless the implementation itself broke something.
    Set requirementIndex to 0 when not applicable. fact ≤ 20 words, effect ≤ 20 words, evidence ≤ 15 words citing the diff, response or verification record.
 5. verdict: which agent's result is better, decided in this order and no other:
    (a) requirements, after any invalidation: the agent that meets more of them, or meets them more fully, wins;
    (b) if requirements are equal: an agent whose change introduces a defect in the required behaviour, or a regression in the code it touches, loses to one that does not;
-   (c) if still equal: an agent with a decisive discovery beats one with "none"; if both or neither have one, this step decides nothing;
-   (d) if still equal: hygiene, only when the difference is material (vendored bulk, generated junk, changes to unrelated files);
-   (e) otherwise "tie".
-   Things that never decide the verdict: hardening of cases the task did not name, extra experiments or checks beyond verifying the required behaviour, deployment or rollout notes, self-review passes, the length or polish of the write-up, the size of the diff by itself. The rationale, ≤ 2 sentences, must name the requirement, the introduced defect, or the decisive discovery that decided it, or say that nothing did.
+   (c) if still equal: hygiene, only when the difference is material (vendored bulk, generated junk, changes to unrelated files);
+   (d) otherwise "tie".
+   Things that never decide the verdict: candidate discoveries (they are weighed afterwards), hardening of cases the task did not name, extra experiments or checks beyond verifying the required behaviour, deployment or rollout notes, self-review passes, the length or polish of the write-up, the size of the diff by itself. A "tie" is the expected verdict when both agents meet every requirement without introducing a defect. The rationale, ≤ 2 sentences, must name the requirement or the introduced defect that decided it, or say that nothing did.
 
 Be even-handed. A larger diff is not better. More words are not better. More work is not better. A wrong answer stated confidently is worse than a right answer with caveats.
 
@@ -229,7 +228,7 @@ export async function assessQuality(result: ComparisonResult, model: string): Pr
     }),
     criteria: raw.criteria.map(c => ({ criterion: c.key, baseline: ub(pick(c, "baseline")), unblocked: ub(pick(c, "unblocked")) })),
     findings: raw.findings.map(f => ({ arm: cond(f.arm), finding: unblind(f.finding), evidence: unblind(f.evidence) })),
-    verdict: { better: raw.verdict.better === "tie" ? "tie" : cond(raw.verdict.better), rationale: unblind(raw.verdict.rationale) },
+    verdict: { better: raw.verdict.better === "tie" ? "tie" : cond(raw.verdict.better), blinded: raw.verdict.better === "tie" ? "tie" : cond(raw.verdict.better), rationale: unblind(raw.verdict.rationale) },
   };
   if (raw.discoveries) {
     const disc = (d: DecisiveDiscovery): DecisiveDiscovery => ({ kind: d.kind, fact: unblind(d.fact), effect: unblind(d.effect), evidence: unblind(d.evidence), ...(d.kind === "invalidated-requirement" && (d.requirementIndex ?? 0) > 0 ? { requirementIndex: (d.requirementIndex ?? 0) - 1 } : {}) });
@@ -237,4 +236,24 @@ export async function assessQuality(result: ComparisonResult, model: string): Pr
   }
   log(`Quality: verdict ${q.verdict.better}; judge ${formatCost(q.judgeCostUsd)} via ${res.modelUsed}`);
   return q;
+}
+
+// The tie-breaker, applied after the impact pass: a blinded tie goes to the
+// Unblocked arm only when its candidate discovery changed the outcome and the
+// impact pass found the context led to it. Anything else leaves the blinded
+// verdict as it is. Idempotent: re-applying recomputes from `blinded`.
+export function applyTieBreaker(result: ComparisonResult): void {
+  const q = result.quality;
+  if (!q) return;
+  const blinded = q.verdict.blinded ?? q.verdict.better;
+  const cand = q.discoveries?.unblocked;
+  const attr = result.impact?.discoveryAttribution;
+  q.verdict.blinded = blinded;
+  q.verdict.better = blinded;
+  if (blinded !== "tie") { q.verdict.tieBreaker = { applied: false, reason: "not a tie" }; return; }
+  if (!cand || cand.kind === "none") { q.verdict.tieBreaker = { applied: false, reason: "the Unblocked arm had no candidate discovery" }; return; }
+  if (!attr) { q.verdict.tieBreaker = { applied: false, reason: "no attribution from the impact pass" }; return; }
+  if (!attr.contextLed) { q.verdict.tieBreaker = { applied: false, reason: `candidate discovery was not led by the context: ${attr.evidence}` }; return; }
+  q.verdict.better = "unblocked";
+  q.verdict.tieBreaker = { applied: true, reason: `${cand.kind === "invalidated-requirement" ? "invalidated a requirement" : "improved the outcome"}, led by the context: ${cand.fact} (${attr.evidence})` };
 }

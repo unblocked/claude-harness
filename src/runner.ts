@@ -4,11 +4,11 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ArmResult, ComparisonResult, Condition, Config, DiffStats, ReviewPass, ReviewRound, ReviewSpec, RunResult, TokenUsage, UnblockedCall } from "./types.ts";
 import { runClaude, createWorktree, removeWorktree } from "./claude.ts";
-import { printReport, writeJsonResult, writeHtmlReport } from "./report.ts";
+import { printReport, writeJsonResult, writeHtmlReport, writeBatchSummary } from "./report.ts";
 import { estimateCost, formatCost, formatDiffSummary, formatDuration, log } from "./util.ts";
 import { git, isAncestor, snapshotRefs, tryGit } from "./git.ts";
 import { attribute } from "./attribution.ts";
-import { assessQuality } from "./quality.ts";
+import { applyTieBreaker, assessQuality } from "./quality.ts";
 import { assessImpact } from "./impact.ts";
 import { economics } from "./economics.ts";
 import { adjudicateDisputes, applyWaivers, disputedSection, extractRequirements, fixPrompt, reviewDraft } from "./review.ts";
@@ -230,17 +230,19 @@ function keepMachineAwake(): void {
   }
 }
 
-// Agent commits per arm, kept for branch cleanup after the diff is captured,
-// and the worktree name per arm from the moment it exists, so a run that
-// fails half way still removes what it created.
-const agentCommitsByArm = new Map<Condition, Set<string>>();
-const worktreeByArm = new Map<Condition, string>();
+// Per-run state, one object per comparison so repeats can run concurrently:
+// agent commits per arm (for branch cleanup after the diff is captured), the
+// worktree name per arm from the moment it exists (so a run that fails half
+// way still removes what it created), and the run's shared review standard
+// (see review.ts), set before the arms start and mutated by adjudications
+// from either arm.
+interface RunContext {
+  agentCommitsByArm: Map<Condition, Set<string>>;
+  worktreeByArm: Map<Condition, string>;
+  reviewSpec: ReviewSpec | null;
+}
 
-// The run's shared review standard (see review.ts); set once in run() before
-// the arms start, mutated by adjudications from either arm.
-let reviewSpec: ReviewSpec | null = null;
-
-async function runArm(config: Config, condition: Condition, outDir: string, refsBefore: Map<string, string> | null): Promise<ArmResult> {
+async function runArm(config: Config, condition: Condition, outDir: string, refsBefore: Map<string, string> | null, ctx: RunContext): Promise<ArmResult> {
   let nudge: string;
   if (condition === "baseline") {
     nudge = BASELINE_NUDGE;
@@ -256,7 +258,7 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
 
   log(`[${condition}] Creating worktree: ${wtName}`);
   const { path: wtPath, baseSha } = createWorktree(config.repo, wtName, config.branch);
-  worktreeByArm.set(condition, wtName);
+  ctx.worktreeByArm.set(condition, wtName);
   log(`[${condition}] Worktree at: ${wtPath} (base ${baseSha.slice(0, 7)})`);
 
   // --timeout budgets the arm: the draft and every fix pass share it.
@@ -283,8 +285,8 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
 
   if (config.reviewRounds > 0 && run.assistantTurns === 0) {
     log(`[${condition}] Review: skipped, the run produced no messages (exit ${run.exitCode})`);
-  } else if (config.reviewRounds > 0 && reviewSpec) {
-    const spec = reviewSpec;
+  } else if (config.reviewRounds > 0 && ctx.reviewSpec) {
+    const spec = ctx.reviewSpec;
     const draftCost = run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage);
     review = { maxRounds: config.reviewRounds, passes: [], draft: { diffStats, costUsd: draftCost, durationMs: run.durationMs, messages: run.assistantTurns }, finalMergeable: false };
     const draftPath = path.join(outDir, `${condition}.draft.jsonl`);
@@ -328,7 +330,7 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
       else review.checkFailed = last.round + 1;
     }
   }
-  agentCommitsByArm.set(condition, agent);
+  ctx.agentCommitsByArm.set(condition, agent);
 
   const unblockedCalls = extractUnblockedCalls(run.toolCalls);
   if (unblockedCalls.length > 0) {
@@ -375,11 +377,12 @@ function mergeRuns(a: RunResult, b: RunResult, jsonlPath: string, model: string)
   };
 }
 
-export async function run(config: Config): Promise<ComparisonResult> {
+export async function run(config: Config, outDirOverride?: string): Promise<ComparisonResult> {
   const startTime = Date.now();
+  const ctx: RunContext = { agentCommitsByArm: new Map(), worktreeByArm: new Map(), reviewSpec: null };
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const outDir = path.join(process.cwd(), "results", `run-${timestamp}`);
+  const outDir = outDirOverride ?? path.join(process.cwd(), "results", `run-${timestamp}`);
   const baselineDir = path.join(outDir, "baseline");
   const unblockedDir = path.join(outDir, "unblocked");
   fs.mkdirSync(baselineDir, { recursive: true });
@@ -393,23 +396,24 @@ export async function run(config: Config): Promise<ComparisonResult> {
   warnIfBehindUpstream(config.repo, config.branch);
   keepMachineAwake();
   if (config.reviewRounds > 0) {
-    reviewSpec = await extractRequirements(config.task, config.checkerModel);
-    if (!reviewSpec) throw new Error("Review: could not extract the task's requirements; not running the arms without a shared review standard");
+    ctx.reviewSpec = await extractRequirements(config.task, config.checkerModel);
+    if (!ctx.reviewSpec) throw new Error("Review: could not extract the task's requirements; not running the arms without a shared review standard");
   }
+  const reviewSpec = ctx.reviewSpec;
 
   let baseline: ArmResult;
   let unblocked: ArmResult;
 
   try {
     [baseline, unblocked] = await Promise.all([
-      runArm(config, "baseline", baselineDir, refsBefore),
-      runArm(config, "unblocked", unblockedDir, refsBefore),
+      runArm(config, "baseline", baselineDir, refsBefore, ctx),
+      runArm(config, "unblocked", unblockedDir, refsBefore, ctx),
     ]);
   } finally {
     if (!config.keepWorktrees) {
       log("Cleaning up worktrees...");
-      for (const [condition, name] of worktreeByArm) {
-        removeWorktree(config.repo, name, refsBefore, agentCommitsByArm.get(condition) ?? new Set());
+      for (const [condition, name] of ctx.worktreeByArm) {
+        removeWorktree(config.repo, name, refsBefore, ctx.agentCommitsByArm.get(condition) ?? new Set());
       }
     }
   }
@@ -445,6 +449,8 @@ export async function run(config: Config): Promise<ComparisonResult> {
     result.economics = economics(result);
     if (q) { const im = await assessImpact(result, config.judgeModel); if (im) result.impact = im; }
     else log("Impact: skipped, no quality verdict to assess against");
+    applyTieBreaker(result);
+    if (result.quality?.verdict.tieBreaker?.applied) log(`Verdict: blinded tie → Unblocked by the tie-breaker (${result.quality.verdict.tieBreaker.reason})`);
   } else if (config.analystModel) {
     result.economics = economics(result);
   }
@@ -461,10 +467,50 @@ export async function run(config: Config): Promise<ComparisonResult> {
   log(`Total time: ${formatDuration(result.totalDurationMs)}`);
   log(`Total cost: ${formatCost(result.totalEstimatedCost)}`);
 
+  if (!outDirOverride) {
+    try {
+      const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+      execSync(`${opener} "${htmlPath}"`);
+    } catch {}
+  }
+
+  return result;
+}
+
+// Repeats: the same comparison `config.repeat` times, up to `config.concurrency`
+// at once, each in its own directory under one batch directory, then a
+// summary across them. Repeats are independent: separate worktrees, spec,
+// transcripts and analysis. One failed repeat is logged and left out.
+export async function runBatch(config: Config): Promise<{ batchDir: string; results: ComparisonResult[] }> {
+  if (config.repeat <= 1) {
+    const r = await run(config);
+    return { batchDir: path.dirname(r.baseline.run.jsonlPath.replace(/\/baseline\/[^/]+$/, "")), results: [r] };
+  }
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const batchDir = path.join(process.cwd(), "results", `batch-${timestamp}`);
+  fs.mkdirSync(batchDir, { recursive: true });
+  log(`Batch: ${config.repeat} repeats, ${config.concurrency} at a time → ${batchDir}`);
+  const results: (ComparisonResult | null)[] = new Array(config.repeat).fill(null);
+  let next = 0;
+  const worker = async () => {
+    while (next < config.repeat) {
+      const i = next++;
+      const dir = path.join(batchDir, `run-${i + 1}`);
+      try {
+        results[i] = await run(config, dir);
+        log(`Batch: run ${i + 1}/${config.repeat} done`);
+      } catch (err) {
+        log(`Batch: run ${i + 1}/${config.repeat} failed: ${(err as Error).message}`);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(config.concurrency, config.repeat)) }, worker));
+  const done = results.filter((r): r is ComparisonResult => r !== null);
+  const htmlPath = writeBatchSummary(config, done, batchDir);
+  log(`Batch summary: ${htmlPath}`);
   try {
     const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
     execSync(`${opener} "${htmlPath}"`);
   } catch {}
-
-  return result;
+  return { batchDir, results: done };
 }

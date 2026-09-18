@@ -11,7 +11,7 @@ import { parseStreamJson } from "../src/claude.ts";
 import { printReport, writeHtmlReport, writeJsonResult } from "../src/report.ts";
 import { estimateCost } from "../src/util.ts";
 import { attribute, buildWalk, rollup } from "../src/attribution.ts";
-import { assessQuality } from "../src/quality.ts";
+import { applyTieBreaker, assessQuality } from "../src/quality.ts";
 import { assessImpact } from "../src/impact.ts";
 import { economics } from "../src/economics.ts";
 import { extractUnblockedCalls } from "../src/runner.ts";
@@ -171,6 +171,8 @@ else if (orig?.quality) result.quality = orig.quality;
 result.economics = economics(result);
 if (impactModel && !killed.length && result.quality) result.impact = (await assessImpact(result, impactModel)) ?? orig?.impact;
 else if (orig?.impact) result.impact = orig.impact;
+
+applyTieBreaker(result);
 
 const reviewCost = (a: ArmResult) => (a.review?.passes ?? []).reduce((s, p) => s + p.reviewCostUsd, 0);
 result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0) + reviewCost(baseline) + reviewCost(unblocked) + (result.reviewSpec?.costUsd ?? 0);

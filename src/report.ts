@@ -1025,16 +1025,20 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   ${result.quality ? `
   <div class="section">
     <div class="section-title">3 · Quality analysis <span class="section-sub">blinded judge: ${escapeHtml(result.quality.judgeModel)}</span></div>
-    <div class="section-note">Blinded judge: saw task, final responses, tests run, diffs and the checker's final record as A/B in random order. Grades the same requirement list as the checker. The verdict is decided by requirements met, then by defects the change introduces within that scope, then by a decisive discovery (a fact that materially improved the delivered outcome, or invalidated a requirement for both agents), then by material hygiene; other work beyond the task does not count.</div>
+    <div class="section-note">Blinded judge: saw task, final responses, tests run, diffs and the checker's final record as A/B in random order. Grades the same requirement list as the checker. Its verdict is decided by requirements met, then by defects the change introduces within that scope, then by material hygiene; other work beyond the task does not count. A blinded tie goes to Unblocked only when the Unblocked agent's candidate discovery materially improved the outcome or invalidated a requirement, and the un-blinded impact pass finds the research context led to it. Discoveries the agent made on its own, on either side, measure model variance and never break a tie.</div>
     <div class="verdict ${result.quality.verdict.better === "unblocked" ? "positive" : result.quality.verdict.better === "baseline" ? "negative" : ""}">
-      <div class="verdict-head">Verdict: ${result.quality.verdict.better === "tie" ? "tie" : result.quality.verdict.better === "unblocked" ? "With Unblocked" : "Baseline"}${result.impact ? ` <span class="verdict-conf">· driver: ${result.impact.impact.outcomeDriver === "context" ? "the Unblocked context" : result.impact.impact.outcomeDriver === "agent" ? "agent behaviour, not context" : "context and agent behaviour"}</span>` : ""}</div>
+      <div class="verdict-head">Verdict: ${result.quality.verdict.better === "tie" ? "tie" : result.quality.verdict.better === "unblocked" ? "With Unblocked" : "Baseline"}${result.quality.verdict.tieBreaker?.applied ? ` <span class="verdict-conf">· blinded verdict was a tie; decided by the context-led discovery tie-breaker</span>` : result.impact ? ` <span class="verdict-conf">· driver: ${result.impact.impact.outcomeDriver === "context" ? "the Unblocked context" : result.impact.impact.outcomeDriver === "agent" ? "agent behaviour, not context" : "context and agent behaviour"}</span>` : ""}</div>
       <div>${escapeHtml(result.quality.verdict.rationale)}</div>
+      ${result.quality.verdict.tieBreaker ? `<div class="evidence" style="margin-top: 6px;">Tie-breaker: ${result.quality.verdict.tieBreaker.applied ? "applied" : "not applied"} · ${escapeHtml(result.quality.verdict.tieBreaker.reason)}</div>` : ""}
     </div>
     ${result.quality.discoveries ? `<div class="findings" style="margin-bottom: 16px;">${(["baseline", "unblocked"] as const).map(a => {
       const d = result.quality!.discoveries![a];
       const label = a === "baseline" ? "Baseline" : "With Unblocked";
-      if (d.kind === "none") return `<div class="finding"><b>${label}</b> · decisive discovery: none</div>`;
-      return `<div class="finding"><b>${label}</b> · decisive discovery: <span class="met met-met">${d.kind === "improved-outcome" ? "improved the outcome" : `invalidated requirement ${(d.requirementIndex ?? 0) + 1} for both agents`}</span><div style="margin-top: 4px;">${escapeHtml(d.fact)} &rarr; ${escapeHtml(d.effect)}</div><div class="evidence">${escapeHtml(d.evidence)}</div></div>`;
+      if (d.kind === "none") return `<div class="finding"><b>${label}</b> · candidate discovery: none</div>`;
+      const attr = a === "unblocked" ? result.impact?.discoveryAttribution : undefined;
+      const tag = a === "baseline" ? `<span class="met met-partial">agent-found; baseline has no context, so it cannot break a tie</span>`
+        : attr ? (attr.contextLed ? `<span class="met met-met">led by the context</span>` : `<span class="met met-partial">not led by the context</span>`) : "";
+      return `<div class="finding"><b>${label}</b> · candidate discovery: ${d.kind === "improved-outcome" ? "improved the outcome" : `invalidated requirement ${(d.requirementIndex ?? 0) + 1} for both agents`} ${tag}<div style="margin-top: 4px;">${escapeHtml(d.fact)} &rarr; ${escapeHtml(d.effect)}</div><div class="evidence">${escapeHtml(d.evidence)}${attr && a === "unblocked" ? ` · attribution: ${escapeHtml(attr.evidence)}` : ""}</div></div>`;
     }).join("")}</div>` : ""}
     <div class="tool-table-wrap" style="margin-bottom: 16px;">
       <table class="tool-table">
@@ -1199,4 +1203,51 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   const htmlPath = path.join(outDir, "report.html");
   fs.writeFileSync(htmlPath, html);
   return htmlPath;
+}
+
+// Summary across the repeats of one task: verdict counts, per-arm medians of
+// core cost and time, and a row per run linking to its report.
+export function writeBatchSummary(config: { task: string; repo: string; branch: string; model: string; repeat: number }, results: ComparisonResult[], batchDir: string): string {
+  const median = (xs: number[]) => { if (!xs.length) return 0; const a = [...xs].sort((x, y) => x - y); return a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2; };
+  const core = (r: ComparisonResult, arm: "baseline" | "unblocked") => r[arm].attribution?.core ?? { costUsd: r[arm].estimatedCost, durationMs: r[arm].run.durationMs, turns: r[arm].run.assistantTurns };
+  const counts = { unblocked: 0, baseline: 0, tie: 0, none: 0 };
+  for (const r of results) { const v = r.quality?.verdict.better; if (v === "unblocked" || v === "baseline" || v === "tie") counts[v]++; else counts.none++; }
+  const med = (arm: "baseline" | "unblocked", f: (c: ReturnType<typeof core>) => number) => median(results.map(r => f(core(r, arm))));
+  const pct = (b: number, u: number) => b > 0 ? `${u >= b ? "+" : ""}${Math.round((u / b - 1) * 100)}%` : "n/a";
+  const rows = results.map((r, i) => {
+    const b = core(r, "baseline"), u = core(r, "unblocked");
+    const dir = path.join(batchDir, `run-${i + 1}`);
+    const v = r.quality?.verdict;
+    return `<tr><td><a href="run-${i + 1}/report.html">run ${i + 1}</a></td><td>${v ? (v.better === "unblocked" ? "With Unblocked" : v.better === "baseline" ? "Baseline" : "tie") : "–"}${v?.tieBreaker?.applied ? " <span class=\"met met-met\">tie-breaker</span>" : ""}</td><td>${r.impact ? escapeHtml(r.impact.impact.outcomeDriver) : "–"}</td><td>${formatCost(b.costUsd)} → ${formatCost(u.costUsd)} (${pct(b.costUsd, u.costUsd)})</td><td>${formatDuration(b.durationMs)} → ${formatDuration(u.durationMs)} (${pct(b.durationMs, u.durationMs)})</td><td>${b.turns} → ${u.turns}</td><td style="font-size: 12px;">${escapeHtml(v?.rationale ?? "")}</td></tr>`;
+  });
+  const bC = med("baseline", c => c.costUsd), uC = med("unblocked", c => c.costUsd), bT = med("baseline", c => c.durationMs), uT = med("unblocked", c => c.durationMs);
+  const html = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Claude Harness — Batch Summary</title>
+<style>
+  :root { --bg: #0a0a0f; --surface: #12121a; --border: #2a2a3a; --text: #e4e4ed; --text-muted: #8888a0; --accent: #3b82f6; --green: #22c55e; --red: #ef4444; --yellow: #eab308; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 32px 16px; }
+  .container { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 24px; margin-bottom: 4px; } .sub { color: var(--text-muted); margin-bottom: 24px; font-size: 14px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 28px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .card .k { color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 1px; } .card .v { font-size: 26px; font-weight: 700; } .card .d { color: var(--text-muted); font-size: 13px; }
+  .pos { color: var(--green); } .neg { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: top; } th { color: var(--text-muted); font-weight: 600; }
+  a { color: #93c5fd; } .met { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; } .met-met { background: rgba(34,197,94,0.15); color: var(--green); }
+  .note { color: var(--text-muted); font-size: 13px; margin-top: 16px; }
+</style></head><body><div class="container">
+  <h1>Batch summary · ${results.length} of ${config.repeat} repeat(s)</h1>
+  <div class="sub">${escapeHtml(repoName(config.repo))} @ ${escapeHtml(config.branch)} · ${escapeHtml(config.model)} · ${escapeHtml(config.task.slice(0, 160))}${config.task.length > 160 ? "…" : ""}</div>
+  <div class="grid">
+    <div class="card"><div class="k">Verdicts</div><div class="v">${counts.unblocked}–${counts.tie}–${counts.baseline}</div><div class="d">Unblocked – tie – baseline${counts.none ? ` · ${counts.none} without a verdict` : ""}</div></div>
+    <div class="card"><div class="k">Median core cost</div><div class="v ${uC <= bC ? "pos" : "neg"}">${pct(bC, uC)}</div><div class="d">${formatCost(bC)} → ${formatCost(uC)}</div></div>
+    <div class="card"><div class="k">Median core time</div><div class="v ${uT <= bT ? "pos" : "neg"}">${pct(bT, uT)}</div><div class="d">${formatDuration(bT)} → ${formatDuration(uT)}</div></div>
+  </div>
+  <table><thead><tr><th>Run</th><th>Verdict</th><th>Driver</th><th>Core cost (B → U)</th><th>Core time (B → U)</th><th>Messages</th><th>Rationale</th></tr></thead><tbody>${rows.join("")}</tbody></table>
+  <div class="note">Each run is an independent comparison (fresh worktrees, its own requirement check, judge and impact pass). Medians are over core work with housekeeping removed. Verdicts follow the same rubric as the per-run reports.</div>
+</div></body></html>`;
+  const out = path.join(batchDir, "summary.html");
+  fs.writeFileSync(out, html);
+  fs.writeFileSync(path.join(batchDir, "summary.json"), JSON.stringify({ config, verdicts: counts, medians: { baseline: { costUsd: bC, durationMs: bT }, unblocked: { costUsd: uC, durationMs: uT } }, runs: results.map((r, i) => ({ dir: `run-${i + 1}`, verdict: r.quality?.verdict, driver: r.impact?.impact.outcomeDriver, baseline: core(r, "baseline"), unblocked: core(r, "unblocked") })) }, null, 2));
+  return out;
 }

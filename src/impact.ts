@@ -98,8 +98,11 @@ const SCHEMA = {
     economics: { type: "object", properties: {
       cost: { type: "string" }, time: { type: "string" }, tokens: { type: "string" },
     }, required: ["cost", "time", "tokens"] },
+    discoveryAttribution: { type: "object", properties: {
+      contextLed: { type: "boolean" }, evidence: { type: "string" },
+    }, required: ["contextLed", "evidence"] },
   },
-  required: ["research", "impact", "loss", "economics"],
+  required: ["research", "impact", "loss", "economics", "discoveryAttribution"],
 };
 
 function prompt(result: ComparisonResult): string {
@@ -125,6 +128,7 @@ Answer with evidence from the material below. Keep every string short; this goes
    - whatWouldChange: 1 sentence — the single change to the context returned, or to how the agent used it, that would most have changed the result.
 3. loss: only meaningful when outcome is "worse" (otherwise fill n/a and empty strings). Name what the BASELINE found that the UNBLOCKED agent never had, if anything. Say whether the baseline found it by a systematic search a careful engineer would do (e.g. a code search on the org's GitHub for the exact pattern) or by chance. Then pick the UNBLOCKED failure mode: the context misled it (returned something wrong, or a confident "nothing found" the agent repeated); the context made it stop searching early (it had a lead in hand, or an obvious next step, and treated the research as the answer); the context did not include it and the agent never looked elsewhere; or the loss is unrelated to context. explanation ≤ 2 sentences.
 4. economics: three explanations, ≤ 2 sentences each, of why the arms differ in cost, time and tokens. Name only the one or two terms that moved each delta, with their size from the ECONOMICS BREAKDOWN, and what in the transcripts caused them. Say what the cost bought when it bought something. Same standard for both arms.
+5. discoveryAttribution: the blinded judge recorded the UNBLOCKED agent's candidate decisive discovery (below, or "none"). Decide whether the research context led to it: contextLed is true only when a research call's returned items contained the fact, or pointed at the file, thread or PR that contained it, and the agent acted on it after that call (cite the turn and the item). If the agent found the fact by its own reading, grep, git history or reasoning, or there is no candidate, contextLed is false. evidence ≤ 25 words. This decides a tie-breaker, so be strict: a research result that merely mentioned the area is not leading the agent to the fact.
 
 "The agent ran more tests" is agent behaviour, not context. "The agent chose sdlc because a research item showed the org roster" is context. "The agent said no prior art existed because research surfaced none, while the baseline found it with a code search" is context that hurt.
 
@@ -136,6 +140,7 @@ ${result.economics ? describeEconomics(result.economics) : "(not available)"}
 
 =================== QUALITY JUDGE (blinded) ===================
 ${verdict}
+UNBLOCKED agent's candidate decisive discovery: ${q?.discoveries?.unblocked && q.discoveries.unblocked.kind !== "none" ? `${q.discoveries.unblocked.kind}: ${q.discoveries.unblocked.fact} → ${q.discoveries.unblocked.effect} (${q.discoveries.unblocked.evidence})` : "none"}
 
 =================== UNBLOCKED AGENT: RESEARCH CALLS AND WHAT CAME BACK ===================
 ${researchBlock || "(the agent made no research calls)"}
