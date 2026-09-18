@@ -114,6 +114,7 @@ export interface Attribution {
 export type Met = "met" | "partial" | "unmet";
 
 export interface QualityRequirement {
+  index?: number;        // position in ReviewSpec.requirements when the judge graded the shared list
   requirement: string;
   baseline: { status: Met; evidence: string };
   unblocked: { status: Met; evidence: string };

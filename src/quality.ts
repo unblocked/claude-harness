@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import type { ArmResult, ComparisonResult, Condition, QualityAssessment } from "./types.ts";
+import type { ArmResult, ComparisonResult, Condition, QualityAssessment, ReviewSpec } from "./types.ts";
 import { formatCost, log } from "./util.ts";
 import { runStructured, VERIFY_CMD } from "./analyst.ts";
 
@@ -71,11 +71,12 @@ const SCHEMA = {
       items: {
         type: "object",
         properties: {
+          index: { type: "integer" },
           requirement: { type: "string" },
           A: { type: "object", properties: { status: { type: "string", enum: ["met", "partial", "unmet"] }, evidence: { type: "string" } }, required: ["status", "evidence"] },
           B: { type: "object", properties: { status: { type: "string", enum: ["met", "partial", "unmet"] }, evidence: { type: "string" } }, required: ["status", "evidence"] },
         },
-        required: ["requirement", "A", "B"],
+        required: ["index", "requirement", "A", "B"],
       },
     },
     criteria: {
@@ -103,11 +104,19 @@ const SCHEMA = {
   required: ["requirements", "criteria", "findings", "verdict"],
 };
 
-function judgePrompt(task: string, first: ArmResult, second: ArmResult): string {
+function judgePrompt(task: string, first: ArmResult, second: ArmResult, spec: ReviewSpec | undefined): string {
+  // With a shared review standard the judge grades the same numbered list the
+  // reviewers used, so the two tables are comparable line by line. A waived
+  // requirement is not graded.
+  const waived = new Set((spec?.adjudications ?? []).filter(a => a.waived).map(a => a.index));
+  const step1 = spec
+    ? `1. The task's requirements are fixed and numbered below. Grade each agent on each one, by its number, met / partial / unmet, with evidence ≤ 12 words drawn from its response or diff. Copy the requirement text as given; do not add, merge or reword requirements. Skip the ones marked waived.
+${spec.requirements.map((r, i) => `   ${i + 1}. ${r}${waived.has(i) ? "   [waived — do not grade]" : ""}`).join("\n")}`
+    : `1. Extract the task's explicit requirements, one per distinct thing it asks for, each ≤ 10 words, numbered from 1. For each, grade each agent met / partial / unmet with evidence ≤ 12 words drawn from its response or diff.`;
   return `Two autonomous coding agents, A and B, were given the same task in identical copies of the same repository. You are judging the quality of what each produced. You will see the task, then for each agent its final written response, the verification commands it ran with the end of their output, and its diff. Judge only from this material. Do not guess at anything you cannot see.
 
 Do the following. Every string you write goes on a one-page report, so keep them short.
-1. Extract the task's explicit requirements, one per distinct thing it asks for, each ≤ 10 words. For each, grade each agent met / partial / unmet with evidence ≤ 12 words drawn from its response or diff.
+${step1}
 2. Score each agent 1 to 5 on each criterion below, rationale ≤ 15 words naming concrete evidence. Use the full range.
 ${CRITERIA.map(c => `   - ${c.key}: ${c.text}`).join("\n")}
 3. List at most 4 findings a reviewer would need, each ≤ 20 words, tied to one agent with evidence ≤ 15 words. Prefer claims the diff or verification record contradicts, and things one agent found that the other missed.
@@ -125,7 +134,7 @@ ${armBlock("B", second)}`;
 }
 
 type Raw = {
-  requirements: { requirement: string; A: { status: "met" | "partial" | "unmet"; evidence: string }; B: { status: "met" | "partial" | "unmet"; evidence: string } }[];
+  requirements: { index: number; requirement: string; A: { status: "met" | "partial" | "unmet"; evidence: string }; B: { status: "met" | "partial" | "unmet"; evidence: string } }[];
   criteria: { key: string; A: { score: number; rationale: string }; B: { score: number; rationale: string } }[];
   findings: { arm: "A" | "B"; finding: string; evidence: string }[];
   verdict: { better: "A" | "B" | "tie"; rationale: string };
@@ -143,7 +152,7 @@ export function assessQuality(result: ComparisonResult, model: string): QualityA
   const second = aIsBaseline ? result.unblocked : result.baseline;
   const cond = (l: "A" | "B"): Condition => (l === "A") === aIsBaseline ? "baseline" : "unblocked";
 
-  const prompt = judgePrompt(result.task, first, second);
+  const prompt = judgePrompt(result.task, first, second, result.reviewSpec);
   log(`Quality: judging with ${model} (${Math.round(prompt.length / 1000)}k chars, arm A = ${aIsBaseline ? "baseline" : "unblocked"})…`);
   // Unredacted: the judge must see digests, env var names and auth headers as written.
   const res = runStructured<Raw>("Quality", prompt, model, SCHEMA, 15 * 60 * 1000, false);
@@ -158,7 +167,11 @@ export function assessQuality(result: ComparisonResult, model: string): QualityA
   const q: QualityAssessment = {
     judgeModel: res.modelUsed,
     judgeCostUsd: res.costUsd,
-    requirements: raw.requirements.map(r => ({ requirement: unblind(r.requirement), baseline: ub(pick(r, "baseline")), unblocked: ub(pick(r, "unblocked")) })),
+    requirements: raw.requirements.map(r => {
+      const i = r.index - 1;
+      const shared = result.reviewSpec && i >= 0 && i < result.reviewSpec.requirements.length;
+      return { ...(shared ? { index: i } : {}), requirement: shared ? result.reviewSpec!.requirements[i] : unblind(r.requirement), baseline: ub(pick(r, "baseline")), unblocked: ub(pick(r, "unblocked")) };
+    }),
     criteria: raw.criteria.map(c => ({ criterion: c.key, baseline: ub(pick(c, "baseline")), unblocked: ub(pick(c, "unblocked")) })),
     findings: raw.findings.map(f => ({ arm: cond(f.arm), finding: unblind(f.finding), evidence: unblind(f.evidence) })),
     verdict: { better: raw.verdict.better === "tie" ? "tie" : cond(raw.verdict.better), rationale: unblind(raw.verdict.rationale) },

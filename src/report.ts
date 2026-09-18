@@ -102,11 +102,13 @@ function sharedRequirementsTable(result: ComparisonResult): string {
   const cell = (arm: ArmResult, i: number) => {
     const r = last(arm)?.requirements.find(x => x.index === i);
     if (!r) return "<td>–</td>";
-    return `<td><span class="met ${r.status === "met" ? "met-met" : r.status === "waived" ? "met-partial" : "met-unmet"}">${r.status}</span><div class="evidence">${escapeHtml(r.note)}</div></td>`;
+    const j = result.quality?.requirements.find(x => x.index === i)?.[arm.condition];
+    const disagree = j && r.status !== "waived" && ((r.status === "met") !== (j.status === "met"));
+    return `<td><span class="met ${r.status === "met" ? "met-met" : r.status === "waived" ? "met-partial" : "met-unmet"}">${r.status}</span><div class="evidence">${escapeHtml(r.note)}</div>${j ? `<div class="evidence" style="margin-top:4px;">judge: <span class="met met-${j.status}">${j.status}</span>${disagree ? ' <span class="met met-partial">disagrees with reviewer</span>' : ""} ${escapeHtml(j.evidence)}</div>` : ""}</td>`;
   };
   const adj = spec.adjudications.map(a => `<li>Requirement ${a.index + 1}, disputed by ${a.disputedBy === "unblocked" ? "the Unblocked arm" : "the baseline arm"} in round ${a.round}: <b>${a.waived ? "waived for both arms" : "dispute rejected"}</b>. ${escapeHtml(a.reason)}</li>`).join("");
   return `<div class="tool-table-wrap"><table class="tool-table">
-      <thead><tr><th>Requirement (same list for both arms)</th><th>Baseline</th><th>With Unblocked</th></tr></thead>
+      <thead><tr><th>Requirement (same list for both arms)</th><th>Baseline: reviewer${result.quality ? " · judge" : ""}</th><th>With Unblocked: reviewer${result.quality ? " · judge" : ""}</th></tr></thead>
       <tbody>${spec.requirements.map((req, i) => `<tr><td>${i + 1}. ${escapeHtml(req)}</td>${cell(result.baseline, i)}${cell(result.unblocked, i)}</tr>`).join("")}</tbody>
     </table></div>${adj ? `<ul class="section-note" style="margin: 8px 0 0 18px;">${adj}</ul>` : ""}`;
 }
