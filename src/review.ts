@@ -20,8 +20,15 @@ import { runStructured } from "./analyst.ts";
 
 const DIFF_BUDGET = 60_000;
 
+// Hide the treatment, not the repository. Only the tool's own names go:
+// "Unblocked MCP/context/research/CLI", the MCP tool names. A bare
+// "unblocked" stays, because the repository under test is called that and
+// its paths, packages and files carry the word.
 function neutralise(s: string): string {
-  return s.replace(/unblocked/gi, "the research tool").replace(/context_research|context_get_urls|context_search_\w+/g, "research_tool");
+  return s
+    .replace(/\bUnblocked (MCP|context|research|tool|search|CLI|skill)s?\b/gi, "the research tool")
+    .replace(/mcp__unblocked__\w+/g, "research_tool")
+    .replace(/\bcontext_(research|get_urls|get_rules|search_\w+)\b/g, "research_tool");
 }
 
 // ---- Requirements, once per run --------------------------------------------
@@ -71,7 +78,7 @@ function prompt(task: string, arm: ArmResult, round: number, previous: ReviewPas
   const prior = previous ? `
 This is round ${round}. In round ${previous.round} you marked: ${previous.requirements.map((r, i) => `${i + 1} ${r.status}${r.status === "met" || r.status === "waived" ? "" : ` (${r.note})`}`).join("; ")}. Judge the current state, not the history.${disputed ? `
 The engineer disputes part of that: """${neutralise(disputed)}""". Where they say a requirement is already satisfied, re-check it against the diff and description and grade what you find. Where they say a requirement should not apply, that is decided elsewhere; grade it as you find it.` : ""}` : "";
-  return `You are checking whether a pull request meets the requirements of the task it was written for. You have the task, the engineer's PR description (their final summary) and the diff.
+  return `You are checking whether an engineer's change meets the requirements of the task it was written for. You have the task, the engineer's summary of the change, and the diff of their working tree against the base branch. Nothing has been committed, pushed or branched: the diff is uncommitted work, and its existence says nothing about commits or branches.
 
 Your only job is classification. For each numbered requirement below, mark it:
 - met: the diff delivers it for every case the task covers;
@@ -88,7 +95,7 @@ summary: ≤ 2 sentences, which requirements are not met and why.
 =================== TASK ===================
 ${task}
 
-=================== PR DESCRIPTION (the engineer's final summary) ===================
+=================== THE ENGINEER'S SUMMARY ===================
 ${neutralise(arm.run.finalResponse)}
 
 =================== DIFF (${arm.diffStats.filesChanged} files, +${arm.diffStats.linesAdded} -${arm.diffStats.linesRemoved}) ===================

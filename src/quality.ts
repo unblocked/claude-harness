@@ -21,8 +21,15 @@ export const CRITERIA = [
   { key: "hygiene", text: "Change hygiene: is the diff proportionate, free of vendored bulk or generated junk, and would a reviewer accept it without asking for cleanup." },
 ];
 
+// Hide the treatment, not the repository. Only the tool's own names go:
+// "Unblocked MCP/context/research/CLI", the MCP tool names. A bare
+// "unblocked" stays, because the repository under test is called that and
+// its paths, packages and files carry the word.
 function neutralise(s: string): string {
-  return s.replace(/unblocked/gi, "the research tool").replace(/context_research|context_get_urls|context_search_\w+/g, "research_tool");
+  return s
+    .replace(/\bUnblocked (MCP|context|research|tool|search|CLI|skill)s?\b/gi, "the research tool")
+    .replace(/mcp__unblocked__\w+/g, "research_tool")
+    .replace(/\bcontext_(research|get_urls|get_rules|search_\w+)\b/g, "research_tool");
 }
 
 function verificationRecord(arm: ArmResult, jsonl: string): string {
