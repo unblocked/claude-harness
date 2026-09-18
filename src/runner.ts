@@ -285,7 +285,7 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
     for (let round = 1; round <= config.reviewRounds; round++) {
       const armNow: ArmResult = { condition, run, diff, diffStats, unblockedCalls: [], estimatedCost: run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage) };
       const prev = review.passes[review.passes.length - 1] ?? null;
-      const r = reviewDraft(config.task, armNow, config.judgeModel, round, prev, spec);
+      const r = reviewDraft(config.task, armNow, config.judgeModel, round, prev, spec, disputed);
       if (!r) break;
       const pass: ReviewPass = { round, reviewModel: r.model, reviewCostUsd: r.costUsd, mergeable: r.mergeable, summary: r.summary, requirements: r.requirements, before: diffStats, fix: null };
       review.passes.push(pass);
@@ -309,7 +309,7 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
     if (!review.finalMergeable && review.passes.length === config.reviewRounds && review.passes[review.passes.length - 1].fix) {
       // Rounds exhausted after a fix: one more review to record the final state, no fix.
       const armNow: ArmResult = { condition, run, diff, diffStats, unblockedCalls: [], estimatedCost: run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage) };
-      const r = reviewDraft(config.task, armNow, config.judgeModel, config.reviewRounds + 1, review.passes[review.passes.length - 1], spec);
+      const r = reviewDraft(config.task, armNow, config.judgeModel, config.reviewRounds + 1, review.passes[review.passes.length - 1], spec, disputed);
       if (r) { review.passes.push({ round: config.reviewRounds + 1, reviewModel: r.model, reviewCostUsd: r.costUsd, mergeable: r.mergeable, summary: r.summary, requirements: r.requirements, before: diffStats, fix: null }); review.finalMergeable = r.mergeable; }
     }
   }

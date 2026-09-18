@@ -63,20 +63,21 @@ const SCHEMA = {
   required: ["requirements", "summary"],
 };
 
-function prompt(task: string, arm: ArmResult, round: number, previous: ReviewPass | null, spec: ReviewSpec): string {
+function prompt(task: string, arm: ArmResult, round: number, previous: ReviewPass | null, spec: ReviewSpec, disputed: string): string {
   const diff = arm.diff.length > DIFF_BUDGET ? arm.diff.slice(0, DIFF_BUDGET) + "\n… (diff truncated)" : arm.diff;
   const waived = waivedIndices(spec);
   const list = spec.requirements.map((r, i) => `${i + 1}. ${r}${waived.has(i) ? "   [WAIVED — do not check; report it as met]" : ""}`).join("\n");
   const waiverNotes = spec.adjudications.map(a => `- Requirement ${a.index + 1}: ${a.waived ? "waived" : "dispute rejected, still required"} — ${a.reason}`).join("\n");
   const prior = previous ? `
-This is round ${round}. In round ${previous.round} you marked: ${previous.requirements.map((r, i) => `${i + 1} ${r.status}${r.status === "met" || r.status === "waived" ? "" : ` (${r.note})`}`).join("; ")}. Judge the current state, not the history.` : "";
+This is round ${round}. In round ${previous.round} you marked: ${previous.requirements.map((r, i) => `${i + 1} ${r.status}${r.status === "met" || r.status === "waived" ? "" : ` (${r.note})`}`).join("; ")}. Judge the current state, not the history.${disputed ? `
+The engineer disputes part of that: """${neutralise(disputed)}""". Where they say a requirement is already satisfied, re-check it against the diff and description and grade what you find. Where they say a requirement should not apply, that is decided elsewhere; grade it as you find it.` : ""}` : "";
   return `You are checking whether a pull request meets the requirements of the task it was written for. You have the task, the engineer's PR description (their final summary) and the diff.
 
 Your only job is classification. For each numbered requirement below, mark it:
 - met: the diff delivers it for every case the task covers;
 - partial: the diff delivers it for some cases the task covers, not all;
 - unmet: the diff does not deliver it.
-With a note ≤ 25 words. For met, cite where in the diff. For partial or unmet, say exactly which case or part is missing, citing the diff or the description. Judge from the diff; a claim in the description that the diff does not show is not evidence.
+With a note ≤ 25 words. For met, cite where in the diff. For partial or unmet, say exactly which case or part is missing, citing the diff or the description. Judge from the diff; a claim in the description that the diff does not show is not evidence. The exception is a requirement about process that a diff cannot show (not committing, not branching, how something was run): accept the description unless the diff contradicts it.
 
 Do not add requirements, do not comment on code quality, style, tests, naming, logging or robustness beyond what a requirement states, and do not suggest changes or extra work. If the description argues that a requirement should not apply, do not waive it: mark it as you find it and quote the argument in the note; disputes are decided elsewhere.
 ${prior}
@@ -111,9 +112,9 @@ function alignRequirements(spec: ReviewSpec, answers: { index: number; status: "
 export const isMergeable = (requirements: ReviewRequirement[]) =>
   requirements.every(x => x.status === "met" || x.status === "waived");
 
-export function reviewDraft(task: string, arm: ArmResult, model: string, round: number, previous: ReviewPass | null, spec: ReviewSpec): ReviewOutput | null {
-  log(`[${arm.condition}] Review round ${round}: reviewing with ${model}…`);
-  const res = runStructured<{ requirements: { index: number; status: "met" | "partial" | "unmet"; note: string }[]; summary: string }>(`Review:${arm.condition}:${round}`, prompt(task, arm, round, previous, spec), model, SCHEMA, 15 * 60 * 1000, false);
+export function reviewDraft(task: string, arm: ArmResult, model: string, round: number, previous: ReviewPass | null, spec: ReviewSpec, disputed = ""): ReviewOutput | null {
+  log(`[${arm.condition}] Review round ${round}: checking requirements with ${model}…`);
+  const res = runStructured<{ requirements: { index: number; status: "met" | "partial" | "unmet"; note: string }[]; summary: string }>(`Review:${arm.condition}:${round}`, prompt(task, arm, round, previous, spec, disputed), model, SCHEMA, 15 * 60 * 1000, false);
   if (!res) return null;
   const requirements = alignRequirements(spec, res.data.requirements);
   const mergeable = isMergeable(requirements);
@@ -139,7 +140,7 @@ export function adjudicateDisputes(task: string, spec: ReviewSpec, disputed: str
   const open = spec.requirements.map((_, i) => i).filter(i => !spec.adjudications.some(a => a.index === i));
   if (!open.length || !disputed.trim()) return 0;
   log(`[${by}] Review round ${round}: the agent disputed part of the review; adjudicating with ${model}…`);
-  const p = `A task was given to an engineer, whose pull request is being reviewed against the numbered requirements below. In their latest revision the engineer disputes part of the review. Decide, for each requirement their dispute addresses, whether to waive it. Waive only when the dispute shows the requirement is wrong for this codebase, is already satisfied in a way a reviewer reading the diff would miss, or would do harm if implemented. "It is out of scope", "the wording does not fit" or "it can be a follow-up" are not grounds when the task states the requirement. Return one decision per requirement the dispute addresses (by number); leave the others out. reason ≤ 25 words. Your decision will bind every reviewer of this task from now on.
+  const p = `A task was given to an engineer, whose pull request is being reviewed against the numbered requirements below. In their latest revision the engineer disputes part of the review. Decide, for each requirement their dispute addresses, whether to waive it. A waiver means the requirement does not apply to this task at all, for anyone. Waive only when the dispute shows the requirement is wrong for this codebase, contradicts another requirement, or would do harm if implemented. Do not waive because the engineer says it is already satisfied: you cannot see the diff, and the next check will re-verify that. "It is out of scope", "the wording does not fit" or "it can be a follow-up" are not grounds when the task states the requirement. Return one decision per requirement the dispute addresses (by number); leave the others out. reason ≤ 25 words. Your decision will bind every check of this task from now on.
 
 =================== TASK ===================
 ${task}
