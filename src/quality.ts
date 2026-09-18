@@ -23,22 +23,43 @@ export const CRITERIA = [
 
 
 function verificationRecord(arm: ArmResult, jsonl: string): string {
-  // Test/CI commands and the tail of their output, straight from the transcript.
+  // Test/CI commands and the tail of their output, straight from the
+  // transcript. An agent may run a build in the background with its output
+  // redirected to a log and read the result later with grep/tail/cat; the
+  // record follows those reads, and the CLI's completion notification for a
+  // background command, so a background build is not mistaken for no
+  // verification.
   const events = jsonl.split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-  const pending = new Map<string, string>();
+  const pending = new Map<string, string>();       // tool_use id -> command
+  const verifyIds = new Set<string>();             // tool_use ids of verify commands (for background notifications)
+  const logs = new Set<string>();                  // files verify output was redirected to
   const lines: string[] = [];
+  const tail = (t: string) => t.replace(/\s+/g, " ").trim().slice(-400);
   for (const e of events) {
     if (e.type === "assistant") {
       for (const b of e.message?.content ?? []) {
-        if (b.type === "tool_use" && b.name === "Bash" && VERIFY_CMD.test(String(b.input?.command ?? ""))) pending.set(b.id, String(b.input.command).replace(/\s+/g, " ").slice(0, 160));
+        if (b.type !== "tool_use" || b.name !== "Bash") continue;
+        const cmd = String(b.input?.command ?? "");
+        const readsLog = [...logs].some(l => cmd.includes(l));
+        if (VERIFY_CMD.test(cmd) || readsLog) {
+          pending.set(b.id, cmd.replace(/\s+/g, " ").slice(0, 160));
+          if (VERIFY_CMD.test(cmd)) {
+            verifyIds.add(b.id);
+            for (const m of cmd.matchAll(/>{1,2}\s*(\/[^\s;&|)]+\.(?:log|txt|out))/g)) logs.add(m[1]);
+          }
+        }
       }
     } else if (e.type === "user" && Array.isArray(e.message?.content)) {
       for (const b of e.message.content) {
         if (b.type !== "tool_result" || !pending.has(b.tool_use_id)) continue;
         const body = Array.isArray(b.content) ? b.content.map((c: { text?: string }) => c.text ?? "").join(" ") : String(b.content ?? "");
-        lines.push(`$ ${pending.get(b.tool_use_id)}\n  -> ${body.replace(/\s+/g, " ").trim().slice(-400)}`);
+        lines.push(`$ ${pending.get(b.tool_use_id)}\n  -> ${tail(body)}`);
         pending.delete(b.tool_use_id);
       }
+    } else if (e.type === "system" && e.subtype === "task_notification" && verifyIds.has(String(e.tool_use_id))) {
+      let extra = "";
+      try { if (e.output_file && fs.existsSync(e.output_file)) extra = ` | output tail: ${tail(fs.readFileSync(e.output_file, "utf8"))}`; } catch {}
+      lines.push(`[background command finished] ${String(e.summary ?? "").replace(/\s+/g, " ")}${e.status ? ` (${e.status})` : ""}${extra}`);
     }
   }
   return lines.length ? lines.join("\n") : "(no test, lint, build or CI commands were run)";
