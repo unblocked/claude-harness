@@ -287,7 +287,7 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
       const prev = review.passes[review.passes.length - 1] ?? null;
       const r = reviewDraft(config.task, armNow, config.judgeModel, round, prev, spec);
       if (!r) break;
-      const pass: ReviewPass = { round, reviewModel: r.model, reviewCostUsd: r.costUsd, mergeable: r.mergeable, summary: r.summary, requirements: r.requirements, comments: r.comments, before: diffStats, fix: null };
+      const pass: ReviewPass = { round, reviewModel: r.model, reviewCostUsd: r.costUsd, mergeable: r.mergeable, summary: r.summary, requirements: r.requirements, before: diffStats, fix: null };
       review.passes.push(pass);
       if (r.mergeable) { review.finalMergeable = true; log(`[${condition}] Review round ${round}: mergeable, stopping`); break; }
       if (!run.sessionId) { log(`[${condition}] Review: no session id to resume; stopping`); break; }
@@ -310,7 +310,7 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
       // Rounds exhausted after a fix: one more review to record the final state, no fix.
       const armNow: ArmResult = { condition, run, diff, diffStats, unblockedCalls: [], estimatedCost: run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage) };
       const r = reviewDraft(config.task, armNow, config.judgeModel, config.reviewRounds + 1, review.passes[review.passes.length - 1], spec);
-      if (r) { review.passes.push({ round: config.reviewRounds + 1, reviewModel: r.model, reviewCostUsd: r.costUsd, mergeable: r.mergeable, summary: r.summary, requirements: r.requirements, comments: r.comments, before: diffStats, fix: null }); review.finalMergeable = r.mergeable; }
+      if (r) { review.passes.push({ round: config.reviewRounds + 1, reviewModel: r.model, reviewCostUsd: r.costUsd, mergeable: r.mergeable, summary: r.summary, requirements: r.requirements, before: diffStats, fix: null }); review.finalMergeable = r.mergeable; }
     }
   }
   agentCommitsByArm.set(condition, agent);

@@ -1,22 +1,22 @@
-import type { ArmResult, Condition, ReviewComment, ReviewPass, ReviewRequirement, ReviewSpec } from "./types.ts";
+import type { ArmResult, Condition, ReviewPass, ReviewRequirement, ReviewSpec } from "./types.ts";
 import { formatCost, log } from "./util.ts";
 import { runStructured } from "./analyst.ts";
-import { CRITERIA } from "./quality.ts";
 
-// Simulated code review, held to one standard for both arms:
+// Requirement check, held to one standard for both arms. The reviewer has
+// one job: for each of the task's requirements, say whether the change
+// meets it, and if not, why. It does not comment on code, suggest work,
+// rate quality or add requirements; that is the judge's job, after the
+// fact, and anything more here would steer the agents.
 //
 // - The requirements are extracted from the task once, before either arm
-//   runs, and every review checks that same numbered list. A reviewer that
-//   wrote its own list would hold the two arms to different wordings.
-// - A reviewer never waives anything. If an agent disputes a requirement in
-//   its fix pass, an arm-blind adjudicator (task, requirement list, dispute
-//   text; no diff, no arm name) decides. A waiver applies to both arms, for
-//   every later round and for the final table.
-// - mergeable is derived: every requirement met or waived and no must-fix
-//   comment. Not the reviewer's own flag.
+//   runs, and every check uses that same numbered list.
+// - The reviewer never waives anything. If an agent disputes a requirement
+//   in its fix pass, an arm-blind adjudicator (task, list, dispute text; no
+//   diff, no arm name) decides, and a waiver applies to both arms.
+// - mergeable: every requirement met or waived.
 //
 // The reviewer sees only its own arm: the task, the agent's final response
-// as the PR description, and the diff. Same rubric for both.
+// as the PR description, and the diff.
 
 const DIFF_BUDGET = 60_000;
 
@@ -58,14 +58,9 @@ const SCHEMA = {
       status: { type: "string", enum: ["met", "partial", "unmet"] },
       note: { type: "string" },
     }, required: ["index", "status", "note"] } },
-    comments: { type: "array", items: { type: "object", properties: {
-      file: { type: "string" },
-      severity: { type: "string", enum: ["must-fix", "should-fix", "nit"] },
-      comment: { type: "string" },
-    }, required: ["file", "severity", "comment"] } },
     summary: { type: "string" },
   },
-  required: ["requirements", "comments", "summary"],
+  required: ["requirements", "summary"],
 };
 
 function prompt(task: string, arm: ArmResult, round: number, previous: ReviewPass | null, spec: ReviewSpec): string {
@@ -74,20 +69,20 @@ function prompt(task: string, arm: ArmResult, round: number, previous: ReviewPas
   const list = spec.requirements.map((r, i) => `${i + 1}. ${r}${waived.has(i) ? "   [WAIVED — do not check; report it as met]" : ""}`).join("\n");
   const waiverNotes = spec.adjudications.map(a => `- Requirement ${a.index + 1}: ${a.waived ? "waived" : "dispute rejected, still required"} — ${a.reason}`).join("\n");
   const prior = previous ? `
-This is review round ${round}. In round ${previous.round} you left these comments:
-${previous.comments.map((c, i) => `${i + 1}. [${c.severity}] ${c.file}: ${c.comment}`).join("\n") || "(none)"}
-and marked these requirements: ${previous.requirements.map((r, i) => `${i + 1} ${r.status}`).join("; ")}.
-Judge the current state, not the history. Do not re-raise a comment that has been addressed.` : "";
-  return `You are reviewing a pull request from an engineer on your team. You know the task they were given. You have their PR description (their final summary) and the diff. Review it the way a careful senior engineer reviews a colleague's PR before merge.
+This is round ${round}. In round ${previous.round} you marked: ${previous.requirements.map((r, i) => `${i + 1} ${r.status}${r.status === "met" || r.status === "waived" ? "" : ` (${r.note})`}`).join("; ")}. Judge the current state, not the history.` : "";
+  return `You are checking whether a pull request meets the requirements of the task it was written for. You have the task, the engineer's PR description (their final summary) and the diff.
+
+Your only job is classification. For each numbered requirement below, mark it:
+- met: the diff delivers it for every case the task covers;
+- partial: the diff delivers it for some cases the task covers, not all;
+- unmet: the diff does not deliver it.
+With a note ≤ 25 words. For met, cite where in the diff. For partial or unmet, say exactly which case or part is missing, citing the diff or the description. Judge from the diff; a claim in the description that the diff does not show is not evidence.
+
+Do not add requirements, do not comment on code quality, style, tests, naming, logging or robustness beyond what a requirement states, and do not suggest changes or extra work. If the description argues that a requirement should not apply, do not waive it: mark it as you find it and quote the argument in the note; disputes are decided elsewhere.
 ${prior}
-The requirements are fixed; check each one by number and mark it met, partial (delivered for some of the cases the task covers, not all) or unmet, with a note ≤ 15 words citing the diff or description. Only met counts for merge. You cannot waive a requirement: if the description argues one should not apply, mark it unmet and note the argument; disputes are decided elsewhere.
 ${list}
 ${waiverNotes ? `\nDecisions already made on disputes:\n${waiverNotes}\n` : ""}
-Then leave at most 5 comments in total. Each names a file, a severity (must-fix: wrong, unsafe, or a task requirement not met; should-fix: a real gap a reviewer would block on; nit: optional), and says concretely what is wrong and what to do instead, in ≤ 40 words. Beyond the requirements, judge the change on the same criteria the final quality assessment will use:
-${CRITERIA.map(c => `   - ${c.text}`).join("\n")}
-Look for: claims in the description the diff does not support; behaviour that differs from what the task asked; wording or names that collide with existing ones; missing or weak tests; logging or error paths that stay silent; convention breaks against the rest of the diff's surroundings. Do not comment on style. Do not ask for work the task did not ask for: no rebases, no refactors of untouched code, no changes to unrelated files.
-
-summary: ≤ 2 sentences, what the review found.
+summary: ≤ 2 sentences, which requirements are not met and why.
 
 =================== TASK ===================
 ${task}
@@ -100,7 +95,7 @@ ${neutralise(diff)}
 `;
 }
 
-export type ReviewOutput = { requirements: ReviewRequirement[]; comments: ReviewComment[]; mergeable: boolean; summary: string; costUsd: number; model: string };
+export type ReviewOutput = { requirements: ReviewRequirement[]; mergeable: boolean; summary: string; costUsd: number; model: string };
 
 // Aligns the reviewer's answers to the fixed list and applies the waivers.
 function alignRequirements(spec: ReviewSpec, answers: { index: number; status: "met" | "partial" | "unmet"; note: string }[]): ReviewRequirement[] {
@@ -113,18 +108,17 @@ function alignRequirements(spec: ReviewSpec, answers: { index: number; status: "
   });
 }
 
-export const isMergeable = (requirements: ReviewRequirement[], comments: ReviewComment[]) =>
-  requirements.every(x => x.status === "met" || x.status === "waived") && !comments.some(c => c.severity === "must-fix");
+export const isMergeable = (requirements: ReviewRequirement[]) =>
+  requirements.every(x => x.status === "met" || x.status === "waived");
 
 export function reviewDraft(task: string, arm: ArmResult, model: string, round: number, previous: ReviewPass | null, spec: ReviewSpec): ReviewOutput | null {
   log(`[${arm.condition}] Review round ${round}: reviewing with ${model}…`);
-  const res = runStructured<{ requirements: { index: number; status: "met" | "partial" | "unmet"; note: string }[]; comments: ReviewComment[]; summary: string }>(`Review:${arm.condition}:${round}`, prompt(task, arm, round, previous, spec), model, SCHEMA, 15 * 60 * 1000, false);
+  const res = runStructured<{ requirements: { index: number; status: "met" | "partial" | "unmet"; note: string }[]; summary: string }>(`Review:${arm.condition}:${round}`, prompt(task, arm, round, previous, spec), model, SCHEMA, 15 * 60 * 1000, false);
   if (!res) return null;
   const requirements = alignRequirements(spec, res.data.requirements);
-  const comments = res.data.comments.slice(0, 5);
-  const mergeable = isMergeable(requirements, comments);
-  log(`[${arm.condition}] Review round ${round}: ${mergeable ? "mergeable" : "not mergeable"}; requirements ${requirements.filter(r => r.status === "met").length} met / ${requirements.filter(r => r.status === "partial").length} partial / ${requirements.filter(r => r.status === "unmet").length} unmet / ${requirements.filter(r => r.status === "waived").length} waived; ${comments.length} comment(s), ${comments.filter(c => c.severity === "must-fix").length} must-fix; ${formatCost(res.costUsd)} via ${res.modelUsed}`);
-  return { requirements, comments, mergeable, summary: res.data.summary, costUsd: res.costUsd, model: res.modelUsed };
+  const mergeable = isMergeable(requirements);
+  log(`[${arm.condition}] Review round ${round}: ${mergeable ? "all requirements met" : "not yet"}; ${requirements.filter(r => r.status === "met").length} met / ${requirements.filter(r => r.status === "partial").length} partial / ${requirements.filter(r => r.status === "unmet").length} unmet / ${requirements.filter(r => r.status === "waived").length} waived; ${formatCost(res.costUsd)} via ${res.modelUsed}`);
+  return { requirements, mergeable, summary: res.data.summary, costUsd: res.costUsd, model: res.modelUsed };
 }
 
 // ---- Disputes, adjudicated once for both arms -------------------------------
@@ -182,23 +176,18 @@ export function applyWaivers(arm: ArmResult, spec: ReviewSpec): void {
       r.note = `waived for both arms: ${spec.adjudications.find(a => a.index === r.index && a.waived)?.reason ?? ""}`;
     }
   }
-  last.mergeable = isMergeable(last.requirements, last.comments);
+  last.mergeable = isMergeable(last.requirements);
   rv.finalMergeable = last.mergeable;
 }
 
-// The message the agent gets when its session is resumed for a fix pass.
+// The message the agent gets when its session is resumed for a fix pass:
+// the requirements not yet met and why, nothing else.
 export function fixPrompt(round: number, r: ReviewOutput): string {
-  const unmet = r.requirements.filter(x => x.status === "unmet" || x.status === "partial").map(x => `- ${x.requirement}${x.status === "partial" ? " (partly)" : ""}: ${x.note}`).join("\n");
-  const list = r.comments.map((c, i) => `${i + 1}. [${c.severity}] ${c.file}: ${c.comment}`).join("\n");
-  return `A reviewer has looked at your change (review round ${round}). Their summary: ${r.summary}
+  const open = r.requirements.filter(x => x.status === "unmet" || x.status === "partial").map(x => `- ${x.requirement} — ${x.status}: ${x.note}`).join("\n");
+  return `Your change has been checked against the task's requirements (round ${round}). These are not yet met:
+${open || "(none)"}
 
-Requirements they consider not yet met:
-${unmet || "(none)"}
-
-Their comments:
-${list || "(none)"}
-
-Address each unmet requirement and each comment: fix what should be fixed. If you believe a requirement or comment is wrong — it does not apply to this codebase, is already satisfied in a way the reviewer missed, or would do harm — do not silently ignore it: put a section headed "Disputed:" in your final response that names it and gives your reason, so it can be decided. Where a comment concerns a convention, prior art, or something you were unsure of, research it first with the tools you used before, rather than guessing. Keep to the conventions you already followed. Re-run the checks you ran before and wait for them to finish. Do not rebase, commit, branch, or tidy unrelated files. End with a short summary of what changed in response to the review.`;
+Make the change meet each of them. Do not take on work beyond what these requirements need. If you believe one is wrong — it does not apply to this codebase, is already satisfied in a way the check missed, or would do harm — do not silently ignore it: put a section headed "Disputed:" in your final response that names it and gives your reason, so it can be decided. Where you are unsure how the codebase handles something, research it with the tools you used before rather than guessing. Keep to the conventions you already followed. Re-run the checks you ran before and wait for them to finish. Do not rebase, commit, branch, or tidy unrelated files. End with a short summary of what changed.`;
 }
 
 // The "Disputed:" section of a fix-pass response, if any.

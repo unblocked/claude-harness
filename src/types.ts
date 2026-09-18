@@ -199,7 +199,7 @@ export interface ReviewPass {
   mergeable: boolean;
   summary: string;
   requirements: ReviewRequirement[];
-  comments: ReviewComment[];
+  comments?: ReviewComment[];   // pre-classifier reviewer only; the check no longer comments
   before: DiffStats;
   fix: { costUsd: number; durationMs: number; messages: number; exitCode: number | null; timedOut: boolean; disputed: string } | null;
 }
