@@ -68,22 +68,38 @@ export function parseStreamJson(jsonl: string): ParsedStream {
   // Per-segment result state (see the result handling below).
   let segLast: Record<string, ModelUsage> | null = null;
   let segFallback: TokenUsage | null = null;
+  let segUsage: TokenUsage | null = null;   // the last result's top-level usage: this process only
   let segCost: number | null = null;
   const addFallback = (acc: TokenUsage | null, u: Record<string, number>): TokenUsage => ({
     inputTokens: (acc?.inputTokens ?? 0) + (u.input_tokens ?? 0), outputTokens: (acc?.outputTokens ?? 0) + (u.output_tokens ?? 0),
     cacheReadTokens: (acc?.cacheReadTokens ?? 0) + (u.cache_read_input_tokens ?? 0), cacheCreationTokens: (acc?.cacheCreationTokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
   });
   const flushSegment = () => {
+    // A second resume of the same session has been seen to report modelUsage
+    // and total_cost_usd that include the previous resumed process's usage,
+    // while the top-level usage stays per process. When the two disagree by
+    // more than a fifth, scale the per-model figures and the cost down to the
+    // top-level usage.
+    let scale = 1;
+    if (segLast && segUsage) {
+      const sum = (u: TokenUsage) => u.inputTokens + u.outputTokens + u.cacheReadTokens + u.cacheCreationTokens;
+      const modelTotal = Object.values(segLast).reduce((a, mu) => a + (mu.inputTokens ?? 0) + (mu.outputTokens ?? 0) + (mu.cacheReadInputTokens ?? 0) + (mu.cacheCreationInputTokens ?? 0), 0);
+      const top = sum(segUsage);
+      if (modelTotal > 0 && top > 0 && top / modelTotal < 0.8) {
+        scale = top / modelTotal;
+        log(`parse: modelUsage (${Math.round(modelTotal / 1000)}k tokens) exceeds this process's usage (${Math.round(top / 1000)}k); carried over from a resumed session, scaling cost and per-model tokens by ${scale.toFixed(2)}`);
+      }
+    }
     if (segLast) {
       const byModel: Record<string, TokenUsage> = usage.byModel ?? {};
       for (const [model, mu] of Object.entries(segLast)) {
         const m: TokenUsage = {
-          inputTokens: mu.inputTokens ?? 0,
-          outputTokens: mu.outputTokens ?? 0,
-          cacheReadTokens: mu.cacheReadInputTokens ?? 0,
-          cacheCreationTokens: mu.cacheCreationInputTokens ?? 0,
-          ...(typeof mu.costUSD === "number" ? { costUsd: mu.costUSD } : {}),
-          ...(typeof mu.thinkingTokens === "number" ? { thinkingTokens: mu.thinkingTokens } : {}),
+          inputTokens: Math.round((mu.inputTokens ?? 0) * scale),
+          outputTokens: Math.round((mu.outputTokens ?? 0) * scale),
+          cacheReadTokens: Math.round((mu.cacheReadInputTokens ?? 0) * scale),
+          cacheCreationTokens: Math.round((mu.cacheCreationInputTokens ?? 0) * scale),
+          ...(typeof mu.costUSD === "number" ? { costUsd: mu.costUSD * scale } : {}),
+          ...(typeof mu.thinkingTokens === "number" ? { thinkingTokens: Math.round(mu.thinkingTokens * scale) } : {}),
         };
         const prev = byModel[model];
         byModel[model] = prev ? {
@@ -105,8 +121,8 @@ export function parseStreamJson(jsonl: string): ParsedStream {
       usage.cacheReadTokens += segFallback.cacheReadTokens;
       usage.cacheCreationTokens += segFallback.cacheCreationTokens;
     }
-    if (segCost !== null) totalCostUsd = (totalCostUsd ?? 0) + segCost;
-    segLast = null; segFallback = null; segCost = null;
+    if (segCost !== null) totalCostUsd = (totalCostUsd ?? 0) + segCost * scale;
+    segLast = null; segFallback = null; segUsage = null; segCost = null;
   };
 
   for (const e of events) {
@@ -169,6 +185,7 @@ export function parseStreamJson(jsonl: string): ParsedStream {
     if (e?.type === "result") {
       if (e.modelUsage && typeof e.modelUsage === "object") segLast = e.modelUsage as Record<string, ModelUsage>;
       else if (e.usage) segFallback = addFallback(segFallback, e.usage);
+      if (e.usage) segUsage = addFallback(segUsage, e.usage);
       if (typeof e.total_cost_usd === "number") segCost = e.total_cost_usd;
       if (typeof e.duration_ms === "number") cliDurationMs = (cliDurationMs ?? 0) + e.duration_ms;
       if (e.session_id) sessionId = e.session_id;
