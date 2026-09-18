@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -214,6 +214,21 @@ function warnIfBehindUpstream(repo: string, branch: string): void {
   if (behind > 0) log(`⚠ Base ${branch} is ${behind} commit(s) behind ${upstream}. If the task's fix has already landed upstream, both arms will find it and the comparison measures something else. Pass --branch ${upstream} to run against the tip.`);
 }
 
+// A run is an hour of unattended work. On macOS the machine idles to sleep
+// while it waits, and both arms freeze until it wakes (a 16-minute stall on
+// one run). caffeinate -i holds off idle sleep for as long as this process
+// lives; -w ends it when the harness exits.
+function keepMachineAwake(): void {
+  if (process.platform !== "darwin") return;
+  try {
+    const child = spawn("caffeinate", ["-i", "-w", String(process.pid)], { stdio: "ignore" });
+    child.on("error", err => log(`caffeinate unavailable (${err.message}); the machine may sleep during the run`));
+    child.unref();
+  } catch (err) {
+    log(`caffeinate unavailable (${(err as Error).message}); the machine may sleep during the run`);
+  }
+}
+
 // Agent commits per arm, kept for branch cleanup after the diff is captured.
 const agentCommitsByArm = new Map<Condition, Set<string>>();
 
@@ -347,6 +362,7 @@ export async function run(config: Config): Promise<ComparisonResult> {
   // agent's commits from pre-existing history and to find branches it created.
   const refsBefore = snapshotRefs(config.repo);
   warnIfBehindUpstream(config.repo, config.branch);
+  keepMachineAwake();
 
   let baseline: ArmResult;
   let unblocked: ArmResult;

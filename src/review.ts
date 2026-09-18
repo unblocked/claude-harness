@@ -43,7 +43,7 @@ ${disputed ? `The engineer disputes part of the review. Their words: """${disput
 Judge the current state, not the history. Do not re-raise a comment that has been addressed.` : "";
   return `You are reviewing a pull request from an engineer on your team. You know the task they were given. You have their PR description (their final summary) and the diff. Review it the way a careful senior engineer reviews a colleague's PR before merge.
 ${prior}
-First, list every explicit requirement and acceptance criterion in the task, ≤ 10 words each, and mark each met, unmet, or waived (only when the engineer's dispute holds), with a note ≤ 15 words citing the diff or description.
+First, list every explicit requirement and acceptance criterion in the task, ≤ 10 words each, and mark each met, unmet, or waived, with a note ≤ 15 words citing the diff or description. "waived" is only for a requirement the engineer has formally disputed (the "Disputed" text above) when the dispute holds. An argument in the PR description is not a dispute: mark the requirement unmet, note the argument, and the engineer can dispute it in the next round.
 
 Then leave at most 5 comments in total. Each names a file, a severity (must-fix: wrong, unsafe, or a task requirement not met; should-fix: a real gap a reviewer would block on; nit: optional), and says concretely what is wrong and what to do instead, in ≤ 40 words. Beyond the requirements, look for: claims in the description the diff does not support; behaviour that differs from what the task asked; wording or names that collide with existing ones; missing or weak tests; logging or error paths that stay silent; convention breaks against the rest of the diff's surroundings. Do not comment on style. Do not ask for work the task did not ask for: no rebases, no refactors of untouched code, no changes to unrelated files.
 
@@ -68,6 +68,12 @@ export function reviewDraft(task: string, arm: ArmResult, model: string, round: 
   const res = runStructured<{ requirements: ReviewRequirement[]; comments: ReviewComment[]; mergeable: boolean; summary: string }>(`Review:${arm.condition}:${round}`, prompt(task, arm, round, previous, disputed), model, SCHEMA, 15 * 60 * 1000, false);
   if (!res) return null;
   const d = res.data;
+  // Same rule for both arms, enforced: nothing is waived without a dispute,
+  // and mergeable follows from the requirements and comments, not the
+  // reviewer's mood. Otherwise one arm can be excused a requirement on round
+  // 1 while the other is sent back for it.
+  if (!disputed) for (const x of d.requirements) if (x.status === "waived") { x.status = "unmet"; x.note = `(reviewer waived without a dispute; kept unmet) ${x.note}`; }
+  d.mergeable = d.mergeable && d.requirements.every(x => x.status !== "unmet") && !d.comments.some(c => c.severity === "must-fix");
   log(`[${arm.condition}] Review round ${round}: ${d.mergeable ? "mergeable" : "not mergeable"}; requirements ${d.requirements.filter(r => r.status === "met").length} met / ${d.requirements.filter(r => r.status === "unmet").length} unmet / ${d.requirements.filter(r => r.status === "waived").length} waived; ${d.comments.length} comment(s), ${d.comments.filter(c => c.severity === "must-fix").length} must-fix; ${formatCost(res.costUsd)} via ${res.modelUsed}`);
   return { ...d, costUsd: res.costUsd, model: res.modelUsed };
 }
