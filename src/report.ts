@@ -102,13 +102,11 @@ function sharedRequirementsTable(result: ComparisonResult): string {
   const cell = (arm: ArmResult, i: number) => {
     const r = last(arm)?.requirements.find(x => x.index === i);
     if (!r) return "<td>–</td>";
-    const j = result.quality?.requirements.find(x => x.index === i)?.[arm.condition];
-    const disagree = j && r.status !== "waived" && ((r.status === "met") !== (j.status === "met"));
-    return `<td><span class="met ${r.status === "met" ? "met-met" : r.status === "waived" ? "met-partial" : "met-unmet"}">${r.status}</span><div class="evidence">${escapeHtml(r.note)}</div>${j ? `<div class="evidence" style="margin-top:4px;">judge: <span class="met met-${j.status}">${j.status}</span>${disagree ? ' <span class="met met-partial">disagrees with reviewer</span>' : ""} ${escapeHtml(j.evidence)}</div>` : ""}</td>`;
+    return `<td><span class="met ${r.status === "met" ? "met-met" : r.status === "unmet" ? "met-unmet" : "met-partial"}">${r.status}</span><div class="evidence">${escapeHtml(r.note)}</div></td>`;
   };
   const adj = spec.adjudications.map(a => `<li>Requirement ${a.index + 1}, disputed by ${a.disputedBy === "unblocked" ? "the Unblocked arm" : "the baseline arm"} in round ${a.round}: <b>${a.waived ? "waived for both arms" : "dispute rejected"}</b>. ${escapeHtml(a.reason)}</li>`).join("");
   return `<div class="tool-table-wrap"><table class="tool-table">
-      <thead><tr><th>Requirement (same list for both arms)</th><th>Baseline: reviewer${result.quality ? " · judge" : ""}</th><th>With Unblocked: reviewer${result.quality ? " · judge" : ""}</th></tr></thead>
+      <thead><tr><th>Requirement (same list for both arms)</th><th>Baseline</th><th>With Unblocked</th></tr></thead>
       <tbody>${spec.requirements.map((req, i) => `<tr><td>${i + 1}. ${escapeHtml(req)}</td>${cell(result.baseline, i)}${cell(result.unblocked, i)}</tr>`).join("")}</tbody>
     </table></div>${adj ? `<ul class="section-note" style="margin: 8px 0 0 18px;">${adj}</ul>` : ""}`;
 }
@@ -1006,7 +1004,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
         <div class="arm-header"><span class="arm-name">${escapeHtml(label as string)} <span class="met ${rv.finalMergeable ? "met-met" : "met-unmet"}">${rv.finalMergeable ? "mergeable" : "not mergeable"}</span></span>
           <span style="font-size: 12px; color: var(--text-muted);">draft ${escapeHtml(formatDiffSummary(rv.draft.diffStats))} → final ${escapeHtml(formatDiffSummary((arm as ArmResult).diffStats))} · ${rv.passes.filter(p => p.fix).length} fix pass(es), ${formatCost(rv.passes.reduce((s2, p) => s2 + (p.fix?.costUsd ?? 0), 0))}, ${formatDuration(rv.passes.reduce((s2, p) => s2 + (p.fix?.durationMs ?? 0), 0))}</span></div>
         ${last && !result.reviewSpec ? `<table class="tool-table"><thead><tr><th>Requirement</th><th>Final status</th></tr></thead><tbody>${last.requirements.map(r => `
-          <tr><td>${escapeHtml(r.requirement)}</td><td><span class="met ${r.status === "met" ? "met-met" : r.status === "waived" ? "met-partial" : "met-unmet"}">${r.status}</span><div class="evidence">${escapeHtml(r.note)}</div></td></tr>`).join("")}</tbody></table>` : ""}
+          <tr><td>${escapeHtml(r.requirement)}</td><td><span class="met ${r.status === "met" ? "met-met" : r.status === "unmet" ? "met-unmet" : "met-partial"}">${r.status}</span><div class="evidence">${escapeHtml(r.note)}</div></td></tr>`).join("")}</tbody></table>` : ""}
         ${rv.passes.map(p => `
         <div class="arm-tokens" style="display:block;"><b>Round ${p.round}</b> · ${p.mergeable ? "mergeable" : "not mergeable"} · ${escapeHtml(p.summary)}${p.fix ? ` · fix: ${formatCost(p.fix.costUsd)}, ${formatDuration(p.fix.durationMs)}, ${p.fix.messages} msgs${p.fix.disputed ? ` · <span class="met met-partial">disputed</span> ${escapeHtml(p.fix.disputed.slice(0, 200))}` : ""}` : ""}
           ${p.comments.length ? `<table class="tool-table" style="margin-top: 6px;"><tbody>${p.comments.map(c => `
@@ -1019,7 +1017,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   ${result.quality ? `
   <div class="section">
     <div class="section-title">3 · Quality analysis <span class="section-sub">blinded judge: ${escapeHtml(result.quality.judgeModel)}</span></div>
-    <div class="section-note">Blinded judge: saw task, final responses, tests run and diffs as A/B in random order.</div>
+    <div class="section-note">Blinded judge: saw task, final responses, tests run, diffs and the reviewer's final record as A/B in random order. Grades the same requirement list as the reviewer.</div>
     <div class="verdict ${result.quality.verdict.better === "unblocked" ? "positive" : result.quality.verdict.better === "baseline" ? "negative" : ""}">
       <div class="verdict-head">Verdict: ${result.quality.verdict.better === "tie" ? "tie" : result.quality.verdict.better === "unblocked" ? "With Unblocked" : "Baseline"}</div>
       <div>${escapeHtml(result.quality.verdict.rationale)}</div>

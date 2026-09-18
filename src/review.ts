@@ -1,6 +1,7 @@
 import type { ArmResult, Condition, ReviewComment, ReviewPass, ReviewRequirement, ReviewSpec } from "./types.ts";
 import { formatCost, log } from "./util.ts";
 import { runStructured } from "./analyst.ts";
+import { CRITERIA } from "./quality.ts";
 
 // Simulated code review, held to one standard for both arms:
 //
@@ -54,7 +55,7 @@ const SCHEMA = {
   properties: {
     requirements: { type: "array", items: { type: "object", properties: {
       index: { type: "integer" },
-      status: { type: "string", enum: ["met", "unmet"] },
+      status: { type: "string", enum: ["met", "partial", "unmet"] },
       note: { type: "string" },
     }, required: ["index", "status", "note"] } },
     comments: { type: "array", items: { type: "object", properties: {
@@ -79,10 +80,12 @@ and marked these requirements: ${previous.requirements.map((r, i) => `${i + 1} $
 Judge the current state, not the history. Do not re-raise a comment that has been addressed.` : "";
   return `You are reviewing a pull request from an engineer on your team. You know the task they were given. You have their PR description (their final summary) and the diff. Review it the way a careful senior engineer reviews a colleague's PR before merge.
 ${prior}
-The requirements are fixed; check each one by number and mark it met or unmet, with a note ≤ 15 words citing the diff or description. You cannot waive a requirement: if the description argues one should not apply, mark it unmet and note the argument; disputes are decided elsewhere.
+The requirements are fixed; check each one by number and mark it met, partial (delivered for some of the cases the task covers, not all) or unmet, with a note ≤ 15 words citing the diff or description. Only met counts for merge. You cannot waive a requirement: if the description argues one should not apply, mark it unmet and note the argument; disputes are decided elsewhere.
 ${list}
 ${waiverNotes ? `\nDecisions already made on disputes:\n${waiverNotes}\n` : ""}
-Then leave at most 5 comments in total. Each names a file, a severity (must-fix: wrong, unsafe, or a task requirement not met; should-fix: a real gap a reviewer would block on; nit: optional), and says concretely what is wrong and what to do instead, in ≤ 40 words. Beyond the requirements, look for: claims in the description the diff does not support; behaviour that differs from what the task asked; wording or names that collide with existing ones; missing or weak tests; logging or error paths that stay silent; convention breaks against the rest of the diff's surroundings. Do not comment on style. Do not ask for work the task did not ask for: no rebases, no refactors of untouched code, no changes to unrelated files.
+Then leave at most 5 comments in total. Each names a file, a severity (must-fix: wrong, unsafe, or a task requirement not met; should-fix: a real gap a reviewer would block on; nit: optional), and says concretely what is wrong and what to do instead, in ≤ 40 words. Beyond the requirements, judge the change on the same criteria the final quality assessment will use:
+${CRITERIA.map(c => `   - ${c.text}`).join("\n")}
+Look for: claims in the description the diff does not support; behaviour that differs from what the task asked; wording or names that collide with existing ones; missing or weak tests; logging or error paths that stay silent; convention breaks against the rest of the diff's surroundings. Do not comment on style. Do not ask for work the task did not ask for: no rebases, no refactors of untouched code, no changes to unrelated files.
 
 summary: ≤ 2 sentences, what the review found.
 
@@ -100,7 +103,7 @@ ${neutralise(diff)}
 export type ReviewOutput = { requirements: ReviewRequirement[]; comments: ReviewComment[]; mergeable: boolean; summary: string; costUsd: number; model: string };
 
 // Aligns the reviewer's answers to the fixed list and applies the waivers.
-function alignRequirements(spec: ReviewSpec, answers: { index: number; status: "met" | "unmet"; note: string }[]): ReviewRequirement[] {
+function alignRequirements(spec: ReviewSpec, answers: { index: number; status: "met" | "partial" | "unmet"; note: string }[]): ReviewRequirement[] {
   const waived = waivedIndices(spec);
   const byIndex = new Map(answers.map(a => [a.index - 1, a]));
   return spec.requirements.map((requirement, i) => {
@@ -111,16 +114,16 @@ function alignRequirements(spec: ReviewSpec, answers: { index: number; status: "
 }
 
 export const isMergeable = (requirements: ReviewRequirement[], comments: ReviewComment[]) =>
-  requirements.every(x => x.status !== "unmet") && !comments.some(c => c.severity === "must-fix");
+  requirements.every(x => x.status === "met" || x.status === "waived") && !comments.some(c => c.severity === "must-fix");
 
 export function reviewDraft(task: string, arm: ArmResult, model: string, round: number, previous: ReviewPass | null, spec: ReviewSpec): ReviewOutput | null {
   log(`[${arm.condition}] Review round ${round}: reviewing with ${model}…`);
-  const res = runStructured<{ requirements: { index: number; status: "met" | "unmet"; note: string }[]; comments: ReviewComment[]; summary: string }>(`Review:${arm.condition}:${round}`, prompt(task, arm, round, previous, spec), model, SCHEMA, 15 * 60 * 1000, false);
+  const res = runStructured<{ requirements: { index: number; status: "met" | "partial" | "unmet"; note: string }[]; comments: ReviewComment[]; summary: string }>(`Review:${arm.condition}:${round}`, prompt(task, arm, round, previous, spec), model, SCHEMA, 15 * 60 * 1000, false);
   if (!res) return null;
   const requirements = alignRequirements(spec, res.data.requirements);
   const comments = res.data.comments.slice(0, 5);
   const mergeable = isMergeable(requirements, comments);
-  log(`[${arm.condition}] Review round ${round}: ${mergeable ? "mergeable" : "not mergeable"}; requirements ${requirements.filter(r => r.status === "met").length} met / ${requirements.filter(r => r.status === "unmet").length} unmet / ${requirements.filter(r => r.status === "waived").length} waived; ${comments.length} comment(s), ${comments.filter(c => c.severity === "must-fix").length} must-fix; ${formatCost(res.costUsd)} via ${res.modelUsed}`);
+  log(`[${arm.condition}] Review round ${round}: ${mergeable ? "mergeable" : "not mergeable"}; requirements ${requirements.filter(r => r.status === "met").length} met / ${requirements.filter(r => r.status === "partial").length} partial / ${requirements.filter(r => r.status === "unmet").length} unmet / ${requirements.filter(r => r.status === "waived").length} waived; ${comments.length} comment(s), ${comments.filter(c => c.severity === "must-fix").length} must-fix; ${formatCost(res.costUsd)} via ${res.modelUsed}`);
   return { requirements, comments, mergeable, summary: res.data.summary, costUsd: res.costUsd, model: res.modelUsed };
 }
 
@@ -185,7 +188,7 @@ export function applyWaivers(arm: ArmResult, spec: ReviewSpec): void {
 
 // The message the agent gets when its session is resumed for a fix pass.
 export function fixPrompt(round: number, r: ReviewOutput): string {
-  const unmet = r.requirements.filter(x => x.status === "unmet").map(x => `- ${x.requirement}: ${x.note}`).join("\n");
+  const unmet = r.requirements.filter(x => x.status === "unmet" || x.status === "partial").map(x => `- ${x.requirement}${x.status === "partial" ? " (partly)" : ""}: ${x.note}`).join("\n");
   const list = r.comments.map((c, i) => `${i + 1}. [${c.severity}] ${c.file}: ${c.comment}`).join("\n");
   return `A reviewer has looked at your change (review round ${round}). Their summary: ${r.summary}
 

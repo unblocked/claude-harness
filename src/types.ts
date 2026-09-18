@@ -183,7 +183,7 @@ export interface ReviewComment { file: string; severity: "must-fix" | "should-fi
 
 // `index` is the position in ReviewSpec.requirements; absent on results from
 // before the list was shared.
-export interface ReviewRequirement { index?: number; requirement: string; status: "met" | "unmet" | "waived"; note: string }
+export interface ReviewRequirement { index?: number; requirement: string; status: "met" | "partial" | "unmet" | "waived"; note: string }
 
 // The task's requirements, extracted once per run and checked by every
 // review of both arms. Disputes from either arm are adjudicated once, blind

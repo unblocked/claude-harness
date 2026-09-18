@@ -47,6 +47,22 @@ function verificationRecord(arm: ArmResult, jsonl: string): string {
   return lines.length ? lines.join("\n") : "(no test, lint, build or CI commands were run)";
 }
 
+// The reviewer's record for one arm: the last pass's verdict per requirement,
+// its open comments, and how many rounds it took. Same reviewer, same list,
+// same rubric for both arms, so the judge can start from it.
+function reviewRecord(label: string, arm: ArmResult): string {
+  const rv = arm.review;
+  if (!rv || !rv.passes.length) return "";
+  const last = rv.passes[rv.passes.length - 1];
+  const fixes = rv.passes.filter(p => p.fix).length;
+  return `
+--- Code review of agent ${label}'s final revision (${rv.passes.length} review round(s), ${fixes} fix pass(es); ${last.mergeable ? "mergeable" : "not mergeable"}) ---
+Per requirement: ${last.requirements.map(r => `${(r.index ?? 0) + 1} ${r.status}${r.note ? ` (${r.note})` : ""}`).join("; ")}
+Open comments: ${last.comments.map(c => `[${c.severity}] ${c.file.split("/").slice(-1)[0]}: ${c.comment}`).join(" | ") || "(none)"}
+Reviewer's summary: ${last.summary}
+`;
+}
+
 function armBlock(label: string, arm: ArmResult): string {
   let jsonl = "";
   try { jsonl = fs.readFileSync(arm.run.jsonlPath, "utf8"); } catch {}
@@ -54,6 +70,7 @@ function armBlock(label: string, arm: ArmResult): string {
   return `=================== ARM ${label} ===================
 --- Final response from agent ${label} ---
 ${neutralise(arm.run.finalResponse)}
+${neutralise(reviewRecord(label, arm))}
 
 --- Verification commands agent ${label} ran, with the end of their output ---
 ${neutralise(verificationRecord(arm, jsonl))}
@@ -109,8 +126,9 @@ function judgePrompt(task: string, first: ArmResult, second: ArmResult, spec: Re
   // reviewers used, so the two tables are comparable line by line. A waived
   // requirement is not graded.
   const waived = new Set((spec?.adjudications ?? []).filter(a => a.waived).map(a => a.index));
+  const reviewed = [first, second].some(a => a.review?.passes.length);
   const step1 = spec
-    ? `1. The task's requirements are fixed and numbered below. Grade each agent on each one, by its number, met / partial / unmet, with evidence ≤ 12 words drawn from its response or diff. Copy the requirement text as given; do not add, merge or reword requirements. Skip the ones marked waived.
+    ? `1. The task's requirements are fixed and numbered below. Grade each agent on each one, by its number, met / partial / unmet, with evidence ≤ 12 words drawn from its response or diff. Copy the requirement text as given; do not add, merge or reword requirements. Skip the ones marked waived.${reviewed ? " A code reviewer has already graded each agent's final revision against this list with the same rubric; its record is under each agent's response. Start from the reviewer's grades and open comments: keep a grade unless the diff or the verification record plainly contradicts it, and when you change one, say why in the evidence." : ""}
 ${spec.requirements.map((r, i) => `   ${i + 1}. ${r}${waived.has(i) ? "   [waived — do not grade]" : ""}`).join("\n")}`
     : `1. Extract the task's explicit requirements, one per distinct thing it asks for, each ≤ 10 words, numbered from 1. For each, grade each agent met / partial / unmet with evidence ≤ 12 words drawn from its response or diff.`;
   return `Two autonomous coding agents, A and B, were given the same task in identical copies of the same repository. You are judging the quality of what each produced. You will see the task, then for each agent its final written response, the verification commands it ran with the end of their output, and its diff. Judge only from this material. Do not guess at anything you cannot see.
