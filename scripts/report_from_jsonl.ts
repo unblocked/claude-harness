@@ -91,7 +91,29 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
     estimatedCost: cost,
     // Carried over unless --attribute recomputes it; the analyst call is the slow part.
     attribution: orig?.attribution,
-    review: orig?.review,
+    review: orig?.review ? reparseReview(orig.review, jsonlPath, model) : undefined,
+  };
+}
+
+// Review passes were priced at run time; re-price the draft and each fix pass
+// from their own transcripts (<arm>.draft.jsonl, <arm>.fix<N>.jsonl) when
+// those sit beside the combined one, so parser fixes reach them.
+function reparseReview(review: NonNullable<ArmResult["review"]>, jsonlPath: string, model: string) {
+  const dir = path.dirname(jsonlPath), stem = path.basename(jsonlPath, ".jsonl");
+  const price = (file: string) => {
+    if (!fs.existsSync(file)) return null;
+    const p = parseStreamJson(fs.readFileSync(file, "utf8"));
+    return { costUsd: p.totalCostUsd ?? estimateCost(model, p.tokenUsage), durationMs: p.cliDurationMs ?? 0, messages: p.assistantTurns };
+  };
+  const draft = price(path.join(dir, `${stem}.draft.jsonl`));
+  return {
+    ...review,
+    draft: draft ? { ...review.draft, ...draft } : review.draft,
+    passes: review.passes.map(pass => {
+      if (!pass.fix) return pass;
+      const fix = price(path.join(dir, `${stem}.fix${pass.round}.jsonl`)) ?? price(path.join(dir, `${stem}.fix.jsonl`));
+      return fix ? { ...pass, fix: { ...pass.fix, ...fix } } : pass;
+    }),
   };
 }
 
