@@ -204,5 +204,7 @@ Address each unmet requirement and each comment: fix what should be fixed. If yo
 // The "Disputed:" section of a fix-pass response, if any.
 export function disputedSection(finalResponse: string): string {
   const m = finalResponse.match(/(?:^|\n)\s*(?:#+\s*)?\**Disputed:?\**\s*\n?([\s\S]{0,2000})/i);
-  return m ? m[1].trim() : "";
+  const text = m ? m[1].trim() : "";
+  // "Disputed: none." is not a dispute.
+  return /^[\s*_]*(none|nothing|n\/a|no disputes?|no)\b/i.test(text) ? "" : text;
 }
