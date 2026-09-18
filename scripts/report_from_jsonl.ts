@@ -39,19 +39,20 @@ function repoFromCwd(cwd: string | undefined): string | undefined {
   return parts.length >= 2 ? parts[parts.length - 2] : undefined;
 }
 
-// The CLI's duration_ms; for a transcript with no result event (killed run),
-// the span of event timestamps.
+// The CLI's duration_ms summed over result events (a draft pass plus a fix
+// pass is two); for a transcript with no result event (killed run), the span
+// of event timestamps.
 function durationMs(jsonl: string): number {
-  let first = NaN, last = NaN;
+  let first = NaN, last = NaN, total = 0, seen = false;
   for (const line of jsonl.split("\n")) {
     if (!line) continue;
     try {
       const e = JSON.parse(line);
-      if (e?.type === "result" && typeof e.duration_ms === "number") return e.duration_ms;
+      if (e?.type === "result" && typeof e.duration_ms === "number") { total += e.duration_ms; seen = true; }
       if (typeof e?.timestamp === "string") { const t = Date.parse(e.timestamp); if (Number.isNaN(first)) first = t; last = t; }
     } catch {}
   }
-  return Number.isNaN(first) ? 0 : Math.max(0, last - first);
+  return seen ? total : (Number.isNaN(first) ? 0 : Math.max(0, last - first));
 }
 
 function unblockedCalls(toolCalls: { name: string; args: Record<string, unknown>; mcpServer?: string }[]): UnblockedCall[] {
@@ -90,6 +91,7 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
     estimatedCost: cost,
     // Carried over unless --attribute recomputes it; the analyst call is the slow part.
     attribution: orig?.attribution,
+    review: orig?.review,
   };
 }
 

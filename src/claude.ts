@@ -110,9 +110,11 @@ export function parseStreamJson(jsonl: string): ParsedStream {
       if (e.session_id) sessionId = e.session_id;
     }
 
+    // A transcript may hold several result events (a draft pass and a resumed
+    // fix pass): everything here accumulates across them.
     if (e?.type === "result") {
       if (e.modelUsage && typeof e.modelUsage === "object") {
-        const byModel: Record<string, TokenUsage> = {};
+        const byModel: Record<string, TokenUsage> = usage.byModel ?? {};
         for (const [model, mu] of Object.entries(e.modelUsage as Record<string, ModelUsage>)) {
           const m: TokenUsage = {
             inputTokens: mu.inputTokens ?? 0,
@@ -122,7 +124,13 @@ export function parseStreamJson(jsonl: string): ParsedStream {
             ...(typeof mu.costUSD === "number" ? { costUsd: mu.costUSD } : {}),
             ...(typeof mu.thinkingTokens === "number" ? { thinkingTokens: mu.thinkingTokens } : {}),
           };
-          byModel[model] = m;
+          const prev = byModel[model];
+          byModel[model] = prev ? {
+            inputTokens: prev.inputTokens + m.inputTokens, outputTokens: prev.outputTokens + m.outputTokens,
+            cacheReadTokens: prev.cacheReadTokens + m.cacheReadTokens, cacheCreationTokens: prev.cacheCreationTokens + m.cacheCreationTokens,
+            ...((prev.costUsd ?? m.costUsd) !== undefined ? { costUsd: (prev.costUsd ?? 0) + (m.costUsd ?? 0) } : {}),
+            ...((prev.thinkingTokens ?? m.thinkingTokens) !== undefined ? { thinkingTokens: (prev.thinkingTokens ?? 0) + (m.thinkingTokens ?? 0) } : {}),
+          } : m;
           usage.inputTokens += m.inputTokens;
           usage.outputTokens += m.outputTokens;
           usage.cacheReadTokens += m.cacheReadTokens;
@@ -131,15 +139,13 @@ export function parseStreamJson(jsonl: string): ParsedStream {
         usage.byModel = byModel;
       } else if (e.usage) {
         // Fallback for transcripts without modelUsage: main model only.
-        usage.inputTokens = e.usage.input_tokens ?? 0;
-        usage.outputTokens = e.usage.output_tokens ?? 0;
-        usage.cacheReadTokens = e.usage.cache_read_input_tokens ?? 0;
-        usage.cacheCreationTokens = e.usage.cache_creation_input_tokens ?? 0;
+        usage.inputTokens += e.usage.input_tokens ?? 0;
+        usage.outputTokens += e.usage.output_tokens ?? 0;
+        usage.cacheReadTokens += e.usage.cache_read_input_tokens ?? 0;
+        usage.cacheCreationTokens += e.usage.cache_creation_input_tokens ?? 0;
       }
-      if (typeof e.total_cost_usd === "number") {
-        totalCostUsd = e.total_cost_usd;
-      }
-      if (typeof e.duration_ms === "number") cliDurationMs = e.duration_ms;
+      if (typeof e.total_cost_usd === "number") totalCostUsd = (totalCostUsd ?? 0) + e.total_cost_usd;
+      if (typeof e.duration_ms === "number") cliDurationMs = (cliDurationMs ?? 0) + e.duration_ms;
       if (e.session_id) sessionId = e.session_id;
     }
   }
