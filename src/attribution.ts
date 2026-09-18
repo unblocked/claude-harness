@@ -243,6 +243,7 @@ Labels:
 - work: reading or searching code and docs, calling research tools, deciding, editing files, writing documentation, or writing the final summary. A turn that only narrates the next step is work.
 - verify: running tests, linters, type checks, builds or CI to validate the change, and environment setup those runs need (starting a database or containers, preparing a test database). A re-run is verify only if the agent changed code since the previous run, or the previous run failed for a reason related to the change.
 - housekeeping: activity that neither advances nor validates the task. Examples: reverting incidental changes to lockfiles or generated files; deleting build artifacts or temp files; git status, branch or log checks not needed to proceed; creating branches; committing; re-running a check that already passed with no code change in between; re-running after a failure unrelated to the change (a flaky test, infrastructure, a timeout).
+- One distinction matters: a deliberate control experiment — running the unmodified code, or a specific variant, to learn whether a failure pre-exists or what causes it, done once and used in the agent's conclusions — is verify. Blind repeats of the same command with nothing changed in between are housekeeping.
 
 Rules:
 - Label every turn, in order, turn numbers exactly as given.
