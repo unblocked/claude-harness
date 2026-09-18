@@ -35,7 +35,7 @@ const SPEC_SCHEMA = {
 
 export async function extractRequirements(task: string, model: string): Promise<ReviewSpec | null> {
   log(`Review: extracting the task's requirements with ${model}…`);
-  const prompt = `A pull request will be reviewed against this task. List every explicit requirement and acceptance criterion the task states, one per entry, ≤ 12 words each, in the order the task gives them. Include deliverables the task names (for example tests, a changelog entry) as their own entries. Do not add requirements the task does not state, and do not merge two criteria into one entry.
+  const prompt = `A change will be checked against this task. List every explicit requirement and acceptance criterion the task states, one per entry, ≤ 20 words each, in the order the task gives them. Include deliverables the task names (for example tests, a changelog entry) as their own entries. Keep an "either X or Y" criterion as one entry that names both alternatives; never split alternatives into separate requirements, and never split one criterion into a condition and its consequence. Do not add requirements the task does not state, and do not restate motivation as a requirement.
 
 =================== TASK ===================
 ${task}
