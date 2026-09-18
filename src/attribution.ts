@@ -19,11 +19,19 @@ export interface WalkTurn {
   durationMs: number;
   modelMs: number;
   toolMs: number;
+  stallMs: number;       // wall time excluded: machine sleep or API outage inside a model wait
   outputTokens: number;
   outputExact: boolean;
   cacheReadTokens: number;
 }
 
+
+const STALL_MS = 5 * 60 * 1000;
+function median(xs: number[]): number {
+  if (!xs.length) return 0;
+  const a = [...xs].sort((x, y) => x - y);
+  return a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2;
+}
 
 function excerpt(s: string, n: number): string {
   s = s.replace(/\s+/g, " ").trim();
@@ -128,7 +136,7 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
       if (!row) {
         const u = e.message?.usage ?? {};
         row = {
-          id, turn: rows.length + 1, text: "", tools: [], startMs: 0, costUsd: 0, durationMs: 0, modelMs: 0, toolMs: 0,
+          id, turn: rows.length + 1, text: "", tools: [], startMs: 0, costUsd: 0, durationMs: 0, modelMs: 0, toolMs: 0, stallMs: 0,
           outputTokens: 0, outputExact: false, cacheReadTokens: u.cache_read_input_tokens ?? 0,
           rawCost: 0, chars: 0, thinkingEst: pendingThinking, usage: u, cache1h: u.cache_creation?.ephemeral_1h_input_tokens ?? 0,
           model: typeof e.message?.model === "string" ? e.message.model : "opus",
@@ -173,6 +181,18 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
       r.durationMs = r.modelMs + r.toolMs;
       prevEnd = end;
     }
+  }
+  // Stalls: a model wait longer than STALL_MS is not generation (the machine
+  // slept, or the API was down and the CLI backed off). The CLI's own
+  // duration_ms skips machine sleep; wall timestamps do not. Charge such a
+  // message the arm's typical model wait and move the rest to stallMs, which
+  // is excluded from every time total.
+  const typical = median(rows.filter(r => r.modelMs > 0 && r.modelMs <= STALL_MS).map(r => r.modelMs));
+  for (const r of rows) {
+    if (r.modelMs <= STALL_MS) continue;
+    r.stallMs = r.modelMs - typical;
+    r.modelMs = typical;
+    r.durationMs = r.modelMs + r.toolMs;
   }
 
   // Output tokens: exact where the stream had message_delta. Otherwise the
@@ -274,7 +294,7 @@ export function classifyTurns(walk: WalkTurn[], task: string, model: string): { 
 function totals(rows: AttributedTurn[]): AttributionTotals {
   const sum = (f: (r: AttributedTurn) => number) => rows.reduce((a, r) => a + f(r), 0);
   return {
-    costUsd: sum(r => r.costUsd), durationMs: sum(r => r.durationMs), modelMs: sum(r => r.modelMs), toolMs: sum(r => r.toolMs),
+    costUsd: sum(r => r.costUsd), durationMs: sum(r => r.durationMs), modelMs: sum(r => r.modelMs), toolMs: sum(r => r.toolMs), stallMs: sum(r => r.stallMs),
     turns: rows.length, outputTokens: sum(r => r.outputTokens), cacheReadTokens: sum(r => r.cacheReadTokens),
   };
 }
@@ -284,7 +304,7 @@ export function rollup(walk: WalkTurn[], labels: TurnLabel[], analystModel: stri
   const rows: AttributedTurn[] = walk.map(t => {
     const l = byTurn.get(t.turn) ?? { turn: t.turn, label: "work" as const, repeatOf: null, reason: "(unlabelled by analyst; counted as work)" };
     const summary = t.tools.length ? t.tools.map(x => `${x.name} ${x.args}`).join("; ").slice(0, 160) : (t.text.slice(0, 160) || "(thinking only)");
-    return { ...l, startMs: t.startMs, costUsd: t.costUsd, durationMs: t.durationMs, modelMs: t.modelMs, toolMs: t.toolMs, outputTokens: t.outputTokens, cacheReadTokens: t.cacheReadTokens, summary };
+    return { ...l, startMs: t.startMs, costUsd: t.costUsd, durationMs: t.durationMs, modelMs: t.modelMs, toolMs: t.toolMs, stallMs: t.stallMs, outputTokens: t.outputTokens, cacheReadTokens: t.cacheReadTokens, summary };
   });
   const housekeeping = rows.filter(r => r.label === "housekeeping");
   const core = rows.filter(r => r.label !== "housekeeping");
@@ -301,6 +321,6 @@ export function attribute(jsonlPath: string, task: string, totalCostUsd: number 
   const res = classifyTurns(walk, task, model);
   if (!res) return null;
   const a = rollup(walk, res.labels, res.modelUsed, res.analystCostUsd);
-  log(`[${tag}] Attribution: core ${formatCost(a.core.costUsd)} / ${formatDuration(a.core.durationMs)} (${a.core.turns} msgs); housekeeping ${formatCost(a.housekeeping.costUsd)} / ${formatDuration(a.housekeeping.durationMs)} (${a.housekeeping.turns} msgs); analyst ${formatCost(res.analystCostUsd)} via ${res.modelUsed}${a.outputExact ? "" : "; per-message output estimated"}`);
+  log(`[${tag}] Attribution: core ${formatCost(a.core.costUsd)} / ${formatDuration(a.core.durationMs)} (${a.core.turns} msgs); housekeeping ${formatCost(a.housekeeping.costUsd)} / ${formatDuration(a.housekeeping.durationMs)} (${a.housekeeping.turns} msgs)${a.raw.stallMs > 0 ? `; stalled ${formatDuration(a.raw.stallMs)} (machine sleep or API outage, excluded)` : ""}; analyst ${formatCost(res.analystCostUsd)} via ${res.modelUsed}${a.outputExact ? "" : "; per-message output estimated"}`);
   return a;
 }

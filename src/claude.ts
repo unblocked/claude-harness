@@ -65,6 +65,50 @@ export function parseStreamJson(jsonl: string): ParsedStream {
   let totalCostUsd: number | null = null;
   let cliDurationMs: number | null = null;
 
+  // Per-segment result state (see the result handling below).
+  let segLast: Record<string, ModelUsage> | null = null;
+  let segFallback: TokenUsage | null = null;
+  let segCost: number | null = null;
+  const addFallback = (acc: TokenUsage | null, u: Record<string, number>): TokenUsage => ({
+    inputTokens: (acc?.inputTokens ?? 0) + (u.input_tokens ?? 0), outputTokens: (acc?.outputTokens ?? 0) + (u.output_tokens ?? 0),
+    cacheReadTokens: (acc?.cacheReadTokens ?? 0) + (u.cache_read_input_tokens ?? 0), cacheCreationTokens: (acc?.cacheCreationTokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
+  });
+  const flushSegment = () => {
+    if (segLast) {
+      const byModel: Record<string, TokenUsage> = usage.byModel ?? {};
+      for (const [model, mu] of Object.entries(segLast)) {
+        const m: TokenUsage = {
+          inputTokens: mu.inputTokens ?? 0,
+          outputTokens: mu.outputTokens ?? 0,
+          cacheReadTokens: mu.cacheReadInputTokens ?? 0,
+          cacheCreationTokens: mu.cacheCreationInputTokens ?? 0,
+          ...(typeof mu.costUSD === "number" ? { costUsd: mu.costUSD } : {}),
+          ...(typeof mu.thinkingTokens === "number" ? { thinkingTokens: mu.thinkingTokens } : {}),
+        };
+        const prev = byModel[model];
+        byModel[model] = prev ? {
+          inputTokens: prev.inputTokens + m.inputTokens, outputTokens: prev.outputTokens + m.outputTokens,
+          cacheReadTokens: prev.cacheReadTokens + m.cacheReadTokens, cacheCreationTokens: prev.cacheCreationTokens + m.cacheCreationTokens,
+          ...((prev.costUsd ?? m.costUsd) !== undefined ? { costUsd: (prev.costUsd ?? 0) + (m.costUsd ?? 0) } : {}),
+          ...((prev.thinkingTokens ?? m.thinkingTokens) !== undefined ? { thinkingTokens: (prev.thinkingTokens ?? 0) + (m.thinkingTokens ?? 0) } : {}),
+        } : m;
+        usage.inputTokens += m.inputTokens;
+        usage.outputTokens += m.outputTokens;
+        usage.cacheReadTokens += m.cacheReadTokens;
+        usage.cacheCreationTokens += m.cacheCreationTokens;
+      }
+      usage.byModel = byModel;
+    } else if (segFallback) {
+      // Transcripts without modelUsage: main model only.
+      usage.inputTokens += segFallback.inputTokens;
+      usage.outputTokens += segFallback.outputTokens;
+      usage.cacheReadTokens += segFallback.cacheReadTokens;
+      usage.cacheCreationTokens += segFallback.cacheCreationTokens;
+    }
+    if (segCost !== null) totalCostUsd = (totalCostUsd ?? 0) + segCost;
+    segLast = null; segFallback = null; segCost = null;
+  };
+
   for (const e of events) {
     const eventMs = typeof e?.timestamp === "string" ? Date.parse(e.timestamp) : NaN;
 
@@ -110,45 +154,27 @@ export function parseStreamJson(jsonl: string): ParsedStream {
       if (e.session_id) sessionId = e.session_id;
     }
 
-    // A transcript may hold several result events (a draft pass and a resumed
-    // fix pass): everything here accumulates across them.
+    // Result events. One CLI process can emit several (a resumed session
+    // first flushes pending task notifications as an empty turn, and each
+    // wake-up ends in its own result); within a process total_cost_usd and
+    // modelUsage are cumulative, duration_ms and usage are per turn. A
+    // transcript may also concatenate several processes (draft pass, fix
+    // passes), separated by harness session_start markers. So: the last
+    // result in each segment carries that segment's cost and usage; segments
+    // are summed.
+    if (e?.type === "harness" && e?.subtype === "session_start") {
+      flushSegment();
+      continue;
+    }
     if (e?.type === "result") {
-      if (e.modelUsage && typeof e.modelUsage === "object") {
-        const byModel: Record<string, TokenUsage> = usage.byModel ?? {};
-        for (const [model, mu] of Object.entries(e.modelUsage as Record<string, ModelUsage>)) {
-          const m: TokenUsage = {
-            inputTokens: mu.inputTokens ?? 0,
-            outputTokens: mu.outputTokens ?? 0,
-            cacheReadTokens: mu.cacheReadInputTokens ?? 0,
-            cacheCreationTokens: mu.cacheCreationInputTokens ?? 0,
-            ...(typeof mu.costUSD === "number" ? { costUsd: mu.costUSD } : {}),
-            ...(typeof mu.thinkingTokens === "number" ? { thinkingTokens: mu.thinkingTokens } : {}),
-          };
-          const prev = byModel[model];
-          byModel[model] = prev ? {
-            inputTokens: prev.inputTokens + m.inputTokens, outputTokens: prev.outputTokens + m.outputTokens,
-            cacheReadTokens: prev.cacheReadTokens + m.cacheReadTokens, cacheCreationTokens: prev.cacheCreationTokens + m.cacheCreationTokens,
-            ...((prev.costUsd ?? m.costUsd) !== undefined ? { costUsd: (prev.costUsd ?? 0) + (m.costUsd ?? 0) } : {}),
-            ...((prev.thinkingTokens ?? m.thinkingTokens) !== undefined ? { thinkingTokens: (prev.thinkingTokens ?? 0) + (m.thinkingTokens ?? 0) } : {}),
-          } : m;
-          usage.inputTokens += m.inputTokens;
-          usage.outputTokens += m.outputTokens;
-          usage.cacheReadTokens += m.cacheReadTokens;
-          usage.cacheCreationTokens += m.cacheCreationTokens;
-        }
-        usage.byModel = byModel;
-      } else if (e.usage) {
-        // Fallback for transcripts without modelUsage: main model only.
-        usage.inputTokens += e.usage.input_tokens ?? 0;
-        usage.outputTokens += e.usage.output_tokens ?? 0;
-        usage.cacheReadTokens += e.usage.cache_read_input_tokens ?? 0;
-        usage.cacheCreationTokens += e.usage.cache_creation_input_tokens ?? 0;
-      }
-      if (typeof e.total_cost_usd === "number") totalCostUsd = (totalCostUsd ?? 0) + e.total_cost_usd;
+      if (e.modelUsage && typeof e.modelUsage === "object") segLast = e.modelUsage as Record<string, ModelUsage>;
+      else if (e.usage) segFallback = addFallback(segFallback, e.usage);
+      if (typeof e.total_cost_usd === "number") segCost = e.total_cost_usd;
       if (typeof e.duration_ms === "number") cliDurationMs = (cliDurationMs ?? 0) + e.duration_ms;
       if (e.session_id) sessionId = e.session_id;
     }
   }
+  flushSegment();
 
   return { tokenUsage: usage, toolCalls, assistantTurns: messageIds.size, finalResponse, sessionId, totalCostUsd, cliDurationMs };
 }

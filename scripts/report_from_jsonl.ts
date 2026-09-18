@@ -10,7 +10,7 @@ import path from "node:path";
 import { parseStreamJson } from "../src/claude.ts";
 import { printReport, writeHtmlReport, writeJsonResult } from "../src/report.ts";
 import { estimateCost } from "../src/util.ts";
-import { attribute } from "../src/attribution.ts";
+import { attribute, buildWalk, rollup } from "../src/attribution.ts";
 import { assessQuality } from "../src/quality.ts";
 import { assessImpact } from "../src/impact.ts";
 import { economics } from "../src/economics.ts";
@@ -118,10 +118,17 @@ const task = orig?.task ?? (taskArg.join(" ") || "(task not recorded in transcri
 const repo = orig?.repo ?? repoFromCwd(init.cwd) ?? "(from transcripts)";
 const baseline = arm("baseline", baseFile, model, orig?.baseline);
 const unblocked = arm("unblocked", ubFile, model, orig?.unblocked);
-if (attrModel) {
-  for (const a of [baseline, unblocked]) {
+for (const a of [baseline, unblocked]) {
+  if (attrModel) {
     const attr = attribute(a.run.jsonlPath, task, a.run.totalCostUsd ?? a.estimatedCost, attrModel, a.condition);
     if (attr) a.attribution = attr;
+  } else if (a.attribution) {
+    // Keep the analyst's labels, recompute the per-message numbers (cost,
+    // windows, stalls) from the transcript with the current code.
+    const walk = buildWalk(fs.readFileSync(a.run.jsonlPath, "utf8"), a.run.totalCostUsd ?? a.estimatedCost);
+    const labels = a.attribution.turns.map(t => ({ turn: t.turn, label: t.label, repeatOf: t.repeatOf, reason: t.reason }));
+    if (walk.length === a.attribution.turns.length) a.attribution = rollup(walk, labels, a.attribution.analystModel, a.attribution.analystCostUsd);
+    else console.error(`[${a.condition}] transcript has ${walk.length} messages, stored attribution ${a.attribution.turns.length}; keeping stored numbers`);
   }
 }
 

@@ -76,6 +76,7 @@ export interface AttributionTotals {
   durationMs: number;    // modelMs + toolMs
   modelMs: number;       // generation incl. thinking
   toolMs: number;        // waiting on tool results
+  stallMs: number;       // excluded from durationMs: machine sleep or API outage during a model wait
   turns: number;         // API messages
   outputTokens: number;
   cacheReadTokens: number;
@@ -87,6 +88,7 @@ export interface AttributedTurn extends TurnLabel {
   durationMs: number;
   modelMs: number;
   toolMs: number;
+  stallMs: number;
   outputTokens: number;
   cacheReadTokens: number;
   summary: string;

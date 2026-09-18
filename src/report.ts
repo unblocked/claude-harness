@@ -91,6 +91,14 @@ function coreToolTimeMs(arm: ArmResult): number { return arm.attribution ? arm.a
 function coreModelTimeMs(arm: ArmResult): number { return arm.attribution ? arm.attribution.core.modelMs : modelTimeMs(arm); }
 
 // Short description of what the housekeeping turns were, for the summary line.
+// Wall time inside a model wait that no model call can account for (the
+// machine slept, or the API was down): excluded from every time figure.
+function stallNote(b: ArmResult, u: ArmResult): string {
+  const bs = b.attribution?.raw.stallMs ?? 0, us = u.attribution?.raw.stallMs ?? 0;
+  if (bs <= 0 && us <= 0) return "";
+  return `<div class="section-note">Stalled time excluded from all figures: baseline ${formatDuration(bs)}, with Unblocked ${formatDuration(us)}. A model wait longer than five minutes is the machine asleep or the API down, not generation.</div>`;
+}
+
 function housekeepingKinds(arm: ArmResult): string {
   const a = arm.attribution;
   if (!a) return "";
@@ -247,6 +255,7 @@ export function printReport(result: ComparisonResult): void {
       r(`  ${"─".repeat(W - 2)}`),
       r(`  ${padRight("Baseline", 28)}${padLeft(String(b.attribution.housekeeping.turns), 4)} turns  ${padLeft(formatCost(b.attribution.housekeeping.costUsd), 9)}  ${padLeft(formatDuration(b.attribution.housekeeping.durationMs), 8)}  ${housekeepingKinds(b).slice(0, 40)}`),
       r(`  ${padRight("Unblocked", 28)}${padLeft(String(u.attribution.housekeeping.turns), 4)} turns  ${padLeft(formatCost(u.attribution.housekeeping.costUsd), 9)}  ${padLeft(formatDuration(u.attribution.housekeeping.durationMs), 8)}  ${housekeepingKinds(u).slice(0, 40)}`),
+      ...((b.attribution.raw.stallMs > 0 || u.attribution.raw.stallMs > 0) ? [r(`  ${padRight("Stalled (excluded)", 28)}${padLeft(formatDuration(b.attribution.raw.stallMs), 10)}  →  ${padLeft(formatDuration(u.attribution.raw.stallMs), 10)}   machine sleep or API outage`)] : []),
       r(`  ${padRight("Raw totals (incl. hk)", 28)}${padLeft(formatCost(b.estimatedCost), 10)}  →  ${padLeft(formatCost(u.estimatedCost), 10)}   ${padLeft(formatDuration(b.run.durationMs), 8)} → ${formatDuration(u.run.durationMs)}`),
     ] : [
       r("  COMPARISON (raw; run with attribution for the core/housekeeping split)"),
@@ -945,6 +954,7 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
         </tbody>
       </table>
     </div>
+    ${stallNote(b, u)}
     <details class="ledger"><summary>Excluded turns, with reasons</summary>
       ${housekeepingLedger("Baseline", b)}
       ${housekeepingLedger("With Unblocked", u)}

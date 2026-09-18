@@ -72,7 +72,7 @@ function toolWaitByCategory(arm: ArmResult): Record<string, number> {
 function armSide(arm: ArmResult) {
   const a = arm.attribution;
   const u = arm.run.tokenUsage;
-  const totals = a ? a.core : { costUsd: arm.estimatedCost, durationMs: arm.run.durationMs, modelMs: 0, toolMs: 0, turns: arm.run.assistantTurns, outputTokens: u.outputTokens, cacheReadTokens: u.cacheReadTokens };
+  const totals = a ? a.core : { costUsd: arm.estimatedCost, durationMs: arm.run.durationMs, modelMs: 0, toolMs: 0, stallMs: 0, turns: arm.run.assistantTurns, outputTokens: u.outputTokens, cacheReadTokens: u.cacheReadTokens };
   const models = Object.entries(u.byModel ?? {});
   const thinking = models.reduce((s, [, m]) => s + (m.thinkingTokens ?? 0), 0);
   const scale = u.outputTokens > 0 ? totals.outputTokens / u.outputTokens : 1; // core share of the run's output
