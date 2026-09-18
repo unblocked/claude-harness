@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import type { ArmResult, ComparisonResult, Condition, QualityAssessment, ReviewSpec } from "./types.ts";
+import type { ArmResult, ComparisonResult, Condition, DecisiveDiscovery, QualityAssessment, ReviewSpec } from "./types.ts";
 import { formatCost, log } from "./util.ts";
 import { neutralise, runStructured, VERIFY_CMD } from "./analyst.ts";
 
@@ -129,13 +129,21 @@ const SCHEMA = {
       type: "array",
       items: { type: "object", properties: { arm: { type: "string", enum: ["A", "B"] }, finding: { type: "string" }, evidence: { type: "string" } }, required: ["arm", "finding", "evidence"] },
     },
+    discoveries: {
+      type: "object",
+      properties: {
+        A: { type: "object", properties: { kind: { type: "string", enum: ["none", "improved-outcome", "invalidated-requirement"] }, fact: { type: "string" }, effect: { type: "string" }, evidence: { type: "string" }, requirementIndex: { type: "integer" } }, required: ["kind", "fact", "effect", "evidence", "requirementIndex"] },
+        B: { type: "object", properties: { kind: { type: "string", enum: ["none", "improved-outcome", "invalidated-requirement"] }, fact: { type: "string" }, effect: { type: "string" }, evidence: { type: "string" }, requirementIndex: { type: "integer" } }, required: ["kind", "fact", "effect", "evidence", "requirementIndex"] },
+      },
+      required: ["A", "B"],
+    },
     verdict: {
       type: "object",
       properties: { better: { type: "string", enum: ["A", "B", "tie"] }, rationale: { type: "string" } },
       required: ["better", "rationale"],
     },
   },
-  required: ["requirements", "criteria", "findings", "verdict"],
+  required: ["requirements", "criteria", "findings", "discoveries", "verdict"],
 };
 
 function judgePrompt(task: string, first: ArmResult, second: ArmResult, spec: ReviewSpec | undefined): string {
@@ -155,12 +163,17 @@ ${step1}
 2. Score each agent 1 to 5 on each criterion below, rationale ≤ 15 words naming concrete evidence. Use the full range.
 ${CRITERIA.map(c => `   - ${c.key}: ${c.text}`).join("\n")}
 3. List at most 4 findings a reviewer would need, each ≤ 20 words, tied to one agent with evidence ≤ 15 words. Prefer claims the diff or verification record contradicts, and defects the change introduces within the requirements' scope.
-4. verdict: which agent's result is better, decided in this order and no other:
-   (a) requirements: the agent that meets more of them, or meets them more fully, wins;
+4. discoveries: for each agent, at most one decisive discovery, or "none". A discovery is decisive only if it changed the outcome, in one of two ways:
+   - "improved-outcome": the agent found a fact (a convention, a prior decision, an incident, a code path, a constraint) and because of it the delivered change is materially better in outcome than it would otherwise be, beyond what the requirements ask. The effect must be visible in the diff and named concretely ("prevents a duplicate reply on redelivery", not "more robust"). Finding a fact, citing it, or confirming a fix that would have been the same anyway does not qualify.
+   - "invalidated-requirement": the agent produced strong contradictory evidence that a numbered requirement is wrong, unreachable under the task's trigger, or harmful to implement in this codebase. Set requirementIndex to that requirement's number. When either agent has one, treat that requirement as not applying to BOTH agents: grade it "met" for both in step 1 with the evidence "invalidated by Agent X: <fact>", and do not count implementing it as a defect unless the implementation itself broke something.
+   Set requirementIndex to 0 when not applicable. fact ≤ 20 words, effect ≤ 20 words, evidence ≤ 15 words citing the diff, response or verification record.
+5. verdict: which agent's result is better, decided in this order and no other:
+   (a) requirements, after any invalidation: the agent that meets more of them, or meets them more fully, wins;
    (b) if requirements are equal: an agent whose change introduces a defect in the required behaviour, or a regression in the code it touches, loses to one that does not;
-   (c) if still equal: hygiene, only when the difference is material (vendored bulk, generated junk, changes to unrelated files);
-   (d) otherwise "tie".
-   Things that never decide the verdict: hardening of cases the task did not name, extra experiments or checks beyond verifying the required behaviour, deployment or rollout notes, self-review passes, the length or polish of the write-up, the size of the diff by itself. A "tie" is the expected verdict when both agents meet every requirement without introducing a defect. The rationale, ≤ 2 sentences, must name the requirement or the introduced defect that decided it.
+   (c) if still equal: an agent with a decisive discovery beats one with "none"; if both or neither have one, this step decides nothing;
+   (d) if still equal: hygiene, only when the difference is material (vendored bulk, generated junk, changes to unrelated files);
+   (e) otherwise "tie".
+   Things that never decide the verdict: hardening of cases the task did not name, extra experiments or checks beyond verifying the required behaviour, deployment or rollout notes, self-review passes, the length or polish of the write-up, the size of the diff by itself. The rationale, ≤ 2 sentences, must name the requirement, the introduced defect, or the decisive discovery that decided it, or say that nothing did.
 
 Be even-handed. A larger diff is not better. More words are not better. More work is not better. A wrong answer stated confidently is worse than a right answer with caveats.
 
@@ -177,6 +190,7 @@ type Raw = {
   requirements: { index: number; requirement: string; A: { status: "met" | "partial" | "unmet"; evidence: string }; B: { status: "met" | "partial" | "unmet"; evidence: string } }[];
   criteria: { key: string; A: { score: number; rationale: string }; B: { score: number; rationale: string } }[];
   findings: { arm: "A" | "B"; finding: string; evidence: string }[];
+  discoveries: { A: DecisiveDiscovery; B: DecisiveDiscovery };
   verdict: { better: "A" | "B" | "tie"; rationale: string };
 };
 
@@ -217,6 +231,10 @@ export async function assessQuality(result: ComparisonResult, model: string): Pr
     findings: raw.findings.map(f => ({ arm: cond(f.arm), finding: unblind(f.finding), evidence: unblind(f.evidence) })),
     verdict: { better: raw.verdict.better === "tie" ? "tie" : cond(raw.verdict.better), rationale: unblind(raw.verdict.rationale) },
   };
+  if (raw.discoveries) {
+    const disc = (d: DecisiveDiscovery): DecisiveDiscovery => ({ kind: d.kind, fact: unblind(d.fact), effect: unblind(d.effect), evidence: unblind(d.evidence), ...(d.kind === "invalidated-requirement" && (d.requirementIndex ?? 0) > 0 ? { requirementIndex: (d.requirementIndex ?? 0) - 1 } : {}) });
+    q.discoveries = { baseline: disc(pick(raw.discoveries, "baseline")), unblocked: disc(pick(raw.discoveries, "unblocked")) };
+  }
   log(`Quality: verdict ${q.verdict.better}; judge ${formatCost(q.judgeCostUsd)} via ${res.modelUsed}`);
   return q;
 }

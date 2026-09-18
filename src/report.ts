@@ -293,6 +293,7 @@ export function printReport(result: ComparisonResult): void {
       r("  3 · QUALITY  (blinded judge)"),
       r(`  ${"─".repeat(W - 2)}`),
       r(`  ${padRight("Verdict", 28)}${result.quality.verdict.better}`),
+      ...(result.quality.discoveries ? (["baseline", "unblocked"] as const).filter(a => result.quality!.discoveries![a].kind !== "none").map(a => r(`  ${padRight("  decisive discovery", 28)}${a}: ${result.quality!.discoveries![a].kind} — ${result.quality!.discoveries![a].fact.slice(0, 40)}`)) : []),
       ...result.quality.criteria.map(c => r(`  ${padRight("  " + c.criterion, 28)}${padLeft(String(c.baseline.score), 10)}  →  ${padLeft(String(c.unblocked.score), 10)}  / 5`)),
       r(`  ${padRight("Requirements met", 28)}${padLeft(result.quality.requirements.filter(x => x.baseline.status === "met").length + "/" + result.quality.requirements.length, 10)}  →  ${padLeft(result.quality.requirements.filter(x => x.unblocked.status === "met").length + "/" + result.quality.requirements.length, 10)}`),
     ] : []),
@@ -1024,11 +1025,17 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   ${result.quality ? `
   <div class="section">
     <div class="section-title">3 · Quality analysis <span class="section-sub">blinded judge: ${escapeHtml(result.quality.judgeModel)}</span></div>
-    <div class="section-note">Blinded judge: saw task, final responses, tests run, diffs and the checker's final record as A/B in random order. Grades the same requirement list as the checker. The verdict is decided by requirements met, then by defects the change introduces within that scope, then by material hygiene; work beyond the task does not count, and a tie is the expected result when both meet every requirement.</div>
+    <div class="section-note">Blinded judge: saw task, final responses, tests run, diffs and the checker's final record as A/B in random order. Grades the same requirement list as the checker. The verdict is decided by requirements met, then by defects the change introduces within that scope, then by a decisive discovery (a fact that materially improved the delivered outcome, or invalidated a requirement for both agents), then by material hygiene; other work beyond the task does not count.</div>
     <div class="verdict ${result.quality.verdict.better === "unblocked" ? "positive" : result.quality.verdict.better === "baseline" ? "negative" : ""}">
       <div class="verdict-head">Verdict: ${result.quality.verdict.better === "tie" ? "tie" : result.quality.verdict.better === "unblocked" ? "With Unblocked" : "Baseline"}</div>
       <div>${escapeHtml(result.quality.verdict.rationale)}</div>
     </div>
+    ${result.quality.discoveries ? `<div class="findings" style="margin-bottom: 16px;">${(["baseline", "unblocked"] as const).map(a => {
+      const d = result.quality!.discoveries![a];
+      const label = a === "baseline" ? "Baseline" : "With Unblocked";
+      if (d.kind === "none") return `<div class="finding"><b>${label}</b> · decisive discovery: none</div>`;
+      return `<div class="finding"><b>${label}</b> · decisive discovery: <span class="met met-met">${d.kind === "improved-outcome" ? "improved the outcome" : `invalidated requirement ${(d.requirementIndex ?? 0) + 1} for both agents`}</span><div style="margin-top: 4px;">${escapeHtml(d.fact)} &rarr; ${escapeHtml(d.effect)}</div><div class="evidence">${escapeHtml(d.evidence)}</div></div>`;
+    }).join("")}</div>` : ""}
     <div class="tool-table-wrap" style="margin-bottom: 16px;">
       <table class="tool-table">
         <thead><tr><th>Requirement from the task</th><th>Baseline</th><th>With Unblocked</th></tr></thead>

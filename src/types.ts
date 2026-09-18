@@ -139,9 +139,23 @@ export interface QualityCriterion {
 // Blinded judgement of the two arms' output: requirements coverage, scored
 // criteria, notable findings and a verdict. The judge sees arms as A and B in
 // random order; the result is un-blinded before it is stored.
+// A discovery that changed the outcome: either the delivered change is
+// materially better because of a fact the agent found (beyond the
+// requirements), or the fact invalidates a requirement, in which case the
+// judge grades both agents without it. "none" when nothing the agent found
+// changed the outcome, however interesting.
+export interface DecisiveDiscovery {
+  kind: "none" | "improved-outcome" | "invalidated-requirement";
+  fact: string;
+  effect: string;
+  evidence: string;
+  requirementIndex?: number;   // for invalidated-requirement: position in the shared list
+}
+
 export interface QualityAssessment {
   judgeModel: string;
   judgeCostUsd: number;
+  discoveries?: { baseline: DecisiveDiscovery; unblocked: DecisiveDiscovery };
   // Which arm was shown as "Agent A" (random per run), so a blinding failure can be audited.
   armA?: Condition;
   requirements: QualityRequirement[];
