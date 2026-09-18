@@ -91,7 +91,7 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
     estimatedCost: cost,
     // Carried over unless --attribute recomputes it; the analyst call is the slow part.
     attribution: orig?.attribution,
-    review: orig?.review ? reparseReview(orig.review, jsonlPath, model) : undefined,
+    review: orig?.review ? reparseReview(orig.review, file, model) : undefined,
   };
 }
 
