@@ -204,8 +204,11 @@ TASK:
 // starts (the fix may already have landed). Fetch, compare, and say so.
 function warnIfBehindUpstream(repo: string, branch: string): void {
   if (tryGit(repo, ["fetch", "--quiet", "origin"], "fetching origin to check the base") === null) return;
-  const upstream = tryGit(repo, ["rev-parse", "--abbrev-ref", `${branch}@{upstream}`], "resolving upstream")?.trim()
-    ?? (tryGit(repo, ["rev-parse", "--verify", "--quiet", "origin/main"], "checking origin/main") ? "origin/main" : null);
+  // A remote-tracking base (origin/main) is the tip after the fetch; nothing to compare.
+  if (/^(origin|refs\/remotes)\//.test(branch)) return;
+  let upstream: string | null = null;
+  try { upstream = git(repo, ["rev-parse", "--abbrev-ref", `${branch}@{upstream}`]).trim(); } catch { /* no upstream configured */ }
+  upstream ??= tryGit(repo, ["rev-parse", "--verify", "--quiet", "origin/main"], "checking origin/main") ? "origin/main" : null;
   if (!upstream) return;
   const behind = parseInt(tryGit(repo, ["rev-list", "--count", `${branch}..${upstream}`], "counting commits behind upstream")?.trim() ?? "0", 10) || 0;
   if (behind > 0) log(`⚠ Base ${branch} is ${behind} commit(s) behind ${upstream}. If the task's fix has already landed upstream, both arms will find it and the comparison measures something else. Pass --branch ${upstream} to run against the tip.`);
