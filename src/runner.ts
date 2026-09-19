@@ -1,36 +1,43 @@
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import type { ArmResult, ComparisonResult, Condition, Config, DiffStats, UnblockedCall } from "./types.ts";
+import type { ArmResult, ComparisonResult, Condition, Config, DiffStats, ReviewPass, ReviewRound, ReviewSpec, RunResult, TokenUsage, UnblockedCall } from "./types.ts";
 import { runClaude, createWorktree, removeWorktree } from "./claude.ts";
-import { printReport, writeJsonResult, writeHtmlReport } from "./report.ts";
+import { printReport, writeJsonResult, writeHtmlReport, writeBatchSummary } from "./report.ts";
 import { estimateCost, formatCost, formatDiffSummary, formatDuration, log } from "./util.ts";
-import { commitsBetween, git, isAncestor, refsContaining, snapshotRefs, tryGit } from "./git.ts";
+import { git, isAncestor, snapshotRefs, tryGit } from "./git.ts";
+import { attribute } from "./attribution.ts";
+import { applyTieBreaker, assessQuality } from "./quality.ts";
+import { assessImpact } from "./impact.ts";
+import { economics } from "./economics.ts";
+import { adjudicateDisputes, applyWaivers, disputedSection, extractRequirements, fixPrompt, reviewDraft } from "./review.ts";
 
-// The most recent commit in this worktree's HEAD reflog that descends from the
-// base and is not already part of history that existed before the run. Used only
-// when HEAD itself is not ahead of the base — i.e. the agent committed somewhere
-// and then checked the base back out, or reset away from its work.
-//
-// "Already existed" is decided by asking which refs contain the candidate and
-// whether any of them still sits at its pre-run sha: a pre-existing branch the
-// agent merely checked out to read is excluded; one it committed onto has moved
-// and so counts. Most recent wins, so history the agent deliberately reset away
-// from is not preferred over its later work.
-export function findAgentTip(cwd: string, baseSha: string, refsBefore: Map<string, string> | null): { sha: string; commits: number } | null {
-  const reflog = tryGit(cwd, ["reflog", "show", "--format=%H", "HEAD"], "reading worktree reflog");
-  if (reflog === null) return null;
-  for (const raw of reflog.split("\n")) {
+// The commits the agent made: everything reachable from any commit this
+// worktree's HEAD ever pointed at (its reflog, plus HEAD now) that was not
+// already reachable from a ref when the run started. Checking out a
+// pre-existing branch contributes nothing; committing onto one contributes the
+// new commits; committing then resetting or switching away still contributes.
+export function agentCommits(cwd: string, baseSha: string, refsBefore: Map<string, string> | null): Set<string> {
+  const heads = new Set<string>();
+  const head = tryGit(cwd, ["rev-parse", "HEAD"], "resolving HEAD")?.trim();
+  if (head) heads.add(head);
+  for (const sha of (tryGit(cwd, ["reflog", "show", "--format=%H", "HEAD"], "reading worktree reflog") ?? "").split("\n")) if (sha.trim()) heads.add(sha.trim());
+  if (heads.size === 0) return new Set();
+  // Exclude everything reachable from a pre-run ref, and from any remote-tracking
+  // ref as it stands now: an agent that fetches during its run pulls in upstream
+  // commits that were not in the snapshot, and those are not its work either.
+  const remoteTips = (tryGit(cwd, ["for-each-ref", "--format=%(objectname)", "refs/remotes"], "listing remote refs") ?? "").split("\n").map(l => l.trim()).filter(Boolean);
+  const exclude = new Set<string>([baseSha, ...(refsBefore ? refsBefore.values() : []), ...remoteTips]);
+  const out = tryGit(cwd, ["rev-list", ...heads, "--not", ...exclude], "listing agent commits");
+  return new Set((out ?? "").split("\n").map(l => l.trim()).filter(Boolean));
+}
+
+// Most recent reflog entry that is an agent commit descending from the base.
+function latestAgentTip(cwd: string, baseSha: string, agent: Set<string>): string | null {
+  for (const raw of (tryGit(cwd, ["reflog", "show", "--format=%H", "HEAD"], "reading worktree reflog") ?? "").split("\n")) {
     const sha = raw.trim();
-    if (!sha || sha === baseSha || !isAncestor(cwd, baseSha, sha)) continue;
-    if (refsBefore) {
-      const containing = refsContaining(cwd, sha);
-      const preExisting = [...containing].some(([ref, tip]) => refsBefore.get(ref) === tip);
-      if (preExisting) continue;
-    }
-    const commits = commitsBetween(cwd, baseSha, sha);
-    if (commits > 0) return { sha, commits };
+    if (sha && agent.has(sha) && isAncestor(cwd, baseSha, sha)) return sha;
   }
   return null;
 }
@@ -50,50 +57,60 @@ function numstatTotals(numstat: string): { files: number; added: number; removed
 }
 
 // Everything the agent changed relative to the commit the worktree started from.
-//
-// Exactly one of two views is reported, never both, so nothing is counted twice:
-//   - the working tree vs the base, when HEAD is at or ahead of the base (the
-//     normal case: commits plus whatever is still uncommitted, plus untracked);
-//   - the reflog tip vs the base, when the agent committed and then moved HEAD
-//     back off that work. Anything uncommitted on top of the moved HEAD is not
-//     included; it is logged instead.
-// Line counts come from --numstat, which stays small however big the change is;
-// the diff text is captured separately and marked truncated if it will not fit.
-export function captureDiff(cwd: string, baseSha: string, refsBefore: Map<string, string> | null): Captured {
-  const empty = (diff: string): Captured => ({ diff, stats: { filesChanged: 0, linesAdded: 0, linesRemoved: 0, commits: 0 } });
+// Exactly one view is reported, never two concatenated:
+//   - HEAD is an agent commit (or the base) → the working tree vs the base:
+//     the agent's commits plus whatever is still uncommitted, plus untracked;
+//   - HEAD is some pre-existing commit (the agent checked out another branch)
+//     → the working tree vs HEAD if it is dirty, else the latest agent commit
+//     found in the reflog vs the base, else nothing.
+// Commit count is the number of agent commits reachable from the reported
+// view. Line counts come from --numstat; the diff text is captured separately
+// and replaced by a summary when it will not fit.
+export function captureDiff(cwd: string, baseSha: string, refsBefore: Map<string, string> | null): Captured & { agent: Set<string> } {
+  const agent = agentCommits(cwd, baseSha, refsBefore);
+  const fail = (diff: string): Captured & { agent: Set<string> } => ({ diff, stats: { filesChanged: 0, linesAdded: 0, linesRemoved: 0, commits: 0 }, agent });
 
   const head = tryGit(cwd, ["rev-parse", "HEAD"], "resolving HEAD for diff capture")?.trim();
-  if (!head) return empty("(failed to capture diff)");
+  if (!head) return fail("(failed to capture diff)");
+  const dirty = (tryGit(cwd, ["status", "--porcelain"], "checking working tree") ?? "").trim().length > 0;
+  const countIn = (tip: string) => (tryGit(cwd, ["rev-list", `${baseSha}..${tip}`], "counting agent commits") ?? "").split("\n").filter(l => agent.has(l.trim())).length;
 
   let range: string[];
   let commits: number;
   let includeWorkingTree: boolean;
-  if (head !== baseSha && isAncestor(cwd, baseSha, head)) {
-    range = [baseSha]; commits = commitsBetween(cwd, baseSha, head); includeWorkingTree = true;
+  if (agent.has(head)) {
+    // HEAD is the agent's own commit: working tree vs base covers commits + uncommitted.
+    range = [baseSha]; commits = countIn(head); includeWorkingTree = true;
+  } else if (dirty) {
+    // HEAD is the base or some pre-existing commit and the tree is dirty: the tree is the latest state.
+    if (agent.size) log(`Worktree HEAD ${head.slice(0, 7)} is not an agent commit and the tree is dirty; reporting uncommitted changes (${agent.size} agent commit(s) in the reflog are not in the diff)`);
+    range = [head]; commits = 0; includeWorkingTree = true;
   } else {
-    const tip = findAgentTip(cwd, baseSha, refsBefore);
-    if (tip) {
-      range = [baseSha, tip.sha]; commits = tip.commits; includeWorkingTree = false;
-      const dirty = (tryGit(cwd, ["status", "--porcelain"], "checking working tree") ?? "").trim();
-      if (dirty) log(`Worktree has uncommitted changes on top of ${head.slice(0, 7)} that are not in the captured diff (agent's committed work at ${tip.sha.slice(0, 7)} is)`);
-    } else {
-      range = [baseSha]; commits = 0; includeWorkingTree = true;
-    }
+    // Clean tree at a non-agent commit: the agent's work, if any, is a commit it moved away from.
+    const tip = latestAgentTip(cwd, baseSha, agent);
+    if (tip) { range = [baseSha, tip]; commits = countIn(tip); includeWorkingTree = false; }
+    else { range = [head]; commits = 0; includeWorkingTree = true; }
   }
 
   const numstat = tryGit(cwd, ["diff", "--numstat", ...range], "computing diff stats");
-  if (numstat === null) return empty("(failed to capture diff)");
+  if (numstat === null) return fail("(failed to capture diff)");
   const totals = numstatTotals(numstat);
 
+  // --no-index exits 1 when the files differ (always, against /dev/null); anything else is a real failure.
+  const noIndex = (file: string, extra: string[]): string | null => {
+    try { git(cwd, ["diff", "--no-index", ...extra, "/dev/null", file]); return ""; } catch (e) {
+      const err = e as { status?: number | null; code?: string; stdout?: Buffer };
+      if (err.status === 1) return err.stdout?.toString() ?? "";
+      log(`git diff --no-index failed for ${file}: ${err.code ?? `exit ${err.status}`}`);
+      return null;
+    }
+  };
   const untracked = includeWorkingTree
-    ? (tryGit(cwd, ["ls-files", "--others", "--exclude-standard"], "listing untracked files") ?? "").split("\n").map(f => f.trim()).filter(Boolean)
+    ? (tryGit(cwd, ["ls-files", "-z", "--others", "--exclude-standard"], "listing untracked files") ?? "").split("\0").filter(Boolean)
     : [];
   for (const file of untracked) {
-    // exit code 1 is normal for --no-index when files differ, so don't go through tryGit
-    try { git(cwd, ["diff", "--no-index", "--numstat", "/dev/null", file]); } catch (e) {
-      const out = (e as { stdout?: Buffer }).stdout?.toString() ?? "";
-      const t = numstatTotals(out); totals.files += t.files; totals.added += t.added; totals.removed += t.removed;
-    }
+    const t = numstatTotals(noIndex(file, ["--numstat"]) ?? "");
+    totals.files += t.files; totals.added += t.added; totals.removed += t.removed;
   }
 
   const stats: DiffStats = { filesChanged: totals.files, linesAdded: totals.added, linesRemoved: totals.removed, commits };
@@ -101,21 +118,28 @@ export function captureDiff(cwd: string, baseSha: string, refsBefore: Map<string
   let text: string;
   try {
     text = git(cwd, ["diff", ...range]);
-    for (const file of untracked) {
-      try { git(cwd, ["diff", "--no-index", "/dev/null", file]); } catch (e) {
-        text += (e as { stdout?: Buffer }).stdout?.toString() ?? "";
-      }
+  } catch (e) {
+    const err = e as { code?: string; status?: number | null };
+    if (err.code === "ENOBUFS") {
+      log("Diff text too large to keep; stats are still exact");
+      text = `(diff text too large to keep: ${formatDiffSummary(stats)})`;
+      stats.truncated = true;
+    } else {
+      log(`git diff failed: ${err.code ?? `exit ${err.status}`}`);
+      return { ...fail("(failed to capture diff)"), stats };
     }
-  } catch (err) {
-    log(`Diff text too large to keep (${(err as Error).message.split("\n")[0]}); stats are still exact`);
-    text = `(diff text too large to keep: ${formatDiffSummary(stats)})`;
-    stats.truncated = true;
   }
-
-  return { diff: text || "(no changes)", stats };
+  if (!stats.truncated) {
+    for (const file of untracked) {
+      const part = noIndex(file, []);
+      if (part === null) { text += `\n(diff for ${file} unavailable)\n`; continue; }
+      text += part;
+    }
+  }
+  return { diff: text || "(no changes)", stats, agent };
 }
 
-function extractUnblockedCalls(toolCalls: { name: string; args: Record<string, unknown>; mcpServer?: string }[]): UnblockedCall[] {
+export function extractUnblockedCalls(toolCalls: { name: string; args: Record<string, unknown>; mcpServer?: string }[]): UnblockedCall[] {
   const calls: UnblockedCall[] = [];
   for (const tc of toolCalls) {
     const isUbMcp = tc.mcpServer?.toLowerCase().includes("unblocked")
@@ -142,39 +166,83 @@ function extractUnblockedCalls(toolCalls: { name: string; args: Record<string, u
   return calls;
 }
 
-const BASELINE_NUDGE = `IMPORTANT: Do NOT use any Unblocked tools, Unblocked skills, or Unblocked CLI commands. Do NOT call context_research, context_get_urls, or any tool with "unblocked" in its name. Do NOT run the "unblocked" CLI binary. You may use all other tools, MCP servers, plugins, and skills.
+// The same research discipline goes to both arms, with only the tool named
+// differently, so the comparison measures the tool and not the instructions.
+// A research result that comes back empty is treated as evidence, not as a
+// finding: the agent is told to check a second source before concluding that
+// something does not exist.
+const RESEARCH_DISCIPLINE = `How to research, whatever tools you use:
+- Before writing code, look for the convention this organisation already uses for this class of problem: prior art in this repository, in other repositories, in build images and shared actions, in docs, tickets and past discussions.
+- After planning, check for operational risks, previous incidents, deployment gotchas and rejected approaches related to your plan. Before implementing an unfamiliar pattern, verify conventions and team decisions.
+- A search that returns nothing is not a finding. If a source returns nothing on a question that matters, check a second source before concluding that nothing exists: a code search across the organisation's repositories, the file a comment or ticket points at, a runbook.
+- Do not end your turn while a command you started in the background is still running: wait for it, read its output, and report the result.
+- Your final response is the PR description a reviewer will read: what changed, what you verified and how, and any part of the task you deliberately left out, with the reason. Say where each decisive fact came from, and say plainly when you are inferring.`;
+
+const BASELINE_NUDGE = `IMPORTANT: Do NOT use any Unblocked tools, Unblocked skills, or Unblocked CLI commands. Do NOT call context_research, context_get_urls, or any tool with "unblocked" in its name. Do NOT run the "unblocked" CLI binary. You may use all other tools, MCP servers, plugins, and skills, including code search across the organisation's repositories.
+
+${RESEARCH_DISCIPLINE}
 
 TASK:
 `;
 
-const UNBLOCKED_MCP_NUDGE = `IMPORTANT: Before doing anything else, call the Unblocked context_research MCP tool with a detailed query describing the task (effort: low). This is your FIRST action.
+const UNBLOCKED_MCP_NUDGE = `IMPORTANT: Before doing anything else, call the Unblocked context_research MCP tool with a detailed query describing the task (effort: low). This is your FIRST action. Use context_research again (effort: low) at the points below, and context_get_urls to expand on anything it surfaces. You may also use all other tools, MCP servers, plugins, and skills.
 
-After that initial call, there are points in your planning and implementation flow where additional calls to context_research would be useful (always effort: low):
-- After planning: check for operational risks, previous incidents, deployment gotchas, or rejected approaches related to your plan
-- Before implementing unfamiliar patterns: verify conventions and team decisions
-
-If you need to expand on something context_research surfaced, use context_get_urls to fetch additional detail.
-
-You may also use all other tools, MCP servers, plugins, and skills as needed.
+${RESEARCH_DISCIPLINE}
 
 TASK:
 `;
 
 const UNBLOCKED_CLI_NUDGE = `IMPORTANT: Before doing anything else, run the Unblocked CLI to research this task. This is your FIRST action:
 unblocked context-research --effort low --query "<detailed query describing the task>"
+Use context-research again (--effort low) at the points below, and context-get-urls to expand on anything it surfaces. You may also use all other tools, MCP servers, plugins, and skills.
 
-After that initial call, continue using context-research throughout the task (always --effort low):
-- After planning: check for operational risks, previous incidents, deployment gotchas, or rejected approaches related to your plan
-- Before implementing unfamiliar patterns: verify conventions and team decisions
-
-If you need to expand on something context-research surfaced, use context-get-urls to fetch additional detail.
-
-You may also use all other tools, MCP servers, plugins, and skills as needed.
+${RESEARCH_DISCIPLINE}
 
 TASK:
 `;
 
-async function runArm(config: Config, condition: Condition, outDir: string, refsBefore: Map<string, string> | null): Promise<ArmResult> {
+// A base that is behind its upstream can make the task moot before the run
+// starts (the fix may already have landed). Fetch, compare, and say so.
+function warnIfBehindUpstream(repo: string, branch: string): void {
+  if (tryGit(repo, ["fetch", "--quiet", "origin"], "fetching origin to check the base") === null) return;
+  // A remote-tracking base (origin/main) is the tip after the fetch; nothing to compare.
+  if (/^(origin|refs\/remotes)\//.test(branch)) return;
+  let upstream: string | null = null;
+  try { upstream = git(repo, ["rev-parse", "--abbrev-ref", `${branch}@{upstream}`]).trim(); } catch { /* no upstream configured */ }
+  upstream ??= tryGit(repo, ["rev-parse", "--verify", "--quiet", "origin/main"], "checking origin/main") ? "origin/main" : null;
+  if (!upstream) return;
+  const behind = parseInt(tryGit(repo, ["rev-list", "--count", `${branch}..${upstream}`], "counting commits behind upstream")?.trim() ?? "0", 10) || 0;
+  if (behind > 0) log(`⚠ Base ${branch} is ${behind} commit(s) behind ${upstream}. If the task's fix has already landed upstream, both arms will find it and the comparison measures something else. Pass --branch ${upstream} to run against the tip.`);
+}
+
+// A run is an hour of unattended work. On macOS the machine idles to sleep
+// while it waits, and both arms freeze until it wakes (a 16-minute stall on
+// one run). caffeinate -i holds off idle sleep for as long as this process
+// lives; -w ends it when the harness exits.
+function keepMachineAwake(): void {
+  if (process.platform !== "darwin") return;
+  try {
+    const child = spawn("caffeinate", ["-i", "-w", String(process.pid)], { stdio: "ignore" });
+    child.on("error", err => log(`caffeinate unavailable (${err.message}); the machine may sleep during the run`));
+    child.unref();
+  } catch (err) {
+    log(`caffeinate unavailable (${(err as Error).message}); the machine may sleep during the run`);
+  }
+}
+
+// Per-run state, one object per comparison so repeats can run concurrently:
+// agent commits per arm (for branch cleanup after the diff is captured), the
+// worktree name per arm from the moment it exists (so a run that fails half
+// way still removes what it created), and the run's shared review standard
+// (see review.ts), set before the arms start and mutated by adjudications
+// from either arm.
+interface RunContext {
+  agentCommitsByArm: Map<Condition, Set<string>>;
+  worktreeByArm: Map<Condition, string>;
+  reviewSpec: ReviewSpec | null;
+}
+
+async function runArm(config: Config, condition: Condition, outDir: string, refsBefore: Map<string, string> | null, ctx: RunContext): Promise<ArmResult> {
   let nudge: string;
   if (condition === "baseline") {
     nudge = BASELINE_NUDGE;
@@ -190,7 +258,13 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
 
   log(`[${condition}] Creating worktree: ${wtName}`);
   const { path: wtPath, baseSha } = createWorktree(config.repo, wtName, config.branch);
+  ctx.worktreeByArm.set(condition, wtName);
   log(`[${condition}] Worktree at: ${wtPath} (base ${baseSha.slice(0, 7)})`);
+
+  // --timeout budgets the arm: the draft and every fix pass share it. Each
+  // pass reports how long it was awake (runClaude counts awake time only).
+  let spentMs = 0;
+  const remainingMs = () => Math.max(60_000, config.timeoutSeconds * 1000 - spentMs);
 
   log(`[${condition}] Running Claude Code...`);
   const runResult = await runClaude({
@@ -198,30 +272,122 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
     worktreePath: wtPath,
     model: config.model,
     condition,
-    timeoutMs: config.timeoutSeconds * 1000,
+    timeoutMs: remainingMs(),
     outDir,
     blockUnblocked: condition === "baseline",
   });
-  log(`[${condition}] Done: ${formatDuration(runResult.durationMs)}, ${runResult.assistantTurns} turns, exit=${runResult.exitCode}${runResult.timedOut ? " (TIMED OUT)" : ""}`);
+  spentMs += runResult.durationMs;
+  log(`[${condition}] Done: ${formatDuration(runResult.durationMs)}, ${runResult.assistantTurns} turns, exit=${runResult.exitCode}${runResult.timedOut ? " (TIMED OUT)" : ""}${runResult.killedReason && !runResult.timedOut ? ` (killed: ${runResult.killedReason})` : ""}`);
 
-  const { diff, stats: diffStats } = captureDiff(wtPath, baseSha, refsBefore);
+  let { diff, stats: diffStats, agent } = captureDiff(wtPath, baseSha, refsBefore);
   log(`[${condition}] Diff: ${formatDiffSummary(diffStats)}`);
 
-  const unblockedCalls = extractUnblockedCalls(runResult.toolCalls);
+  let run: RunResult = { ...runResult, worktreePath: wtPath };
+  let review: ReviewRound | undefined;
+
+  if (config.reviewRounds > 0 && run.assistantTurns === 0) {
+    log(`[${condition}] Review: skipped, the run produced no messages (exit ${run.exitCode})`);
+  } else if (config.reviewRounds > 0 && ctx.reviewSpec) {
+    const spec = ctx.reviewSpec;
+    const draftCost = run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage);
+    review = { maxRounds: config.reviewRounds, passes: [], draft: { diffStats, costUsd: draftCost, durationMs: run.durationMs, messages: run.assistantTurns }, finalMergeable: false };
+    const draftPath = path.join(outDir, `${condition}.draft.jsonl`);
+    fs.copyFileSync(run.jsonlPath, draftPath);
+    let disputed = "";
+    const toPass = (round: number, r: NonNullable<Awaited<ReturnType<typeof reviewDraft>>>): ReviewPass =>
+      ({ round, reviewModel: r.model, reviewCostUsd: r.costUsd, mergeable: r.mergeable, summary: r.summary, requirements: r.requirements, waiversInForce: r.waiversInForce, before: diffStats, fix: null });
+    for (let round = 1; round <= config.reviewRounds; round++) {
+      const armNow: ArmResult = { condition, run, diff, diffStats, unblockedCalls: [], estimatedCost: run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage) };
+      const prev = review.passes[review.passes.length - 1] ?? null;
+      const r = await reviewDraft(config.task, armNow, config.checkerModel, round, prev, spec, disputed);
+      if (!r) { review.checkFailed = round; log(`[${condition}] Review round ${round}: the check itself failed; stopping this arm's loop (recorded, not a verdict on the change)`); break; }
+      const pass = toPass(round, r);
+      review.passes.push(pass);
+      if (r.mergeable) { review.finalMergeable = true; log(`[${condition}] Review round ${round}: mergeable, stopping`); break; }
+      if (!run.sessionId) { log(`[${condition}] Review: no session id to resume; stopping`); break; }
+      if (run.killedReason) { log(`[${condition}] Review: the draft run was killed (${run.killedReason}); no fix pass`); break; }
+      log(`[${condition}] Review round ${round}: fix pass, resuming session ${run.sessionId.slice(0, 8)}…`);
+      const fixRun = await runClaude({
+        prompt: (condition === "baseline" ? BASELINE_FIX_PREAMBLE : "") + fixPrompt(round, r),
+        worktreePath: wtPath, model: config.model, condition, timeoutMs: remainingMs(), outDir,
+        blockUnblocked: condition === "baseline", resumeSessionId: run.sessionId, jsonlName: `${condition}.fix${round}.jsonl`,
+      });
+      spentMs += fixRun.durationMs;
+      log(`[${condition}] Fix pass ${round} done: ${formatDuration(fixRun.durationMs)}, ${fixRun.assistantTurns} msgs, exit=${fixRun.exitCode}${fixRun.killedReason ? ` (killed: ${fixRun.killedReason})` : ""}`);
+      fs.appendFileSync(run.jsonlPath, fs.readFileSync(fixRun.jsonlPath, "utf8"));
+      disputed = disputedSection(fixRun.finalResponse);
+      if (disputed) await adjudicateDisputes(config.task, spec, disputed, condition, round, config.checkerModel);
+      pass.fix = { costUsd: fixRun.totalCostUsd ?? estimateCost(config.model, fixRun.tokenUsage), durationMs: fixRun.durationMs, messages: fixRun.assistantTurns, exitCode: fixRun.exitCode, timedOut: fixRun.timedOut, disputed };
+      run = mergeRuns(run, fixRun, run.jsonlPath, config.model);
+      ({ diff, stats: diffStats, agent } = captureDiff(wtPath, baseSha, refsBefore));
+      log(`[${condition}] Diff after fix ${round}: ${formatDiffSummary(diffStats)}${disputed ? " (agent disputed part of the review)" : ""}`);
+      if (fixRun.killedReason) break;
+    }
+    const last = review.passes[review.passes.length - 1];
+    if (!review.finalMergeable && !review.checkFailed && last?.fix) {
+      // The loop ended after a fix (rounds exhausted, or the fix pass was
+      // killed): one more check to record the final state, no fix.
+      const armNow: ArmResult = { condition, run, diff, diffStats, unblockedCalls: [], estimatedCost: run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage) };
+      const r = await reviewDraft(config.task, armNow, config.checkerModel, last.round + 1, last, spec, disputed);
+      if (r) { review.passes.push(toPass(last.round + 1, r)); review.finalMergeable = r.mergeable; }
+      else review.checkFailed = last.round + 1;
+    }
+  }
+  ctx.agentCommitsByArm.set(condition, agent);
+
+  const unblockedCalls = extractUnblockedCalls(run.toolCalls);
   if (unblockedCalls.length > 0) {
     log(`[${condition}] Unblocked calls: ${unblockedCalls.length}`);
   }
 
-  const cost = runResult.totalCostUsd ?? estimateCost(config.model, runResult.tokenUsage);
+  const cost = run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage);
 
-  return { condition, run: { ...runResult, worktreePath: wtPath }, diff, diffStats, unblockedCalls, estimatedCost: cost };
+  return { condition, run, diff, diffStats, unblockedCalls, estimatedCost: cost, review };
 }
 
-export async function run(config: Config): Promise<ComparisonResult> {
-  const startTime = Date.now();
+const BASELINE_FIX_PREAMBLE = "IMPORTANT: as before, do NOT use any Unblocked tools, Unblocked skills, or Unblocked CLI commands.\n\n";
 
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const outDir = path.join(process.cwd(), "results", `run-${timestamp}`);
+// The draft run plus the fix pass as one run: sums for time, tokens and cost;
+// the fix pass's final response; the combined transcript.
+function mergeRuns(a: RunResult, b: RunResult, jsonlPath: string, model: string): RunResult {
+  const addUsage = (x: TokenUsage, y: TokenUsage): TokenUsage => ({
+    inputTokens: x.inputTokens + y.inputTokens, outputTokens: x.outputTokens + y.outputTokens,
+    cacheCreationTokens: x.cacheCreationTokens + y.cacheCreationTokens, cacheReadTokens: x.cacheReadTokens + y.cacheReadTokens,
+    ...(x.costUsd !== undefined || y.costUsd !== undefined ? { costUsd: (x.costUsd ?? 0) + (y.costUsd ?? 0) } : {}),
+    ...(x.thinkingTokens !== undefined || y.thinkingTokens !== undefined ? { thinkingTokens: (x.thinkingTokens ?? 0) + (y.thinkingTokens ?? 0) } : {}),
+  });
+  const byModel: Record<string, TokenUsage> = { ...(a.tokenUsage.byModel ?? {}) };
+  for (const [m, mu] of Object.entries(b.tokenUsage.byModel ?? {})) byModel[m] = byModel[m] ? addUsage(byModel[m], mu) : { ...mu };
+  // A pass without a billed total is priced from the rate table before the
+  // sum, so a missing draft cost never becomes 0 + fix cost.
+  const costOf = (x: RunResult) => x.totalCostUsd ?? estimateCost(model, x.tokenUsage);
+  const anyEstimated = !!(a.costEstimated || b.costEstimated || a.totalCostUsd === null || b.totalCostUsd === null);
+  return {
+    durationMs: a.durationMs + b.durationMs,
+    wallMs: (a.wallMs ?? a.durationMs) + (b.wallMs ?? b.durationMs),
+    tokenUsage: { ...addUsage(a.tokenUsage, b.tokenUsage), byModel },
+    toolCalls: [...a.toolCalls, ...b.toolCalls],
+    assistantTurns: a.assistantTurns + b.assistantTurns,
+    finalResponse: b.finalResponse || a.finalResponse,
+    sessionId: b.sessionId ?? a.sessionId,
+    exitCode: b.exitCode ?? a.exitCode,
+    timedOut: a.timedOut || b.timedOut,
+    ...(b.killedReason ?? a.killedReason ? { killedReason: b.killedReason ?? a.killedReason } : {}),
+    jsonlPath,
+    worktreePath: a.worktreePath,
+    totalCostUsd: costOf(a) + costOf(b),
+    ...(anyEstimated ? { costEstimated: true } : {}),
+  };
+}
+
+export async function run(config: Config, outDirOverride?: string, sharedSpec?: ReviewSpec): Promise<ComparisonResult> {
+  const startTime = Date.now();
+  const ctx: RunContext = { agentCommitsByArm: new Map(), worktreeByArm: new Map(), reviewSpec: null };
+
+  // A random suffix: two harness processes started in the same millisecond
+  // once shared a directory and interleaved their transcripts.
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-") + "-" + randomBytes(2).toString("hex");
+  const outDir = outDirOverride ?? path.join(process.cwd(), "results", `run-${timestamp}`);
   const baselineDir = path.join(outDir, "baseline");
   const unblockedDir = path.join(outDir, "unblocked");
   fs.mkdirSync(baselineDir, { recursive: true });
@@ -231,22 +397,43 @@ export async function run(config: Config): Promise<ComparisonResult> {
   // --detach` creates no refs, so both arms share it. Used to separate the
   // agent's commits from pre-existing history and to find branches it created.
   const refsBefore = snapshotRefs(config.repo);
+  if (!refsBefore) throw new Error("Could not snapshot the repository's refs; without it the agent's commits cannot be told from existing history");
+  warnIfBehindUpstream(config.repo, config.branch);
+  keepMachineAwake();
+  if (config.reviewRounds > 0) {
+    // Repeats of one task share the requirement list (extracted once by the
+    // batch) so their verdicts are comparable; adjudications are per run.
+    ctx.reviewSpec = sharedSpec ? { ...sharedSpec, adjudications: [], costUsd: 0 } : await extractRequirements(config.task, config.checkerModel);
+    if (!ctx.reviewSpec) throw new Error("Review: could not extract the task's requirements; not running the arms without a shared review standard");
+  }
+  const reviewSpec = ctx.reviewSpec;
 
   let baseline: ArmResult;
   let unblocked: ArmResult;
 
   try {
     [baseline, unblocked] = await Promise.all([
-      runArm(config, "baseline", baselineDir, refsBefore),
-      runArm(config, "unblocked", unblockedDir, refsBefore),
+      runArm(config, "baseline", baselineDir, refsBefore, ctx),
+      runArm(config, "unblocked", unblockedDir, refsBefore, ctx),
     ]);
   } finally {
     if (!config.keepWorktrees) {
       log("Cleaning up worktrees...");
-      for (const arm of [baseline!, unblocked!]) {
-        if (!arm) continue;
-        removeWorktree(config.repo, path.basename(arm.run.worktreePath), refsBefore);
+      for (const [condition, name] of ctx.worktreeByArm) {
+        removeWorktree(config.repo, name, refsBefore, ctx.agentCommitsByArm.get(condition) ?? new Set());
       }
+    }
+  }
+
+  if (reviewSpec) {
+    for (const arm of [baseline, unblocked]) applyWaivers(arm, reviewSpec);
+    if (reviewSpec.adjudications.some(a => a.waived)) log(`Review: waived for both arms — ${reviewSpec.adjudications.filter(a => a.waived).map(a => `${a.index + 1}. ${reviewSpec!.requirements[a.index]} (disputed by ${a.disputedBy}, round ${a.round})`).join("; ")}`);
+  }
+
+  if (config.analystModel) {
+    for (const arm of [baseline, unblocked]) {
+      const a = await attribute(arm.run.jsonlPath, config.task, arm.run.totalCostUsd ?? arm.estimatedCost, config.analystModel, arm.condition);
+      if (a) arm.attribution = a;
     }
   }
 
@@ -257,9 +444,26 @@ export async function run(config: Config): Promise<ComparisonResult> {
     model: config.model,
     baseline,
     unblocked,
-    totalDurationMs: Date.now() - startTime,
+    totalDurationMs: Math.max(baseline.run.durationMs, unblocked.run.durationMs),
     totalEstimatedCost: baseline.estimatedCost + unblocked.estimatedCost,
+    ...(reviewSpec ? { reviewSpec } : {}),
   };
+  const killed = [baseline, unblocked].filter(a => a.run.killedReason);
+  if (killed.length) log(`⚠ ${killed.map(a => `${a.condition} was killed (${a.run.killedReason})`).join("; ")}: no quality or impact verdict for an unfinished comparison`);
+  if (config.analystModel && !killed.length) {
+    const q = await assessQuality(result, config.judgeModel);
+    if (q) result.quality = q;
+    result.economics = economics(result);
+    if (q) { const im = await assessImpact(result, config.judgeModel); if (im) result.impact = im; }
+    else log("Impact: skipped, no quality verdict to assess against");
+    applyTieBreaker(result);
+    if (result.quality?.verdict.tieBreaker?.applied) log(`Verdict: blinded tie → Unblocked by the tie-breaker (${result.quality.verdict.tieBreaker.reason})`);
+  } else if (config.analystModel) {
+    result.economics = economics(result);
+  }
+  const reviewCost = (a: ArmResult) => (a.review?.passes ?? []).reduce((s, p) => s + p.reviewCostUsd, 0);
+  result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0) + reviewCost(baseline) + reviewCost(unblocked) + (reviewSpec?.costUsd ?? 0);
+  log(`Experiment wall time ${formatDuration(Date.now() - startTime)} incl. analysis`);
 
   printReport(result);
   writeJsonResult(result, outDir);
@@ -270,10 +474,57 @@ export async function run(config: Config): Promise<ComparisonResult> {
   log(`Total time: ${formatDuration(result.totalDurationMs)}`);
   log(`Total cost: ${formatCost(result.totalEstimatedCost)}`);
 
+  if (!outDirOverride) {
+    try {
+      const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+      execSync(`${opener} "${htmlPath}"`);
+    } catch {}
+  }
+
+  return result;
+}
+
+// Repeats: the same comparison `config.repeat` times, up to `config.concurrency`
+// at once, each in its own directory under one batch directory, then a
+// summary across them. Repeats are independent: separate worktrees, spec,
+// transcripts and analysis. One failed repeat is logged and left out.
+export async function runBatch(config: Config): Promise<{ batchDir: string; results: ComparisonResult[] }> {
+  if (config.repeat <= 1) {
+    const r = await run(config);
+    return { batchDir: path.dirname(r.baseline.run.jsonlPath.replace(/\/baseline\/[^/]+$/, "")), results: [r] };
+  }
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-") + "-" + randomBytes(2).toString("hex");
+  const batchDir = path.join(process.cwd(), "results", `batch-${timestamp}`);
+  fs.mkdirSync(batchDir, { recursive: true });
+  log(`Batch: ${config.repeat} repeats, ${config.concurrency} at a time → ${batchDir}`);
+  let sharedSpec: ReviewSpec | undefined;
+  if (config.reviewRounds > 0) {
+    const spec = await extractRequirements(config.task, config.checkerModel);
+    if (!spec) throw new Error("Review: could not extract the task's requirements; not running the batch without a shared review standard");
+    sharedSpec = spec;
+    fs.writeFileSync(path.join(batchDir, "requirements.json"), JSON.stringify(spec, null, 2));
+  }
+  const results: (ComparisonResult | null)[] = new Array(config.repeat).fill(null);
+  let next = 0;
+  const worker = async () => {
+    while (next < config.repeat) {
+      const i = next++;
+      const dir = path.join(batchDir, `run-${i + 1}`);
+      try {
+        results[i] = await run(config, dir, sharedSpec);
+        log(`Batch: run ${i + 1}/${config.repeat} done`);
+      } catch (err) {
+        log(`Batch: run ${i + 1}/${config.repeat} failed: ${(err as Error).message}`);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(config.concurrency, config.repeat)) }, worker));
+  const done = results.filter((r): r is ComparisonResult => r !== null);
+  const htmlPath = writeBatchSummary(config, done, batchDir);
+  log(`Batch summary: ${htmlPath}`);
   try {
     const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
     execSync(`${opener} "${htmlPath}"`);
   } catch {}
-
-  return result;
+  return { batchDir, results: done };
 }

@@ -1,5 +1,5 @@
 // Generate a comparison report from two existing stream-json transcripts.
-// Usage: bun scripts/report_from_jsonl.ts <baseline.jsonl> <unblocked.jsonl> [result.json | model] [branch] [task]
+// Usage: bun scripts/report_from_jsonl.ts <baseline.jsonl> <unblocked.jsonl> [result.json | model] [branch] [task] [--attribute[=model]] [--rejudge[=model]] [--impact[=model]]
 // Token usage and tool calls are always re-parsed from the transcripts. The
 // task prompt, branch, and code diffs are not recorded in stream-json output:
 // pass the run's original result.json (third argument, detected by .json
@@ -10,6 +10,11 @@ import path from "node:path";
 import { parseStreamJson } from "../src/claude.ts";
 import { printReport, writeHtmlReport, writeJsonResult } from "../src/report.ts";
 import { estimateCost } from "../src/util.ts";
+import { attribute, buildWalk, rollup } from "../src/attribution.ts";
+import { applyTieBreaker, assessQuality } from "../src/quality.ts";
+import { assessImpact } from "../src/impact.ts";
+import { economics } from "../src/economics.ts";
+import { extractUnblockedCalls } from "../src/runner.ts";
 import type { ArmResult, ComparisonResult, Condition, UnblockedCall } from "../src/types.ts";
 
 interface InitInfo { cwd?: string; model?: string }
@@ -35,23 +40,20 @@ function repoFromCwd(cwd: string | undefined): string | undefined {
   return parts.length >= 2 ? parts[parts.length - 2] : undefined;
 }
 
+// The CLI's duration_ms summed over result events (a draft pass plus a fix
+// pass is two); for a transcript with no result event (killed run), the span
+// of event timestamps.
 function durationMs(jsonl: string): number {
+  let first = NaN, last = NaN, total = 0, seen = false;
   for (const line of jsonl.split("\n")) {
     if (!line) continue;
-    try { const e = JSON.parse(line); if (e?.type === "result" && typeof e.duration_ms === "number") return e.duration_ms; } catch {}
+    try {
+      const e = JSON.parse(line);
+      if (e?.type === "result" && typeof e.duration_ms === "number") { total += e.duration_ms; seen = true; }
+      if (typeof e?.timestamp === "string") { const t = Date.parse(e.timestamp); if (Number.isNaN(first)) first = t; last = t; }
+    } catch {}
   }
-  return 0;
-}
-
-function unblockedCalls(toolCalls: { name: string; args: Record<string, unknown>; mcpServer?: string }[]): UnblockedCall[] {
-  const out: UnblockedCall[] = [];
-  for (const tc of toolCalls) {
-    const isUb = tc.mcpServer?.toLowerCase().includes("unblocked") || tc.name.toLowerCase().includes("unblocked");
-    if (isUb) {
-      out.push({ tool: tc.name.split(/__|::/).pop() ?? tc.name, query: (tc.args.query as string) ?? (tc.args.url as string) ?? undefined });
-    }
-  }
-  return out;
+  return seen ? total : (Number.isNaN(first) ? 0 : Math.max(0, last - first));
 }
 
 function arm(condition: Condition, file: string, model: string, orig?: ArmResult): ArmResult {
@@ -64,23 +66,63 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
     assistantTurns: parsed.assistantTurns,
     finalResponse: parsed.finalResponse,
     sessionId: parsed.sessionId,
-    exitCode: 0,
-    timedOut: false,
+    // Exit state is not in the transcript; carried from the run's result.json.
+    exitCode: orig?.run.exitCode ?? 0,
+    timedOut: orig?.run.timedOut ?? false,
+    ...(orig?.run.killedReason ? { killedReason: orig.run.killedReason } : {}),
     jsonlPath: file,
-    worktreePath: "(from transcript)",
+    worktreePath: orig?.run.worktreePath ?? "(from transcript)",
     totalCostUsd: parsed.totalCostUsd,
+    ...(parsed.totalCostUsd === null ? { costEstimated: true } : {}),
   };
   const cost = run.totalCostUsd ?? estimateCost(model, run.tokenUsage);
   return {
     condition, run,
     diff: orig?.diff ?? "(not captured — generated from transcript)",
     diffStats: orig?.diffStats ?? { filesChanged: 0, linesAdded: 0, linesRemoved: 0, commits: 0 },
-    unblockedCalls: unblockedCalls(parsed.toolCalls),
+    unblockedCalls: extractUnblockedCalls(parsed.toolCalls),
     estimatedCost: cost,
+    // Carried over unless --attribute recomputes it; the analyst call is the slow part.
+    attribution: orig?.attribution,
+    review: orig?.review ? reparseReview(orig.review, file, model) : undefined,
   };
 }
 
-const [,, baseFile, ubFile, thirdArg, branchArg, ...taskArg] = process.argv;
+// Review passes were priced at run time; re-price the draft and each fix pass
+// from their own transcripts (<arm>.draft.jsonl, <arm>.fix<N>.jsonl) when
+// those sit beside the combined one, so parser fixes reach them.
+function reparseReview(review: NonNullable<ArmResult["review"]>, jsonlPath: string, model: string) {
+  const dir = path.dirname(jsonlPath), stem = path.basename(jsonlPath, ".jsonl");
+  const price = (file: string) => {
+    if (!fs.existsSync(file)) return null;
+    const jsonl = fs.readFileSync(file, "utf8");
+    const p = parseStreamJson(jsonl);
+    return { costUsd: p.totalCostUsd ?? estimateCost(model, p.tokenUsage), durationMs: durationMs(jsonl), messages: p.assistantTurns };
+  };
+  const draft = price(path.join(dir, `${stem}.draft.jsonl`));
+  return {
+    ...review,
+    draft: draft ? { ...review.draft, ...draft } : review.draft,
+    passes: review.passes.map(pass => {
+      if (!pass.fix) return pass;
+      const fix = price(path.join(dir, `${stem}.fix${pass.round}.jsonl`)) ?? price(path.join(dir, `${stem}.fix.jsonl`));
+      return fix ? { ...pass, fix: { ...pass.fix, ...fix } } : pass;
+    }),
+  };
+}
+
+// --attribute[=model] recomputes per-message attribution; --rejudge re-runs the
+// quality judge (same model, default opus). Only these flags are stripped from
+// argv, so a "--flag" inside a free-text task argument survives.
+// --attribute[=model] recomputes attribution (default opus); --rejudge[=model]
+// re-runs the quality judge and --impact[=model] the context-impact pass
+// (default fable). Only these flags are stripped from argv.
+const KNOWN = /^--(attribute|rejudge|impact)(=.*)?$/;
+const flagModel = (name: string, dflt: string) => { const f = process.argv.find(a => a === `--${name}` || a.startsWith(`--${name}=`)); return f ? (f.split("=")[1] || dflt) : null; };
+const attrModel = flagModel("attribute", "opus");
+const judgeModel = flagModel("rejudge", "fable");
+const impactModel = flagModel("impact", "fable");
+const [,, baseFile, ubFile, thirdArg, branchArg, ...taskArg] = process.argv.filter(a => !KNOWN.test(a));
 const orig: ComparisonResult | undefined = thirdArg?.endsWith(".json")
   ? JSON.parse(fs.readFileSync(thirdArg, "utf8"))
   : undefined;
@@ -92,6 +134,19 @@ const task = orig?.task ?? (taskArg.join(" ") || "(task not recorded in transcri
 const repo = orig?.repo ?? repoFromCwd(init.cwd) ?? "(from transcripts)";
 const baseline = arm("baseline", baseFile, model, orig?.baseline);
 const unblocked = arm("unblocked", ubFile, model, orig?.unblocked);
+for (const a of [baseline, unblocked]) {
+  if (attrModel) {
+    const attr = await attribute(a.run.jsonlPath, task, a.run.totalCostUsd ?? a.estimatedCost, attrModel, a.condition);
+    if (attr) a.attribution = attr;
+  } else if (a.attribution) {
+    // Keep the analyst's labels, recompute the per-message numbers (cost,
+    // windows, stalls) from the transcript with the current code.
+    const walk = buildWalk(fs.readFileSync(a.run.jsonlPath, "utf8"), a.run.totalCostUsd ?? a.estimatedCost);
+    const labels = a.attribution.turns.map(t => ({ turn: t.turn, label: t.label, repeatOf: t.repeatOf, reason: t.reason }));
+    if (walk.length === a.attribution.turns.length) a.attribution = rollup(walk, labels, a.attribution.analystModel, a.attribution.analystCostUsd);
+    else console.error(`[${a.condition}] transcript has ${walk.length} messages, stored attribution ${a.attribution.turns.length}; keeping stored numbers`);
+  }
+}
 
 const result: ComparisonResult = {
   repo,
@@ -102,7 +157,25 @@ const result: ComparisonResult = {
   unblocked,
   totalDurationMs: Math.max(baseline.run.durationMs, unblocked.run.durationMs),
   totalEstimatedCost: baseline.estimatedCost + unblocked.estimatedCost,
+  ...(orig?.reviewSpec ? { reviewSpec: orig.reviewSpec } : {}),
 };
+
+// The judge and impact passes are the expensive, non-deterministic steps; a
+// previous result from the supplied result.json is kept unless re-run is asked
+// for, and a failed re-run keeps the previous result rather than dropping it.
+const killed = [baseline, unblocked].filter(a => a.run.killedReason);
+if (killed.length) console.error(`⚠ ${killed.map(a => `${a.condition} was killed (${a.run.killedReason})`).join("; ")}: judge and impact are not re-run for an unfinished comparison`);
+if (judgeModel && !killed.length) result.quality = (await assessQuality(result, judgeModel)) ?? orig?.quality;
+else if (orig?.quality) result.quality = orig.quality;
+
+result.economics = economics(result);
+if (impactModel && !killed.length && result.quality) result.impact = (await assessImpact(result, impactModel)) ?? orig?.impact;
+else if (orig?.impact) result.impact = orig.impact;
+
+applyTieBreaker(result);
+
+const reviewCost = (a: ArmResult) => (a.review?.passes ?? []).reduce((s, p) => s + p.reviewCostUsd, 0);
+result.analysisCostUsd = (baseline.attribution?.analystCostUsd ?? 0) + (unblocked.attribution?.analystCostUsd ?? 0) + (result.quality?.judgeCostUsd ?? 0) + (result.impact?.costUsd ?? 0) + reviewCost(baseline) + reviewCost(unblocked) + (result.reviewSpec?.costUsd ?? 0);
 
 const outDir = path.join(process.cwd(), "results", "regenerated");
 fs.mkdirSync(outDir, { recursive: true });
