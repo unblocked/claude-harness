@@ -384,7 +384,9 @@ export async function run(config: Config, outDirOverride?: string, sharedSpec?: 
   const startTime = Date.now();
   const ctx: RunContext = { agentCommitsByArm: new Map(), worktreeByArm: new Map(), reviewSpec: null };
 
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  // A random suffix: two harness processes started in the same millisecond
+  // once shared a directory and interleaved their transcripts.
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-") + "-" + randomBytes(2).toString("hex");
   const outDir = outDirOverride ?? path.join(process.cwd(), "results", `run-${timestamp}`);
   const baselineDir = path.join(outDir, "baseline");
   const unblockedDir = path.join(outDir, "unblocked");
@@ -491,7 +493,7 @@ export async function runBatch(config: Config): Promise<{ batchDir: string; resu
     const r = await run(config);
     return { batchDir: path.dirname(r.baseline.run.jsonlPath.replace(/\/baseline\/[^/]+$/, "")), results: [r] };
   }
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-") + "-" + randomBytes(2).toString("hex");
   const batchDir = path.join(process.cwd(), "results", `batch-${timestamp}`);
   fs.mkdirSync(batchDir, { recursive: true });
   log(`Batch: ${config.repeat} repeats, ${config.concurrency} at a time → ${batchDir}`);
