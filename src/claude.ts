@@ -343,14 +343,33 @@ export async function runClaude(opts: {
 
     let unblockedCallSeen = false;
 
-    const unblockedDeadline = opts.condition === "unblocked" && !opts.resumeSessionId
-      ? setTimeout(() => {
-          if (!unblockedCallSeen && !killed) {
-            log(`[${tag}] ⛔ Unblocked not called within 120s — killing run`);
-            kill("the Unblocked arm made no Unblocked call within 120s");
-          }
-        }, 120_000)
-      : null;
+    // Deadlines count awake time only. A laptop that sleeps mid-run freezes
+    // the agent; a plain setTimeout then fires on wake and kills a run that
+    // had no chance to progress. A 5s tick measures elapsed time and treats
+    // any gap over 30s between ticks as sleep, which does not count.
+    let awakeMs = 0;
+    let lastTick = Date.now();
+    const unblockedDeadlineMs = opts.condition === "unblocked" && !opts.resumeSessionId ? 120_000 : Infinity;
+    let unblockedDeadlineFired = false;
+    let timedOut = false;
+    const ticker = setInterval(() => {
+      const now = Date.now();
+      const gap = now - lastTick;
+      lastTick = now;
+      if (gap > 30_000) log(`[${tag}] machine was asleep or stalled for ${Math.round(gap / 1000)}s; not counted against deadlines`);
+      else awakeMs += gap;
+      if (!unblockedDeadlineFired && awakeMs >= unblockedDeadlineMs) {
+        unblockedDeadlineFired = true;
+        if (!unblockedCallSeen && !killed) {
+          log(`[${tag}] ⛔ Unblocked not called within 120s — killing run`);
+          kill("the Unblocked arm made no Unblocked call within 120s");
+        }
+      }
+      if (!timedOut && awakeMs >= opts.timeoutMs) {
+        timedOut = true;
+        if (!killed) kill(`timed out after ${Math.round(opts.timeoutMs / 1000)}s`);
+      }
+    }, 5_000);
 
     p.stdout.on("data", (chunk: Buffer) => {
       out.write(chunk);
@@ -413,7 +432,6 @@ export async function runClaude(opts: {
 
                 if (opts.condition === "unblocked" && !unblockedCallSeen && (isUbMcp || isUbCli)) {
                   unblockedCallSeen = true;
-                  if (unblockedDeadline) clearTimeout(unblockedDeadline);
                   log(`[${tag}] ✅ Unblocked call detected`);
                 }
               }
@@ -430,17 +448,10 @@ export async function runClaude(opts: {
       }
     });
 
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      if (!killed) kill(`timed out after ${Math.round(opts.timeoutMs / 1000)}s`);
-    }, opts.timeoutMs);
-
     p.stderr.on("data", (d: Buffer) => process.stderr.write(`[claude:${opts.condition}] ${d}`));
 
     p.on("close", (code) => {
-      clearTimeout(timer);
-      if (unblockedDeadline) clearTimeout(unblockedDeadline);
+      clearInterval(ticker);
       // Resolve only once the transcript is fully on disk: the last chunk is
       // the result event with the cost and usage, and reading before the
       // stream has flushed loses it.

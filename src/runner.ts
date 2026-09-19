@@ -261,9 +261,10 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
   ctx.worktreeByArm.set(condition, wtName);
   log(`[${condition}] Worktree at: ${wtPath} (base ${baseSha.slice(0, 7)})`);
 
-  // --timeout budgets the arm: the draft and every fix pass share it.
-  const deadline = Date.now() + config.timeoutSeconds * 1000;
-  const remainingMs = () => Math.max(60_000, deadline - Date.now());
+  // --timeout budgets the arm: the draft and every fix pass share it. Each
+  // pass reports how long it was awake (runClaude counts awake time only).
+  let spentMs = 0;
+  const remainingMs = () => Math.max(60_000, config.timeoutSeconds * 1000 - spentMs);
 
   log(`[${condition}] Running Claude Code...`);
   const runResult = await runClaude({
@@ -275,7 +276,8 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
     outDir,
     blockUnblocked: condition === "baseline",
   });
-  log(`[${condition}] Done: ${formatDuration(runResult.durationMs)}, ${runResult.assistantTurns} turns, exit=${runResult.exitCode}${runResult.timedOut ? " (TIMED OUT)" : ""}`);
+  spentMs += runResult.durationMs;
+  log(`[${condition}] Done: ${formatDuration(runResult.durationMs)}, ${runResult.assistantTurns} turns, exit=${runResult.exitCode}${runResult.timedOut ? " (TIMED OUT)" : ""}${runResult.killedReason && !runResult.timedOut ? ` (killed: ${runResult.killedReason})` : ""}`);
 
   let { diff, stats: diffStats, agent } = captureDiff(wtPath, baseSha, refsBefore);
   log(`[${condition}] Diff: ${formatDiffSummary(diffStats)}`);
@@ -310,6 +312,7 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
         worktreePath: wtPath, model: config.model, condition, timeoutMs: remainingMs(), outDir,
         blockUnblocked: condition === "baseline", resumeSessionId: run.sessionId, jsonlName: `${condition}.fix${round}.jsonl`,
       });
+      spentMs += fixRun.durationMs;
       log(`[${condition}] Fix pass ${round} done: ${formatDuration(fixRun.durationMs)}, ${fixRun.assistantTurns} msgs, exit=${fixRun.exitCode}${fixRun.killedReason ? ` (killed: ${fixRun.killedReason})` : ""}`);
       fs.appendFileSync(run.jsonlPath, fs.readFileSync(fixRun.jsonlPath, "utf8"));
       disputed = disputedSection(fixRun.finalResponse);
