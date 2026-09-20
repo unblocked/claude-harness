@@ -1212,7 +1212,13 @@ export function writeBatchSummary(config: { task: string; repo: string; branch: 
   const core = (r: ComparisonResult, arm: "baseline" | "unblocked") => r[arm].attribution?.core ?? { costUsd: r[arm].estimatedCost, durationMs: r[arm].run.durationMs, turns: r[arm].run.assistantTurns };
   const counts = { unblocked: 0, baseline: 0, tie: 0, none: 0 };
   for (const r of results) { const v = r.quality?.verdict.better; if (v === "unblocked" || v === "baseline" || v === "tie") counts[v]++; else counts.none++; }
-  const med = (arm: "baseline" | "unblocked", f: (c: ReturnType<typeof core>) => number) => median(results.map(r => f(core(r, arm))));
+  // A run that never got a verdict (an arm was killed or timed out) has real
+  // spend up to the point it was cut off, but that partial number is not a
+  // comparable data point next to a completed comparison; it would drag the
+  // median toward whatever the kill happened to cost. Judged runs only.
+  const judged = results.filter(r => r.quality);
+  if (judged.length < results.length) console.error(`Batch summary: ${results.length - judged.length} of ${results.length} run(s) had no verdict (killed/void) and are excluded from the medians, shown as "–" in the table`);
+  const med = (arm: "baseline" | "unblocked", f: (c: ReturnType<typeof core>) => number) => median(judged.map(r => f(core(r, arm))));
   const pct = (b: number, u: number) => b > 0 ? `${u >= b ? "+" : ""}${Math.round((u / b - 1) * 100)}%` : "n/a";
   const rows = results.map((r, i) => {
     const b = core(r, "baseline"), u = core(r, "unblocked");
@@ -1244,7 +1250,7 @@ export function writeBatchSummary(config: { task: string; repo: string; branch: 
     <div class="card"><div class="k">Median core time</div><div class="v ${uT <= bT ? "pos" : "neg"}">${pct(bT, uT)}</div><div class="d">${formatDuration(bT)} → ${formatDuration(uT)}</div></div>
   </div>
   <table><thead><tr><th>Run</th><th>Verdict</th><th>Driver</th><th>Core cost (B → U)</th><th>Core time (B → U)</th><th>Messages</th><th>Rationale</th></tr></thead><tbody>${rows.join("")}</tbody></table>
-  <div class="note">Each run is an independent comparison (fresh worktrees, its own requirement check, judge and impact pass). Medians are over core work with housekeeping removed. Verdicts follow the same rubric as the per-run reports.</div>
+  <div class="note">Each run is an independent comparison (fresh worktrees, its own requirement check, judge and impact pass). Medians are over core work with housekeeping removed, across the ${judged.length} of ${results.length} run(s) that reached a verdict${judged.length < results.length ? " (a killed or timed-out run's partial spend is not comparable and is excluded)" : ""}. Verdicts follow the same rubric as the per-run reports.</div>
 </div></body></html>`;
   const out = path.join(batchDir, "summary.html");
   fs.writeFileSync(out, html);
