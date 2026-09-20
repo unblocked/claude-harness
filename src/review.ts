@@ -18,7 +18,15 @@ import { neutralise, runStructured } from "./analyst.ts";
 // The reviewer sees only its own arm: the task, the agent's final response
 // as the PR description, and the diff.
 
-const DIFF_BUDGET = 60_000;
+// Observed real diffs run 60-100k characters for a multi-file Kotlin change
+// (12-14 files with test boilerplate); a 60k budget truncated one arm's diff
+// before its test files, in both directions depending on git's file order,
+// and the checker read "not shown" as "not done" every round, burning the
+// full round cap on a check the diff could never satisfy. 200k gives 2-3x
+// headroom over anything seen so far; a checker model has ample context left
+// for it. Real over-budget diffs still get an explicit "not shown" marker
+// (below) so the checker does not have to guess.
+const DIFF_BUDGET = 200_000;
 
 // Hide the treatment, not the repository. Only the tool's own names go:
 // "Unblocked MCP/context/research/CLI", the MCP tool names. A bare
@@ -66,7 +74,8 @@ const SCHEMA = {
 };
 
 function prompt(task: string, arm: ArmResult, round: number, previous: ReviewPass | null, spec: ReviewSpec, disputed: string): string {
-  const diff = arm.diff.length > DIFF_BUDGET ? arm.diff.slice(0, DIFF_BUDGET) + "\n… (diff truncated)" : arm.diff;
+  const truncated = arm.diff.length > DIFF_BUDGET;
+  const diff = truncated ? arm.diff.slice(0, DIFF_BUDGET) + `\n… (diff truncated here; ${arm.diff.length - DIFF_BUDGET} more characters not shown, in files not visible above)` : arm.diff;
   const waived = waivedIndices(spec);
   const list = spec.requirements.map((r, i) => `${i + 1}. ${r}${waived.has(i) ? "   [WAIVED — do not check; report it as met]" : exclusionsFor(spec, i).length ? `   [does not cover: ${exclusionsFor(spec, i).join("; ")}]` : ""}`).join("\n");
   const waiverNotes = spec.adjudications.map(a => `- Requirement ${a.index + 1}: ${a.waived ? "waived" : a.excludes ? `stands, but does not cover ${a.excludes}` : "dispute rejected, still required"} — ${a.reason}`).join("\n");
@@ -79,7 +88,7 @@ Your only job is classification. For each numbered requirement below, mark it:
 - met: the diff delivers it for every case the task covers;
 - partial: the diff delivers it for some cases the task covers, not all;
 - unmet: the diff does not deliver it.
-With a note ≤ 25 words. For met, cite where in the diff. For partial or unmet, say exactly which case or part is missing, citing the diff or the description. Judge from the diff; a claim in the description that the diff does not show is not evidence. The exception is a requirement about process that a diff cannot show (not committing, not branching, how something was run): accept the description unless the diff contradicts it.
+With a note ≤ 25 words. For met, cite where in the diff. For partial or unmet, say exactly which case or part is missing, citing the diff or the description. Judge from the diff; a claim in the description that the diff does not show is not evidence. Exception: if the diff says it was truncated and the description credibly claims something was done in a file the truncation notice says is not shown, mark that requirement unmet with the note "cannot verify, diff truncated before the relevant file" rather than a note that says it is missing — and do not repeat the same conclusion round after round if the description keeps pointing at the same file; each round the diff may show different files depending on what changed. The exception is a requirement about process that a diff cannot show (not committing, not branching, how something was run): accept the description unless the diff contradicts it.
 
 Do not add requirements, do not comment on code quality, style, tests, naming, logging or robustness beyond what a requirement states, and do not suggest changes or extra work. If the description argues that a requirement should not apply, do not waive it: mark it as you find it and quote the argument in the note; disputes are decided elsewhere.
 ${prior}
