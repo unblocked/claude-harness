@@ -45,7 +45,9 @@ function verificationRecord(arm: ArmResult, jsonl: string): string {
           pending.set(b.id, cmd.replace(/\s+/g, " ").slice(0, 160));
           if (VERIFY_CMD.test(cmd)) {
             verifyIds.add(b.id);
-            for (const m of cmd.matchAll(/>{1,2}\s*(\/[^\s;&|)]+\.(?:log|txt|out))/g)) logs.add(m[1]);
+            // Redirect target after > or >>, absolute or relative (agents use both:
+            // /tmp/x.log, .build-foo.log, build/agent-logs/x.log, a bare x.log).
+            for (const m of cmd.matchAll(/>{1,2}\s*([^\s;&|)<>]+\.(?:log|txt|out))/g)) logs.add(m[1]);
           }
         }
       }
