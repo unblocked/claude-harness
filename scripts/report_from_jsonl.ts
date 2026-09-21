@@ -1,5 +1,4 @@
 // Generate a comparison report from two existing stream-json transcripts.
-// Usage: bun scripts/report_from_jsonl.ts <baseline.jsonl> <unblocked.jsonl> [result.json | model] [branch] [task] [--attribute[=model]] [--rejudge[=model]] [--impact[=model]]
 // Token usage and tool calls are always re-parsed from the transcripts. The
 // task prompt, branch, and code diffs are not recorded in stream-json output:
 // pass the run's original result.json (third argument, detected by .json
@@ -40,9 +39,6 @@ function repoFromCwd(cwd: string | undefined): string | undefined {
   return parts.length >= 2 ? parts[parts.length - 2] : undefined;
 }
 
-// The CLI's duration_ms summed over result events (a draft pass plus a fix
-// pass is two); for a transcript with no result event (killed run), the span
-// of event timestamps.
 function durationMs(jsonl: string): number {
   let first = NaN, last = NaN, total = 0, seen = false;
   for (const line of jsonl.split("\n")) {
@@ -66,7 +62,6 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
     assistantTurns: parsed.assistantTurns,
     finalResponse: parsed.finalResponse,
     sessionId: parsed.sessionId,
-    // Exit state is not in the transcript; carried from the run's result.json.
     exitCode: orig?.run.exitCode ?? 0,
     timedOut: orig?.run.timedOut ?? false,
     ...(orig?.run.killedReason ? { killedReason: orig.run.killedReason } : {}),
@@ -82,15 +77,11 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
     diffStats: orig?.diffStats ?? { filesChanged: 0, linesAdded: 0, linesRemoved: 0, commits: 0 },
     unblockedCalls: extractUnblockedCalls(parsed.toolCalls),
     estimatedCost: cost,
-    // Carried over unless --attribute recomputes it; the analyst call is the slow part.
     attribution: orig?.attribution,
     review: orig?.review ? reparseReview(orig.review, file, model) : undefined,
   };
 }
 
-// Review passes were priced at run time; re-price the draft and each fix pass
-// from their own transcripts (<arm>.draft.jsonl, <arm>.fix<N>.jsonl) when
-// those sit beside the combined one, so parser fixes reach them.
 function reparseReview(review: NonNullable<ArmResult["review"]>, jsonlPath: string, model: string) {
   const dir = path.dirname(jsonlPath), stem = path.basename(jsonlPath, ".jsonl");
   const price = (file: string) => {
@@ -111,12 +102,6 @@ function reparseReview(review: NonNullable<ArmResult["review"]>, jsonlPath: stri
   };
 }
 
-// --attribute[=model] recomputes per-message attribution; --rejudge re-runs the
-// quality judge (same model, default opus). Only these flags are stripped from
-// argv, so a "--flag" inside a free-text task argument survives.
-// --attribute[=model] recomputes attribution (default opus); --rejudge[=model]
-// re-runs the quality judge and --impact[=model] the context-impact pass
-// (default fable). Only these flags are stripped from argv.
 const KNOWN = /^--(attribute|rejudge|impact)(=.*)?$/;
 const flagModel = (name: string, dflt: string) => { const f = process.argv.find(a => a === `--${name}` || a.startsWith(`--${name}=`)); return f ? (f.split("=")[1] || dflt) : null; };
 const attrModel = flagModel("attribute", "opus");
@@ -139,8 +124,6 @@ for (const a of [baseline, unblocked]) {
     const attr = await attribute(a.run.jsonlPath, task, a.run.totalCostUsd ?? a.estimatedCost, attrModel, a.condition);
     if (attr) a.attribution = attr;
   } else if (a.attribution) {
-    // Keep the analyst's labels, recompute the per-message numbers (cost,
-    // windows, stalls) from the transcript with the current code.
     const walk = buildWalk(fs.readFileSync(a.run.jsonlPath, "utf8"), a.run.totalCostUsd ?? a.estimatedCost);
     const labels = a.attribution.turns.map(t => ({ turn: t.turn, label: t.label, repeatOf: t.repeatOf, reason: t.reason }));
     if (walk.length === a.attribution.turns.length) a.attribution = rollup(walk, labels, a.attribution.analystModel, a.attribution.analystCostUsd);
@@ -160,9 +143,6 @@ const result: ComparisonResult = {
   ...(orig?.reviewSpec ? { reviewSpec: orig.reviewSpec } : {}),
 };
 
-// The judge and impact passes are the expensive, non-deterministic steps; a
-// previous result from the supplied result.json is kept unless re-run is asked
-// for, and a failed re-run keeps the previous result rather than dropping it.
 const killed = [baseline, unblocked].filter(a => a.run.killedReason);
 if (killed.length) console.error(`⚠ ${killed.map(a => `${a.condition} was killed (${a.run.killedReason})`).join("; ")}: judge and impact are not re-run for an unfinished comparison`);
 if (judgeModel && !killed.length) result.quality = (await assessQuality(result, judgeModel)) ?? orig?.quality;

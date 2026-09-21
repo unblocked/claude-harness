@@ -3,24 +3,14 @@ import type { ArmResult, ComparisonResult, EconomicsBreakdown, ToolCall } from "
 import { priceFor } from "./util.ts";
 import { VERIFY_CMD } from "./analyst.ts";
 
-// Deterministic decomposition of the cost, time and token differences between
-// the two arms, computed the same way for both. It names which term moved a
-// delta so the explanation that follows is anchored to arithmetic, not to a
-// story. Everything here is over core work (housekeeping removed) when
-// attribution exists, else over the whole run.
-
 const isResearch = (name: string, input: Record<string, unknown>) =>
   name.toLowerCase().includes("unblocked") || (name === "Bash" && /^unblocked\s+context/.test(String(input.command ?? "")));
 
-// Tokens of research results carried in context: for each research call, the
-// size of what came back (chars/4) times the number of later main-thread
-// messages that re-read it. An estimate of the cache-read tokens the research
-// context itself accounts for.
 function researchCarried(arm: ArmResult): { calls: number; payloadTokens: number; carriedTokens: number } {
   let jsonl = "";
   try { jsonl = fs.readFileSync(arm.run.jsonlPath, "utf8"); } catch { return { calls: 0, payloadTokens: 0, carriedTokens: 0 }; }
   const events = jsonl.split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-  const pending = new Map<string, number>();  // tool_use id -> message index of the call
+  const pending = new Map<string, number>();
   const payloads: { atMessage: number; tokens: number }[] = [];
   const seen = new Set<string>();
   let msgIndex = 0;
@@ -47,7 +37,6 @@ function researchCarried(arm: ArmResult): { calls: number; payloadTokens: number
   };
 }
 
-// Union of intervals, in ms.
 function unionMs(spans: [number, number][]): number {
   const sorted = [...spans].sort((a, b) => a[0] - b[0]);
   let total = 0, curStart = -1, curEnd = -1;
@@ -60,12 +49,6 @@ function unionMs(spans: [number, number][]): number {
 }
 
 function toolWaitByCategory(arm: ArmResult, core: boolean): Record<string, number> {
-  // Wall time of tool calls by kind: each call clipped to the core message
-  // windows (when attribution is the basis) and unioned within its kind, so
-  // two parallel calls of one kind count once and a kind never exceeds the
-  // window it ran in. Kinds can still overlap each other, so the rows are a
-  // breakdown of where waiting happened, not an exact partition of the
-  // headline tool wait.
   const windows = core ? arm.attribution!.turns.filter(t => t.label !== "housekeeping" && t.startMs > 0).map(t => [t.startMs, t.startMs + t.durationMs + t.stallMs] as const) : null;
   const spansByKind: Record<string, [number, number][]> = {};
   for (const tc of arm.run.toolCalls) {
@@ -89,16 +72,13 @@ function toolWaitByCategory(arm: ArmResult, core: boolean): Record<string, numbe
   return Object.fromEntries(Object.entries(spansByKind).map(([k, spans]) => [k, unionMs(spans)]));
 }
 
-// One side of the comparison. `core` selects the attribution's core totals
-// (housekeeping removed); the same basis is used for both arms, decided by
-// the caller, so a core figure is never set against a whole-run one.
 function armSide(arm: ArmResult, core: boolean) {
   const a = arm.attribution;
   const u = arm.run.tokenUsage;
   const totals = core && a ? a.core : { costUsd: arm.estimatedCost, inputTokens: u.inputTokens, cacheWriteTokens: u.cacheCreationTokens, durationMs: arm.run.durationMs, modelMs: 0, toolMs: 0, stallMs: 0, turns: arm.run.assistantTurns, outputTokens: u.outputTokens, cacheReadTokens: u.cacheReadTokens };
   const models = Object.entries(u.byModel ?? {});
   const thinking = models.reduce((s, [, m]) => s + (m.thinkingTokens ?? 0), 0);
-  const scale = u.outputTokens > 0 ? totals.outputTokens / u.outputTokens : 1; // core share of the run's output
+  const scale = u.outputTokens > 0 ? totals.outputTokens / u.outputTokens : 1;
   const research = researchCarried(arm);
   return {
     costUsd: totals.costUsd,
@@ -122,8 +102,6 @@ export function economics(result: ComparisonResult): EconomicsBreakdown {
   const u = armSide(result.unblocked, core);
   const price = priceFor(result.model);
   const perM = (n: number, rate: number) => (n / 1_000_000) * rate;
-  // Cost delta by term, at the model's list rates (the billed total is what
-  // the arms show; this is the attribution of the difference between them).
   const costTerms = {
     output: perM(u.outputTokens - b.outputTokens, price.output),
     cacheRead: perM(u.cacheReadTokens - b.cacheReadTokens, price.cacheRead),
@@ -147,7 +125,6 @@ export function economics(result: ComparisonResult): EconomicsBreakdown {
   };
 }
 
-// Plain-text rendering for the explainer prompt and the console.
 export function describeEconomics(e: EconomicsBreakdown): string {
   const f = (n: number) => (n >= 0 ? "+" : "") + n.toLocaleString("en-US", { maximumFractionDigits: 0 });
   const usd = (n: number) => (n >= 0 ? "+" : "-") + "$" + Math.abs(n).toFixed(2);

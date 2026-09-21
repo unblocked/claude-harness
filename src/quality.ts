@@ -3,14 +3,7 @@ import type { ArmResult, ComparisonResult, Condition, DecisiveDiscovery, Quality
 import { formatCost, log } from "./util.ts";
 import { neutralise, runStructured, VERIFY_CMD } from "./analyst.ts";
 
-// Blinded quality judgement of the two arms' output. The judge sees the task,
-// each arm's final response, diff, and verification record, labelled A and B
-// in random order. It extracts the task's requirements, grades each arm on
-// them, scores a fixed set of criteria, lists notable findings and gives a
-// verdict. Un-blinded before it is stored. It never sees which arm had the
-// research tool, and mentions of it in the agents' own text are neutralised.
-
-const DIFF_BUDGET = 40_000;   // chars of diff per arm shown to the judge
+const DIFF_BUDGET = 40_000;
 
 export const CRITERIA = [
   { key: "completeness", text: "Completeness: how much of the task's stated requirements was delivered. Work beyond the requirements does not raise this score." },
@@ -21,18 +14,11 @@ export const CRITERIA = [
   { key: "hygiene", text: "Change hygiene: is the diff proportionate to the requirements, free of vendored bulk or generated junk, and would a reviewer accept it without asking for cleanup." },
 ];
 
-
 function verificationRecord(arm: ArmResult, jsonl: string): string {
-  // Test/CI commands and the tail of their output, straight from the
-  // transcript. An agent may run a build in the background with its output
-  // redirected to a log and read the result later with grep/tail/cat; the
-  // record follows those reads, and the CLI's completion notification for a
-  // background command, so a background build is not mistaken for no
-  // verification.
   const events = jsonl.split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-  const pending = new Map<string, string>();       // tool_use id -> command
-  const verifyIds = new Set<string>();             // tool_use ids of verify commands (for background notifications)
-  const logs = new Set<string>();                  // files verify output was redirected to
+  const pending = new Map<string, string>();
+  const verifyIds = new Set<string>();
+  const logs = new Set<string>();
   const lines: string[] = [];
   const tail = (t: string) => t.replace(/\s+/g, " ").trim().slice(-400);
   for (const e of events) {
@@ -45,8 +31,6 @@ function verificationRecord(arm: ArmResult, jsonl: string): string {
           pending.set(b.id, cmd.replace(/\s+/g, " ").slice(0, 160));
           if (VERIFY_CMD.test(cmd)) {
             verifyIds.add(b.id);
-            // Redirect target after > or >>, absolute or relative (agents use both:
-            // /tmp/x.log, .build-foo.log, build/agent-logs/x.log, a bare x.log).
             for (const m of cmd.matchAll(/>{1,2}\s*([^\s;&|)<>]+\.(?:log|txt|out))/g)) logs.add(m[1]);
           }
         }
@@ -67,9 +51,6 @@ function verificationRecord(arm: ArmResult, jsonl: string): string {
   return lines.length ? lines.join("\n") : "(no test, lint, build or CI commands were run)";
 }
 
-// The reviewer's record for one arm: the last pass's verdict per requirement,
-// its open comments, and how many rounds it took. Same reviewer, same list,
-// same rubric for both arms, so the judge can start from it.
 function reviewRecord(label: string, arm: ArmResult): string {
   const rv = arm.review;
   if (!rv || !rv.passes.length) return "";
@@ -149,9 +130,6 @@ const SCHEMA = {
 };
 
 function judgePrompt(task: string, first: ArmResult, second: ArmResult, spec: ReviewSpec | undefined): string {
-  // With a shared review standard the judge grades the same numbered list the
-  // reviewers used, so the two tables are comparable line by line. A waived
-  // requirement is not graded.
   const waived = new Set((spec?.adjudications ?? []).filter(a => a.waived).map(a => a.index));
   const reviewed = [first, second].some(a => a.review?.passes.length);
   const step1 = spec
@@ -196,12 +174,10 @@ type Raw = {
 };
 
 export async function assessQuality(result: ComparisonResult, model: string): Promise<QualityAssessment | null> {
-  // A placeholder where the diff should be means the judge would be grading a sentinel.
   for (const arm of [result.baseline, result.unblocked]) {
     if (!arm.diff || arm.diff.startsWith("(")) { log(`Quality: skipping judge, ${arm.condition} arm has no diff to judge (${arm.diff.slice(0, 60)})`); return null; }
   }
 
-  // Blind: random order, so "A" is baseline half the time.
   const aIsBaseline = Math.random() < 0.5;
   const first = aIsBaseline ? result.baseline : result.unblocked;
   const second = aIsBaseline ? result.unblocked : result.baseline;
@@ -209,13 +185,11 @@ export async function assessQuality(result: ComparisonResult, model: string): Pr
 
   const prompt = judgePrompt(result.task, first, second, result.reviewSpec);
   log(`Quality: judging with ${model} (${Math.round(prompt.length / 1000)}k chars, arm A = ${aIsBaseline ? "baseline" : "unblocked"})…`);
-  // Unredacted: the judge must see digests, env var names and auth headers as written.
   const res = await runStructured<Raw>("Quality", prompt, model, SCHEMA, 15 * 60 * 1000, false);
   if (!res) return null;
   const raw = res.data;
 
   const pick = <T>(row: { A: T; B: T }, c: Condition): T => (cond("A") === c ? row.A : row.B);
-  // Un-blind the prose: "Agent A" / "Agent B" become the arm names the reader knows.
   const nameOf = (l: "A" | "B") => (cond(l) === "baseline" ? "Baseline" : "Unblocked");
   const unblind = (t: string) => t.replace(/\b[Aa]gent ([AB])\b/g, (_, l: "A" | "B") => nameOf(l));
   const ub = <T extends Record<string, unknown>>(o: T): T => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === "string" ? unblind(v) : v])) as T;
@@ -240,10 +214,6 @@ export async function assessQuality(result: ComparisonResult, model: string): Pr
   return q;
 }
 
-// The tie-breaker, applied after the impact pass: a blinded tie goes to the
-// Unblocked arm only when its candidate discovery changed the outcome and the
-// impact pass found the context led to it. Anything else leaves the blinded
-// verdict as it is. Idempotent: re-applying recomputes from `blinded`.
 export function applyTieBreaker(result: ComparisonResult): void {
   const q = result.quality;
   if (!q) return;

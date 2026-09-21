@@ -18,21 +18,15 @@ function divider(): string {
   return "╠" + "═".repeat(W + 2) + "╣";
 }
 
-// Shell commands that write files. Agents sometimes bypass Edit/Write and
-// patch code through `python3 - <<'PY' ... write_text(...)`, `cat > f <<EOF`,
-// `sed -i`, etc.; without this, such an arm shows "Edit: 0" beside a real diff.
-// Deliberately narrow: an earlier, looser version matched `2>/dev/null` and
-// `=>` inside grep patterns and flagged ~125 read-only commands across the
-// saved transcripts. This one flags 16 of 701, all genuine.
 const BASH_WRITE_RE = new RegExp([
-  String.raw`(?:^|[\s;&|(])cat\s*>{1,2}\s*[^\s&|;>]+\s*<<`,                                                  // cat > file <<EOF
-  String.raw`(?:python3?|ruby|node|perl)\s+-\s*<<[\s\S]*?(?:write_text\(|\.write\(|open\([^)]*["'][wa]|writeFileSync|File\.write|IO\.write)`, // inline script that writes
-  String.raw`\bsed\s+(?:-[a-zA-Z]*\s+)*-i\b`,                                                               // sed -i
+  String.raw`(?:^|[\s;&|(])cat\s*>{1,2}\s*[^\s&|;>]+\s*<<`,
+  String.raw`(?:python3?|ruby|node|perl)\s+-\s*<<[\s\S]*?(?:write_text\(|\.write\(|open\([^)]*["'][wa]|writeFileSync|File\.write|IO\.write)`,
+  String.raw`\bsed\s+(?:-[a-zA-Z]*\s+)*-i\b`,
   String.raw`\bperl\s+-p?i\b`,
-  String.raw`\btee\s+(?:-a\s+)?(?!/dev/)[\w./-]+`,                                                          // tee file
+  String.raw`\btee\s+(?:-a\s+)?(?!/dev/)[\w./-]+`,
   String.raw`\bgit\s+apply\b`,
   String.raw`(?:^|[\s;&|])patch\s+(?:-p\d\s+)?[<\w]`,
-  String.raw`(?:^|[^\w<>=&$-])>{1,2}\s*(?!/dev/|&)['"]?[\w./~-]+`,                                             // echo x > file; not 2>, =>, >&, /dev/null
+  String.raw`(?:^|[^\w<>=&$-])>{1,2}\s*(?!/dev/|&)['"]?[\w./~-]+`,
 ].join("|"), "m");
 
 function bashWritesFiles(cmd: string): boolean {
@@ -61,9 +55,6 @@ function toolCategory(tc: ToolCall): string {
   return tc.name;
 }
 
-// Wall time covered by the given calls, as a union of their intervals: two
-// parallel 30s calls are 30s of tool time, not 60s. Calls issued by subagents
-// are skipped — the parent Agent call's interval already spans them.
 function unionMs(calls: ToolCall[]): number {
   const spans = calls
     .filter(tc => !tc.nested && tc.timestamp > 0 && (tc.durationMs ?? 0) > 0)
@@ -86,15 +77,9 @@ function hasTiming(arm: ArmResult): boolean {
   return arm.run.toolCalls.some(tc => (tc.durationMs ?? 0) > 0);
 }
 
-// Core model/tool time straight from the per-message windows (attribution.ts).
 function coreToolTimeMs(arm: ArmResult): number { return arm.attribution ? arm.attribution.core.toolMs : toolTimeMs(arm); }
 function coreModelTimeMs(arm: ArmResult): number { return arm.attribution ? arm.attribution.core.modelMs : modelTimeMs(arm); }
 
-// Short description of what the housekeeping turns were, for the summary line.
-// Wall time inside a model wait that no model call can account for (the
-// machine slept, or the API was down): excluded from every time figure.
-// Final status of every shared requirement for both arms, from each arm's
-// last review pass, with the adjudicated disputes underneath.
 function sharedRequirementsTable(result: ComparisonResult): string {
   const spec = result.reviewSpec;
   if (!spec) return "";
@@ -104,8 +89,6 @@ function sharedRequirementsTable(result: ComparisonResult): string {
     if (!r) return "<td>–</td>";
     return `<td><span class="met ${r.status === "met" ? "met-met" : r.status === "unmet" ? "met-unmet" : "met-partial"}">${r.status}</span><div class="evidence">${escapeHtml(r.note)}</div></td>`;
   };
-  // A waiver granted after an arm had already been sent back for that
-  // requirement cost that arm a fix round the other arm did not pay for.
   const paidFor = (arm: ArmResult, index: number) => (arm.review?.passes ?? []).filter(p => p.fix && !(p.waiversInForce ?? []).includes(index) && p.requirements.some(r => r.index === index && (r.status === "unmet" || r.status === "partial"))).length;
   const adj = spec.adjudications.map(a => {
     const cost = a.waived ? [["Baseline", result.baseline], ["With Unblocked", result.unblocked]].map(([n, arm]) => [n, paidFor(arm as ArmResult, a.index)] as const).filter(([, k]) => k > 0).map(([n, k]) => `${n} had already spent ${k} fix pass(es) on it before the waiver`).join("; ") : "";
@@ -140,15 +123,11 @@ function housekeepingKinds(arm: ArmResult): string {
 
 const MET_ICON: Record<Met, string> = { met: "✓", partial: "◐", unmet: "✗" };
 
-// Files the agent changed without ever calling Edit/Write: everything went
-// through shell commands (heredocs, sed, git). Worth a note next to the tool
-// counts, where "Edit: 0" would otherwise read as "did nothing".
 function shellOnlyEdits(arm: ArmResult): boolean {
   const editors = arm.run.toolCalls.filter(tc => ["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(tc.name)).length;
   return arm.diffStats.filesChanged > 0 && editors === 0;
 }
 
-// category -> wall time across that category's calls (ms), overlap-free.
 function toolTimeBreakdown(toolCalls: ToolCall[]): Record<string, number> {
   const byCat: Record<string, ToolCall[]> = {};
   for (const tc of toolCalls) (byCat[toolCategory(tc)] ??= []).push(tc);
@@ -159,8 +138,6 @@ function modelTimeMs(arm: ArmResult): number {
   return Math.max(0, arm.run.durationMs - toolTimeMs(arm));
 }
 
-// Unblocked calls are left out: they have their own section, and this list is
-// meant to show where the *rest* of the wall time went (tests, CI, shell).
 function slowestTools(toolCalls: ToolCall[], n: number): ToolCall[] {
   return [...toolCalls]
     .filter(tc => (tc.durationMs ?? 0) > 0 && !tc.nested && toolCategory(tc) !== "Unblocked")
@@ -174,8 +151,6 @@ function toolLabel(tc: ToolCall): string {
   const fp = (tc.args.file_path as string) ?? "";
   return fp ? `${tc.name}: ...${fp.slice(-60)}` : tc.name;
 }
-
-
 
 // category -> model label -> count. Calls without model info land under "".
 function toolBreakdown(toolCalls: ToolCall[]): Record<string, Record<string, number>> {
@@ -384,7 +359,6 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   const allTools = [...new Set([...Object.keys(toolsB), ...Object.keys(toolsU)])].sort();
   const hasToolTiming = hasTiming(b) || hasTiming(u);
   const hasAttr = !!(b.attribution && u.attribution);
-  // Old transcripts carry no per-event timestamps; then durations are 0 and time rows are meaningless.
   const hasCoreTiming = hasAttr && (b.attribution!.raw.durationMs > 0 || u.attribution!.raw.durationMs > 0);
   const timeCell = (ms: number | undefined) => ms ? formatDuration(ms) : `<span style="color: var(--text-muted)">–</span>`;
 
@@ -402,8 +376,6 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
     return `${total} <span style="color: var(--text-muted); font-size: 12px;">(${split})</span>`;
   };
 
-
-  // Why the numbers differ: the explainer's three paragraphs (when present) over the computed decomposition.
   const economicsBlock = (r: ComparisonResult) => {
     const e = r.economics!;
     const ex = r.impact?.economics;
@@ -465,7 +437,6 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
       </tr>`;
   }).join("");
 
-  // Headline numbers are core work when attribution exists; raw totals move to the footnote.
   const armCard = (label: string, arm: ArmResult, accent: boolean) => {
     const t = arm.run.tokenUsage;
     const has = totalTokens(t) > 0;
@@ -514,8 +485,6 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   const bModelMs = modelTimeMs(b), uModelMs = modelTimeMs(u);
   const bToolMs = toolTimeMs(b), uToolMs = toolTimeMs(u);
 
-  // One head-to-head bar pair. Lower is better for every metric shown, so the
-  // Unblocked bar is green when it is at or below baseline.
   const barPair = (label: string, bVal: number, uVal: number, max: number, fmt: (n: number) => string, note = "") => {
     const better = uVal <= bVal;
     return `
@@ -1205,17 +1174,11 @@ export function writeHtmlReport(result: ComparisonResult, outDir: string): strin
   return htmlPath;
 }
 
-// Summary across the repeats of one task: verdict counts, per-arm medians of
-// core cost and time, and a row per run linking to its report.
 export function writeBatchSummary(config: { task: string; repo: string; branch: string; model: string; repeat: number }, results: ComparisonResult[], batchDir: string): string {
   const median = (xs: number[]) => { if (!xs.length) return 0; const a = [...xs].sort((x, y) => x - y); return a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2; };
   const core = (r: ComparisonResult, arm: "baseline" | "unblocked") => r[arm].attribution?.core ?? { costUsd: r[arm].estimatedCost, durationMs: r[arm].run.durationMs, turns: r[arm].run.assistantTurns };
   const counts = { unblocked: 0, baseline: 0, tie: 0, none: 0 };
   for (const r of results) { const v = r.quality?.verdict.better; if (v === "unblocked" || v === "baseline" || v === "tie") counts[v]++; else counts.none++; }
-  // A run that never got a verdict (an arm was killed or timed out) has real
-  // spend up to the point it was cut off, but that partial number is not a
-  // comparable data point next to a completed comparison; it would drag the
-  // median toward whatever the kill happened to cost. Judged runs only.
   const judged = results.filter(r => r.quality);
   if (judged.length < results.length) console.error(`Batch summary: ${results.length - judged.length} of ${results.length} run(s) had no verdict (killed/void) and are excluded from the medians, shown as "–" in the table`);
   const med = (arm: "baseline" | "unblocked", f: (c: ReturnType<typeof core>) => number) => median(judged.map(r => f(core(r, arm))));

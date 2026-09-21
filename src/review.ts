@@ -2,38 +2,7 @@ import type { ArmResult, Condition, ReviewPass, ReviewRequirement, ReviewSpec } 
 import { formatCost, log } from "./util.ts";
 import { neutralise, runStructured } from "./analyst.ts";
 
-// Requirement check, held to one standard for both arms. The reviewer has
-// one job: for each of the task's requirements, say whether the change
-// meets it, and if not, why. It does not comment on code, suggest work,
-// rate quality or add requirements; that is the judge's job, after the
-// fact, and anything more here would steer the agents.
-//
-// - The requirements are extracted from the task once, before either arm
-//   runs, and every check uses that same numbered list.
-// - The reviewer never waives anything. If an agent disputes a requirement
-//   in its fix pass, an arm-blind adjudicator (task, list, dispute text; no
-//   diff, no arm name) decides, and a waiver applies to both arms.
-// - mergeable: every requirement met or waived.
-//
-// The reviewer sees only its own arm: the task, the agent's final response
-// as the PR description, and the diff.
-
-// Observed real diffs run 60-100k characters for a multi-file Kotlin change
-// (12-14 files with test boilerplate); a 60k budget truncated one arm's diff
-// before its test files, in both directions depending on git's file order,
-// and the checker read "not shown" as "not done" every round, burning the
-// full round cap on a check the diff could never satisfy. 200k gives 2-3x
-// headroom over anything seen so far; a checker model has ample context left
-// for it. Real over-budget diffs still get an explicit "not shown" marker
-// (below) so the checker does not have to guess.
 const DIFF_BUDGET = 200_000;
-
-// Hide the treatment, not the repository. Only the tool's own names go:
-// "Unblocked MCP/context/research/CLI", the MCP tool names. A bare
-// "unblocked" stays, because the repository under test is called that and
-// its paths, packages and files carry the word.
-
-// ---- Requirements, once per run --------------------------------------------
 
 const SPEC_SCHEMA = {
   type: "object",
@@ -57,8 +26,6 @@ ${task}
 
 const waivedIndices = (spec: ReviewSpec) => new Set(spec.adjudications.filter(a => a.waived).map(a => a.index));
 const exclusionsFor = (spec: ReviewSpec, i: number) => spec.adjudications.filter(a => a.index === i && !a.waived && a.excludes).map(a => a.excludes as string);
-
-// ---- One review pass --------------------------------------------------------
 
 const SCHEMA = {
   type: "object",
@@ -109,7 +76,6 @@ ${neutralise(diff)}
 
 export type ReviewOutput = { requirements: ReviewRequirement[]; waiversInForce: number[]; mergeable: boolean; summary: string; costUsd: number; model: string };
 
-// Aligns the reviewer's answers to the fixed list and applies the waivers.
 function alignRequirements(spec: ReviewSpec, answers: { index: number; status: "met" | "partial" | "unmet"; note: string }[]): ReviewRequirement[] {
   const waived = waivedIndices(spec);
   const byIndex = new Map(answers.map(a => [a.index - 1, a]));
@@ -133,8 +99,6 @@ export async function reviewDraft(task: string, arm: ArmResult, model: string, r
   return { requirements, waiversInForce: [...waivedIndices(spec)].sort((a, b) => a - b), mergeable, summary: res.data.summary, costUsd: res.costUsd, model: res.modelUsed };
 }
 
-// ---- Disputes, adjudicated once for both arms -------------------------------
-
 const DISPUTE_SCHEMA = {
   type: "object",
   properties: { decisions: { type: "array", items: { type: "object", properties: {
@@ -146,13 +110,7 @@ const DISPUTE_SCHEMA = {
   required: ["decisions"],
 };
 
-// Decides the disputed requirements that have not been decided yet, and
-// records the decisions on the shared spec. Blind to which arm disputed and
-// to its diff: only the task, the list and the engineer's argument. Returns
-// the call's cost.
 export async function adjudicateDisputes(task: string, spec: ReviewSpec, disputed: string, by: Condition, round: number, model: string): Promise<number> {
-  // A requirement can be disputed more than once, on different cases; only a
-  // waiver or a rejected dispute closes it.
   const closed = new Set(spec.adjudications.filter(a => a.waived || !a.excludes).map(a => a.index));
   const open = spec.requirements.map((_, i) => i).filter(i => !closed.has(i));
   if (!open.length || !disputed.trim()) return 0;
@@ -188,9 +146,6 @@ ${neutralise(disputed)}
   return res.costUsd;
 }
 
-// Re-applies the final waivers to an arm's last review pass, so a waiver won
-// by one arm after the other arm's last review shows for both. finalMergeable
-// follows.
 export function applyWaivers(arm: ArmResult, spec: ReviewSpec): void {
   const rv = arm.review;
   if (!rv || !rv.passes.length) return;
@@ -206,8 +161,6 @@ export function applyWaivers(arm: ArmResult, spec: ReviewSpec): void {
   rv.finalMergeable = last.mergeable;
 }
 
-// The message the agent gets when its session is resumed for a fix pass:
-// the requirements not yet met and why, nothing else.
 export function fixPrompt(round: number, r: ReviewOutput): string {
   const open = r.requirements.filter(x => x.status === "unmet" || x.status === "partial").map(x => `- ${x.requirement} — ${x.status}: ${x.note}`).join("\n");
   return `Your change has been checked against the task's requirements (round ${round}). These are not yet met:
@@ -216,17 +169,11 @@ ${open || "(none)"}
 Make the change meet each of them. Do not take on work beyond what these requirements need. If you believe one is wrong — it does not apply to this codebase, is already satisfied in a way the check missed, or would do harm — do not silently ignore it: put a section headed "Disputed:" in your final response that names it and gives your reason, so it can be decided. Where you are unsure how the codebase handles something, research it with the tools you used before rather than guessing. Keep to the conventions you already followed. Re-run the checks you ran before and wait for them to finish. Do not rebase, commit, branch, or tidy unrelated files. End with a short summary of what changed.`;
 }
 
-// The "Disputed:" section of a fix-pass response, if any.
 export function disputedSection(finalResponse: string): string {
   const m = finalResponse.match(/(?:^|\n)\s*(?:#+\s*)?\**Disputed:?\**\s*\n?([\s\S]{0,2000})/i);
-  // The section ends at the next heading, bold title line, or "Title:" line
-  // on its own; without that, the summary that follows would be sent to the
-  // adjudicator as part of the dispute. Blank lines do not end it: agents
-  // write the dispute as a title, a blank line, then paragraphs.
   let text = m ? m[1] : "";
   const end = text.search(/\n\s*(#+\s|\*\*[^*\n]{1,80}\*\*:?\s*\n|[A-Z][A-Za-z ]{2,40}:\s*\n)/);
   if (end >= 0) text = text.slice(0, end);
   text = text.trim();
-  // "Disputed: none." is not a dispute.
   return /^[\s*_]*(none|nothing|n\/a|no disputes?|no)\b/i.test(text) ? "" : text;
 }

@@ -13,27 +13,18 @@ import { assessImpact } from "./impact.ts";
 import { economics } from "./economics.ts";
 import { adjudicateDisputes, applyWaivers, disputedSection, extractRequirements, fixPrompt, reviewDraft } from "./review.ts";
 
-// The commits the agent made: everything reachable from any commit this
-// worktree's HEAD ever pointed at (its reflog, plus HEAD now) that was not
-// already reachable from a ref when the run started. Checking out a
-// pre-existing branch contributes nothing; committing onto one contributes the
-// new commits; committing then resetting or switching away still contributes.
 export function agentCommits(cwd: string, baseSha: string, refsBefore: Map<string, string> | null): Set<string> {
   const heads = new Set<string>();
   const head = tryGit(cwd, ["rev-parse", "HEAD"], "resolving HEAD")?.trim();
   if (head) heads.add(head);
   for (const sha of (tryGit(cwd, ["reflog", "show", "--format=%H", "HEAD"], "reading worktree reflog") ?? "").split("\n")) if (sha.trim()) heads.add(sha.trim());
   if (heads.size === 0) return new Set();
-  // Exclude everything reachable from a pre-run ref, and from any remote-tracking
-  // ref as it stands now: an agent that fetches during its run pulls in upstream
-  // commits that were not in the snapshot, and those are not its work either.
   const remoteTips = (tryGit(cwd, ["for-each-ref", "--format=%(objectname)", "refs/remotes"], "listing remote refs") ?? "").split("\n").map(l => l.trim()).filter(Boolean);
   const exclude = new Set<string>([baseSha, ...(refsBefore ? refsBefore.values() : []), ...remoteTips]);
   const out = tryGit(cwd, ["rev-list", ...heads, "--not", ...exclude], "listing agent commits");
   return new Set((out ?? "").split("\n").map(l => l.trim()).filter(Boolean));
 }
 
-// Most recent reflog entry that is an agent commit descending from the base.
 function latestAgentTip(cwd: string, baseSha: string, agent: Set<string>): string | null {
   for (const raw of (tryGit(cwd, ["reflog", "show", "--format=%H", "HEAD"], "reading worktree reflog") ?? "").split("\n")) {
     const sha = raw.trim();
@@ -56,16 +47,6 @@ function numstatTotals(numstat: string): { files: number; added: number; removed
   return { files, added, removed };
 }
 
-// Everything the agent changed relative to the commit the worktree started from.
-// Exactly one view is reported, never two concatenated:
-//   - HEAD is an agent commit (or the base) → the working tree vs the base:
-//     the agent's commits plus whatever is still uncommitted, plus untracked;
-//   - HEAD is some pre-existing commit (the agent checked out another branch)
-//     → the working tree vs HEAD if it is dirty, else the latest agent commit
-//     found in the reflog vs the base, else nothing.
-// Commit count is the number of agent commits reachable from the reported
-// view. Line counts come from --numstat; the diff text is captured separately
-// and replaced by a summary when it will not fit.
 export function captureDiff(cwd: string, baseSha: string, refsBefore: Map<string, string> | null): Captured & { agent: Set<string> } {
   const agent = agentCommits(cwd, baseSha, refsBefore);
   const fail = (diff: string): Captured & { agent: Set<string> } => ({ diff, stats: { filesChanged: 0, linesAdded: 0, linesRemoved: 0, commits: 0 }, agent });
@@ -79,14 +60,11 @@ export function captureDiff(cwd: string, baseSha: string, refsBefore: Map<string
   let commits: number;
   let includeWorkingTree: boolean;
   if (agent.has(head)) {
-    // HEAD is the agent's own commit: working tree vs base covers commits + uncommitted.
     range = [baseSha]; commits = countIn(head); includeWorkingTree = true;
   } else if (dirty) {
-    // HEAD is the base or some pre-existing commit and the tree is dirty: the tree is the latest state.
     if (agent.size) log(`Worktree HEAD ${head.slice(0, 7)} is not an agent commit and the tree is dirty; reporting uncommitted changes (${agent.size} agent commit(s) in the reflog are not in the diff)`);
     range = [head]; commits = 0; includeWorkingTree = true;
   } else {
-    // Clean tree at a non-agent commit: the agent's work, if any, is a commit it moved away from.
     const tip = latestAgentTip(cwd, baseSha, agent);
     if (tip) { range = [baseSha, tip]; commits = countIn(tip); includeWorkingTree = false; }
     else { range = [head]; commits = 0; includeWorkingTree = true; }
@@ -96,7 +74,6 @@ export function captureDiff(cwd: string, baseSha: string, refsBefore: Map<string
   if (numstat === null) return fail("(failed to capture diff)");
   const totals = numstatTotals(numstat);
 
-  // --no-index exits 1 when the files differ (always, against /dev/null); anything else is a real failure.
   const noIndex = (file: string, extra: string[]): string | null => {
     try { git(cwd, ["diff", "--no-index", ...extra, "/dev/null", file]); return ""; } catch (e) {
       const err = e as { status?: number | null; code?: string; stdout?: Buffer };
@@ -166,11 +143,6 @@ export function extractUnblockedCalls(toolCalls: { name: string; args: Record<st
   return calls;
 }
 
-// The same research discipline goes to both arms, with only the tool named
-// differently, so the comparison measures the tool and not the instructions.
-// A research result that comes back empty is treated as evidence, not as a
-// finding: the agent is told to check a second source before concluding that
-// something does not exist.
 const RESEARCH_DISCIPLINE = `How to research, whatever tools you use:
 - Before writing code, look for the convention this organisation already uses for this class of problem: prior art in this repository, in other repositories, in build images and shared actions, in docs, tickets and past discussions.
 - After planning, check for operational risks, previous incidents, deployment gotchas and rejected approaches related to your plan. Before implementing an unfamiliar pattern, verify conventions and team decisions.
@@ -202,11 +174,8 @@ ${RESEARCH_DISCIPLINE}
 TASK:
 `;
 
-// A base that is behind its upstream can make the task moot before the run
-// starts (the fix may already have landed). Fetch, compare, and say so.
 function warnIfBehindUpstream(repo: string, branch: string): void {
   if (tryGit(repo, ["fetch", "--quiet", "origin"], "fetching origin to check the base") === null) return;
-  // A remote-tracking base (origin/main) is the tip after the fetch; nothing to compare.
   if (/^(origin|refs\/remotes)\//.test(branch)) return;
   let upstream: string | null = null;
   try { upstream = git(repo, ["rev-parse", "--abbrev-ref", `${branch}@{upstream}`]).trim(); } catch { /* no upstream configured */ }
@@ -216,10 +185,6 @@ function warnIfBehindUpstream(repo: string, branch: string): void {
   if (behind > 0) log(`⚠ Base ${branch} is ${behind} commit(s) behind ${upstream}. If the task's fix has already landed upstream, both arms will find it and the comparison measures something else. Pass --branch ${upstream} to run against the tip.`);
 }
 
-// A run is an hour of unattended work. On macOS the machine idles to sleep
-// while it waits, and both arms freeze until it wakes (a 16-minute stall on
-// one run). caffeinate -i holds off idle sleep for as long as this process
-// lives; -w ends it when the harness exits.
 function keepMachineAwake(): void {
   if (process.platform !== "darwin") return;
   try {
@@ -231,12 +196,6 @@ function keepMachineAwake(): void {
   }
 }
 
-// Per-run state, one object per comparison so repeats can run concurrently:
-// agent commits per arm (for branch cleanup after the diff is captured), the
-// worktree name per arm from the moment it exists (so a run that fails half
-// way still removes what it created), and the run's shared review standard
-// (see review.ts), set before the arms start and mutated by adjudications
-// from either arm.
 interface RunContext {
   agentCommitsByArm: Map<Condition, Set<string>>;
   worktreeByArm: Map<Condition, string>;
@@ -262,8 +221,6 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
   ctx.worktreeByArm.set(condition, wtName);
   log(`[${condition}] Worktree at: ${wtPath} (base ${baseSha.slice(0, 7)})`);
 
-  // --timeout budgets the arm: the draft and every fix pass share it. Each
-  // pass reports how long it was awake (runClaude counts awake time only).
   let spentMs = 0;
   const remainingMs = () => Math.max(60_000, config.timeoutSeconds * 1000 - spentMs);
 
@@ -326,8 +283,6 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
     }
     const last = review.passes[review.passes.length - 1];
     if (!review.finalMergeable && !review.checkFailed && last?.fix) {
-      // The loop ended after a fix (rounds exhausted, or the fix pass was
-      // killed): one more check to record the final state, no fix.
       const armNow: ArmResult = { condition, run, diff, diffStats, unblockedCalls: [], estimatedCost: run.totalCostUsd ?? estimateCost(config.model, run.tokenUsage) };
       const r = await reviewDraft(config.task, armNow, config.checkerModel, last.round + 1, last, spec, disputed);
       if (r) { review.passes.push(toPass(last.round + 1, r)); review.finalMergeable = r.mergeable; }
@@ -348,8 +303,6 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
 
 const BASELINE_FIX_PREAMBLE = "IMPORTANT: as before, do NOT use any Unblocked tools, Unblocked skills, or Unblocked CLI commands.\n\n";
 
-// The draft run plus the fix pass as one run: sums for time, tokens and cost;
-// the fix pass's final response; the combined transcript.
 function mergeRuns(a: RunResult, b: RunResult, jsonlPath: string, model: string): RunResult {
   const addUsage = (x: TokenUsage, y: TokenUsage): TokenUsage => ({
     inputTokens: x.inputTokens + y.inputTokens, outputTokens: x.outputTokens + y.outputTokens,
@@ -359,8 +312,6 @@ function mergeRuns(a: RunResult, b: RunResult, jsonlPath: string, model: string)
   });
   const byModel: Record<string, TokenUsage> = { ...(a.tokenUsage.byModel ?? {}) };
   for (const [m, mu] of Object.entries(b.tokenUsage.byModel ?? {})) byModel[m] = byModel[m] ? addUsage(byModel[m], mu) : { ...mu };
-  // A pass without a billed total is priced from the rate table before the
-  // sum, so a missing draft cost never becomes 0 + fix cost.
   const costOf = (x: RunResult) => x.totalCostUsd ?? estimateCost(model, x.tokenUsage);
   const anyEstimated = !!(a.costEstimated || b.costEstimated || a.totalCostUsd === null || b.totalCostUsd === null);
   return {
@@ -385,8 +336,6 @@ export async function run(config: Config, outDirOverride?: string, sharedSpec?: 
   const startTime = Date.now();
   const ctx: RunContext = { agentCommitsByArm: new Map(), worktreeByArm: new Map(), reviewSpec: null };
 
-  // A random suffix: two harness processes started in the same millisecond
-  // once shared a directory and interleaved their transcripts.
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-") + "-" + randomBytes(2).toString("hex");
   const outDir = outDirOverride ?? path.join(process.cwd(), "results", `run-${timestamp}`);
   const baselineDir = path.join(outDir, "baseline");
@@ -394,16 +343,11 @@ export async function run(config: Config, outDirOverride?: string, sharedSpec?: 
   fs.mkdirSync(baselineDir, { recursive: true });
   fs.mkdirSync(unblockedDir, { recursive: true });
 
-  // One snapshot of every ref before either worktree exists. `worktree add
-  // --detach` creates no refs, so both arms share it. Used to separate the
-  // agent's commits from pre-existing history and to find branches it created.
   const refsBefore = snapshotRefs(config.repo);
   if (!refsBefore) throw new Error("Could not snapshot the repository's refs; without it the agent's commits cannot be told from existing history");
   warnIfBehindUpstream(config.repo, config.branch);
   keepMachineAwake();
   if (config.reviewRounds > 0) {
-    // Repeats of one task share the requirement list (extracted once by the
-    // batch) so their verdicts are comparable; adjudications are per run.
     ctx.reviewSpec = sharedSpec ? { ...sharedSpec, adjudications: [], costUsd: 0 } : await extractRequirements(config.task, config.checkerModel);
     if (!ctx.reviewSpec) throw new Error("Review: could not extract the task's requirements; not running the arms without a shared review standard");
   }
@@ -485,10 +429,6 @@ export async function run(config: Config, outDirOverride?: string, sharedSpec?: 
   return result;
 }
 
-// Repeats: the same comparison `config.repeat` times, up to `config.concurrency`
-// at once, each in its own directory under one batch directory, then a
-// summary across them. Repeats are independent: separate worktrees, spec,
-// transcripts and analysis. One failed repeat is logged and left out.
 export async function runBatch(config: Config): Promise<{ batchDir: string; results: ComparisonResult[] }> {
   if (config.repeat <= 1) {
     const r = await run(config);

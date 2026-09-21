@@ -4,22 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { log } from "./util.ts";
 
-// One way to ask a model for structured output: a single-turn `claude -p` call
-// with no tools and no MCP, a JSON schema, redaction of strings that trip input
-// safeguards, a retry on an intermittent decline, and a fallback model. Used by
-// the per-turn attribution analyst and the quality judge.
-
 const BINARY = process.env.CLAUDE_BINARY ?? "claude";
 export const FALLBACK_MODEL = "opus";
 
-// Shell commands that run tests, linters, type checks, builds or CI. Used to
-// pick verification output for the judge and to classify tool wait. Broad on
-// purpose: `gradlew`, `make lint-changes`, `bun test`, `detekt` all count.
 export const VERIFY_CMD = /(\b(rspec|rails test|bin\/ci|npm (test|run [\w:-]*(test|lint|check|build)[\w:-]*)|pnpm (test|lint|build)|yarn (test|lint|build)|bun test|go (test|vet|build)|gofmt|rubocop|tsc|eslint|pytest|jest|vitest|cargo (test|build|clippy)|mvn|gradlew?|detekt|ktlint)\b|\bmake [\w-]*(test|lint|check|build|ci)[\w-]*\b)/;
 const DECLINE_RETRIES = 2;
 
-// Strings that have tripped input safeguards on real transcripts (auth headers,
-// token env names, long hex ids). None carry signal for labelling or judging.
 export function redact(s: string): string {
   return s
     .replace(/\b[0-9a-f]{40}\b/g, "<sha>")
@@ -32,25 +22,12 @@ export interface StructuredResult<T> { data: T; costUsd: number; modelUsed: stri
 
 interface RawOut { structured_output?: unknown; result?: string; total_cost_usd?: number; is_error?: boolean; stop_reason?: string; num_turns?: number; subtype?: string }
 
-// HARNESS_DEBUG_DIR=<dir>: every analyst call's raw CLI output is written there.
 const DEBUG_DIR = process.env.HARNESS_DEBUG_DIR;
 let debugSeq = 0;
 
-// Analyst calls run from an empty directory. With the harness as cwd, Claude
-// Code loads this repo's CLAUDE.md into the model's system prompt, and the
-// judge learns the experiment's premise ("with and without Unblocked").
 const ANALYST_CWD = path.join(os.tmpdir(), "claude-harness-analyst");
 fs.mkdirSync(ANALYST_CWD, { recursive: true });
 
-// Blinding helper shared by the requirement check and the judge: hide the
-// treatment, not the repository. The tool's own names go ("Unblocked
-// MCP/context/research/CLI", the MCP tool ids, the CLI subcommands) and so
-// does the capitalised product name on its own, which is how an agent refers
-// to the tool in prose ("Unblocked surfaced…", "I did not use Unblocked").
-// Lowercase "unblocked" stays: the repository under test is called that and
-// its paths, packages and handles carry the word. A sentence that asserts
-// non-use of the tool is dropped outright, since the control arm is told not
-// to use it and says so.
 export function neutralise(s: string): string {
   const t = s
     .replace(/mcp__unblocked__\w+/g, "research_tool")
@@ -62,15 +39,10 @@ export function neutralise(s: string): string {
 }
 
 function callOnce(prompt: string, model: string, schema: object, timeoutMs: number): Promise<{ out: RawOut | null; declined: boolean; error: string }> {
-  // --max-turns 3, not 1: structured output is returned through a tool round
-  // trip, and with 1 the CLI ends in error_max_turns before the JSON arrives.
   const args = [
     "-p", "--model", model, "--max-turns", "3", "--tools", "", "--strict-mcp-config", "--no-session-persistence",
     "--output-format", "json", "--json-schema", JSON.stringify(schema),
   ];
-  // Async, not spawnSync: these calls run while the other arm's agent is
-  // live, and a blocked event loop would defer its timers (the contamination
-  // kill, the no-research deadline, the per-arm timeout) by minutes.
   return new Promise(resolve => {
     const chunks: Buffer[] = [], errs: Buffer[] = [];
     let status: number | null = null;
@@ -103,10 +75,6 @@ function callOnce(prompt: string, model: string, schema: object, timeoutMs: numb
   });
 }
 
-// Runs the prompt and returns the schema-shaped result, or null after logging
-// why. Cost includes declined attempts, which still bill. `redactInput` strips
-// strings that have tripped input safeguards; leave it off when the caller
-// needs them intact (the quality judge reads image digests and env names).
 export async function runStructured<T>(what: string, prompt: string, model: string, schema: object, timeoutMs = 15 * 60 * 1000, redactInput = true): Promise<StructuredResult<T> | null> {
   const p = redactInput ? redact(prompt) : prompt;
   let cost = 0;

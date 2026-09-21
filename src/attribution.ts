@@ -3,12 +3,6 @@ import type { AttributedTurn, Attribution, AttributionTotals, TurnLabel } from "
 import { costAt, formatCost, formatDuration, log, priceFor } from "./util.ts";
 import { runStructured, VERIFY_CMD } from "./analyst.ts";
 
-// Per-message attribution: an analyst model labels every assistant message as
-// task work, verification, or housekeeping, so the comparison can be reported
-// with and without the tail of tidying, committing and redundant reruns that
-// both agents tend to add after the task is done. Housekeeping is model habit,
-// not something the treatment caused, and it swings small deltas.
-
 interface WalkTool { name: string; args: string; result: string }
 export interface WalkTurn {
   turn: number;
@@ -19,14 +13,13 @@ export interface WalkTurn {
   durationMs: number;
   modelMs: number;
   toolMs: number;
-  stallMs: number;       // wall time excluded: machine sleep or API outage inside a model wait
+  stallMs: number;
   outputTokens: number;
   outputExact: boolean;
   cacheReadTokens: number;
   inputTokens: number;
   cacheWriteTokens: number;
 }
-
 
 const STALL_MS = 5 * 60 * 1000;
 function median(xs: number[]): number {
@@ -50,28 +43,12 @@ function argsExcerpt(name: string, input: Record<string, unknown>): string {
 }
 
 function resultExcerpt(name: string, args: string, body: string): string {
-  // Test and CI output: the verdict is at the end. Everything else: the start is enough.
   if (name === "Bash" && VERIFY_CMD.test(args)) return "…" + excerpt(body.slice(-600), 600);
   return excerpt(body, 300);
 }
 
 const tsOf = (e: { timestamp?: unknown }): number => typeof e.timestamp === "string" ? Date.parse(e.timestamp) : NaN;
 
-// One row per API message.
-//
-// Timing. Content blocks stream as they complete, so a message's first block
-// arrives after its generation; its tools run after its last block; the next
-// message's generation starts when the last tool result comes back. So each
-// message owns the window from the previous message's end to its own end:
-//   modelMs = last block − previous end     (thinking + generation)
-//   toolMs  = last tool result − last block (waiting on tools)
-// Tokens. Every block of a message carries the same usage snapshot; its cache
-// counts are exact, its output_tokens is the message-start value. When the run
-// was recorded with --include-partial-messages the stream's message_delta has
-// the exact output count (thinking included) and is used. Otherwise the run's
-// real output total is shared across messages by content size, and the row is
-// marked outputExact=false. Per-message cost is priced from those numbers and
-// scaled so the messages sum to the billed total.
 export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[] {
   const events = jsonl.split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
   interface Row extends WalkTurn { id: string; rawCost: number; chars: number; thinkingEst: number; usage: Record<string, number>; cache1h: number; model: string; lastBlockMs: number; lastResultMs: number; segmentStartMs: number; nestedOutput: number }
@@ -82,16 +59,10 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
   let streamMsgId = "";
   let totalOutput = 0;
   let totalThinking = 0;
-  // Result events within one process are cumulative (see claude.ts); keep the
-  // last one per segment and add segments up.
   let segOutput = 0, segThinking = 0;
   const flushSegment = () => { totalOutput += segOutput; totalThinking += segThinking; segOutput = 0; segThinking = 0; };
-  let pendingThinking = 0;   // thinking_tokens deltas seen since the last message started
+  let pendingThinking = 0;
   let firstTs = NaN;
-  // Segment start: the first CLI event after the harness session_start
-  // marker, not the marker itself, so process spawn and MCP connection are
-  // not charged to the first message as model time. A second marker is the
-  // resumed fix pass; the gap before it (the check) is not agent time.
   let segmentStartMs = NaN;
   let awaitingFirstEvent = false;
 
@@ -110,11 +81,9 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
       segOutput = out; segThinking = think;
       continue;
     }
-    // The CLI's running estimate of thinking tokens, emitted while a message is being generated.
     if (e.type === "system" && e.subtype === "thinking_tokens") { pendingThinking += e.estimated_tokens_delta ?? 0; continue; }
 
     if (typeof e.parent_tool_use_id === "string") {
-      // Subagent traffic: charge its usage to the main-thread message that issued the Agent call.
       if (e.type === "stream_event" && e.event?.type === "message_delta" && typeof e.event.usage?.output_tokens === "number") {
         const parent = pending.get(String(e.parent_tool_use_id))?.row;
         if (parent) parent.nestedOutput += e.event.usage.output_tokens;
@@ -125,7 +94,6 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
           const u = e.message?.usage ?? {};
           const price = priceFor(typeof e.message?.model === "string" ? e.message.model : "opus");
           const oneH = u.cache_creation?.ephemeral_1h_input_tokens ?? 0;
-          // Each nested message repeats its usage per block too; count a nested message once.
           const key = `nested:${e.message?.id ?? ""}`;
           if (!byId.has(key)) {
             byId.set(key, parent);
@@ -192,10 +160,9 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
 
   flushSegment();
 
-  // Windows: each message runs from the previous message's end to its own end.
   let prevEnd = firstTs;
   for (const r of rows) {
-    if (!Number.isNaN(r.segmentStartMs) && r.segmentStartMs > prevEnd) prevEnd = r.segmentStartMs; // gap between sessions (the review call) is not agent time
+    if (!Number.isNaN(r.segmentStartMs) && r.segmentStartMs > prevEnd) prevEnd = r.segmentStartMs;
     const end = Number.isNaN(r.lastResultMs) ? r.lastBlockMs : Math.max(r.lastBlockMs, r.lastResultMs);
     if (!Number.isNaN(prevEnd) && !Number.isNaN(end)) {
       r.startMs = prevEnd;
@@ -205,22 +172,14 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
       prevEnd = end;
     }
   }
-  // Stalls: a model wait longer than STALL_MS is not generation (the machine
-  // slept, or the API was down and the CLI backed off). The CLI's own
-  // duration_ms skips machine sleep; wall timestamps do not. Charge such a
-  // message the arm's typical model wait and move the rest to stallMs, which
-  // is excluded from every time total.
   const typical = median(rows.filter(r => r.modelMs > 0 && r.modelMs <= STALL_MS).map(r => r.modelMs));
   for (const r of rows) {
-    if (r.modelMs <= STALL_MS || typical <= 0) continue;  // no ordinary waits to compare against: leave the run unadjusted
+    if (r.modelMs <= STALL_MS || typical <= 0) continue;
     r.stallMs = r.modelMs - typical;
     r.modelMs = typical;
     r.durationMs = r.modelMs + r.toolMs;
   }
 
-  // Output tokens: exact where the stream had message_delta. Otherwise the
-  // run's thinking total is shared by each message's thinking_tokens deltas and
-  // the visible remainder by content size.
   let exactSum = 0, inexactChars = 0, inexactThinking = 0;
   for (const r of rows) {
     if (exactOutput.has(r.id)) { r.outputTokens = exactOutput.get(r.id)! + r.nestedOutput; r.outputExact = true; exactSum += r.outputTokens; }

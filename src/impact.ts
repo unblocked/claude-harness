@@ -4,27 +4,16 @@ import { formatCost, log } from "./util.ts";
 import { runStructured } from "./analyst.ts";
 import { describeEconomics } from "./economics.ts";
 
-// Context-impact assessment: un-blinded, run after the quality judge. Answers
-// what the Unblocked context actually did — which returned items the agent
-// used and for what, which facts the baseline found by other means, what the
-// research should have surfaced and didn't, what the agent had and ignored —
-// and whether the quality outcome (better, worse, similar) is attributable to
-// the context, to the agent's own behaviour, or to neither.
-
 interface ResearchCall { turn: number; tool: string; query: string; items: { title: string; chars: number; preview: string }[]; chars: number }
 
 const isResearch = (name: string, input: Record<string, unknown>) =>
   name.toLowerCase().includes("unblocked") || (name === "Bash" && /^unblocked\s+context/.test(String(input.command ?? "")));
 
-// External lookups the baseline can make without the research tool: the
-// enterprise GitHub API, curl, web fetch, database probes.
 const isExternal = (name: string, input: Record<string, unknown>) =>
   /^(WebFetch|WebSearch)$/.test(name) || (name === "Bash" && /\b(gh (api|search|pr|repo)|curl |wget |rails runner|psql |mysql )/.test(String(input.command ?? "")));
 
 function excerpt(s: string, n: number): string { s = s.replace(/\s+/g, " ").trim(); return s.length > n ? s.slice(0, n) + "…" : s; }
 
-// Compact walk: one line per tool call, args only. Research calls carry their
-// returned items (title, size, short preview); external lookups are marked.
 function walkAndResearch(arm: ArmResult): { walk: string; research: ResearchCall[] } {
   let jsonl = "";
   try { jsonl = fs.readFileSync(arm.run.jsonlPath, "utf8"); } catch { return { walk: "(transcript unavailable)", research: [] }; }

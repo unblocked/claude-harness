@@ -57,7 +57,6 @@ export function parseStreamJson(jsonl: string): ParsedStream {
 
   const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
   const toolCalls: ToolCall[] = [];
-  // tool_use id -> the ToolCall awaiting its tool_result, so we can attribute wall time.
   const pending = new Map<string, ToolCall>();
   const messageIds = new Set<string>();
   let finalResponse = "";
@@ -65,21 +64,15 @@ export function parseStreamJson(jsonl: string): ParsedStream {
   let totalCostUsd: number | null = null;
   let cliDurationMs: number | null = null;
 
-  // Per-segment result state (see the result handling below).
   let segLast: Record<string, ModelUsage> | null = null;
   let segFallback: TokenUsage | null = null;
-  let segUsage: TokenUsage | null = null;   // the last result's top-level usage: this process only
+  let segUsage: TokenUsage | null = null;
   let segCost: number | null = null;
   const addFallback = (acc: TokenUsage | null, u: Record<string, number>): TokenUsage => ({
     inputTokens: (acc?.inputTokens ?? 0) + (u.input_tokens ?? 0), outputTokens: (acc?.outputTokens ?? 0) + (u.output_tokens ?? 0),
     cacheReadTokens: (acc?.cacheReadTokens ?? 0) + (u.cache_read_input_tokens ?? 0), cacheCreationTokens: (acc?.cacheCreationTokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
   });
   const flushSegment = () => {
-    // A second resume of the same session has been seen to report modelUsage
-    // and total_cost_usd that include the previous resumed process's usage,
-    // while the top-level usage stays per process. When the two disagree by
-    // more than a fifth, scale the per-model figures and the cost down to the
-    // top-level usage.
     let scale = 1;
     if (segLast && segUsage) {
       const sum = (u: TokenUsage) => u.inputTokens + u.outputTokens + u.cacheReadTokens + u.cacheCreationTokens;
@@ -115,7 +108,6 @@ export function parseStreamJson(jsonl: string): ParsedStream {
       }
       usage.byModel = byModel;
     } else if (segFallback) {
-      // Transcripts without modelUsage: main model only.
       usage.inputTokens += segFallback.inputTokens;
       usage.outputTokens += segFallback.outputTokens;
       usage.cacheReadTokens += segFallback.cacheReadTokens;
@@ -132,7 +124,6 @@ export function parseStreamJson(jsonl: string): ParsedStream {
       sessionId = e.session_id;
     }
 
-    // Tool results come back as user messages; close out the matching tool_use.
     if (e?.type === "user" && Array.isArray(e.message?.content)) {
       for (const block of e.message.content as ContentBlock[]) {
         if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") continue;
@@ -150,8 +141,6 @@ export function parseStreamJson(jsonl: string): ParsedStream {
       if (!nested) messageIds.add(String(e.message?.id ?? `evt-${messageIds.size}`));
       const content: ContentBlock[] = e.message?.content ?? [];
       for (const block of content) {
-        // The final response is the main thread's last text; a sub-agent's
-        // text must not replace it. The result event's own text wins below.
         if (!nested && block.type === "text" && typeof block.text === "string") {
           finalResponse = block.text;
         }
@@ -173,14 +162,6 @@ export function parseStreamJson(jsonl: string): ParsedStream {
       if (e.session_id) sessionId = e.session_id;
     }
 
-    // Result events. One CLI process can emit several (a resumed session
-    // first flushes pending task notifications as an empty turn, and each
-    // wake-up ends in its own result); within a process total_cost_usd and
-    // modelUsage are cumulative, duration_ms and usage are per turn. A
-    // transcript may also concatenate several processes (draft pass, fix
-    // passes), separated by harness session_start markers. So: the last
-    // result in each segment carries that segment's cost and usage; segments
-    // are summed.
     if (e?.type === "harness" && e?.subtype === "session_start") {
       flushSegment();
       continue;
@@ -221,8 +202,6 @@ export function createWorktree(repoPath: string, name: string, branch: string): 
   const wtPath = worktreePath(repoPath, name);
   fs.mkdirSync(path.dirname(wtPath), { recursive: true });
   git(repoPath, ["worktree", "add", "--detach", wtPath, branch]);
-  // `worktree add` leaves submodules empty; an agent then loses minutes to a
-  // missing schema or vendored dependency before it can even compile.
   if (fs.existsSync(path.join(wtPath, ".gitmodules"))) {
     if (tryGit(wtPath, ["submodule", "update", "--init", "--recursive"], "initialising submodules in worktree") !== null) log(`Initialised submodules in ${name}`);
   }
@@ -230,16 +209,6 @@ export function createWorktree(repoPath: string, name: string, branch: string): 
   return { path: wtPath, baseSha };
 }
 
-// Removes the worktree and undoes what the agent did to the repo's refs, using
-// the set of commits the agent made (see runner.ts agentCommits):
-//   - a branch that did not exist at run start and whose tip is an agent commit
-//     is deleted: the agent created it and it holds only the agent's work;
-//   - a branch that did exist and now points at an agent commit was moved by
-//     the agent (it checked it out and committed): it is reset to its pre-run
-//     sha, and the agent's tip is logged so it can be recovered;
-//   - anything else is left alone, including a branch the user created mid-run
-//     that the agent merely checked out.
-// Runs after the diff is captured. Not called under --keep-worktrees.
 export function removeWorktree(repoPath: string, name: string, refsBefore: Map<string, string> | null, agentCommits: Set<string>): void {
   const wtPath = worktreePath(repoPath, name);
   if (tryGit(repoPath, ["worktree", "remove", "--force", wtPath], `removing worktree ${name}`) === null) {
@@ -248,8 +217,6 @@ export function removeWorktree(repoPath: string, name: string, refsBefore: Map<s
   if (!refsBefore) { log(`Skipping branch cleanup for ${name}: no ref snapshot from run start`); return; }
   if (agentCommits.size === 0) return;
 
-  // Branches checked out in some other worktree are never moved: resetting
-  // one under a live checkout leaves that worktree's index inconsistent.
   const checkedOut = new Set((tryGit(repoPath, ["worktree", "list", "--porcelain"], "listing worktrees") ?? "").split("\n").filter(l => l.startsWith("branch ")).map(l => l.slice(7).trim()));
   const now = tryGit(repoPath, ["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads"], "listing branches after run") ?? "";
   for (const line of now.split("\n")) {
@@ -284,23 +251,16 @@ export async function runClaude(opts: {
   timeoutMs: number;
   outDir: string;
   blockUnblocked: boolean;
-  // Continue an earlier session in the same worktree (the review fix pass).
   resumeSessionId?: string;
-  // Transcript file name; defaults to <condition>.jsonl.
   jsonlName?: string;
 }): Promise<RunResult> {
   const jsonlPath = path.join(opts.outDir, opts.jsonlName ?? `${opts.condition}.jsonl`);
 
-  // The prompt goes in argv, not stdin: the CLI gives up on stdin after 3s,
-  // and a synchronous step elsewhere in the harness (the other arm's worktree
-  // setup) can hold the event loop longer than that before the pipe flushes.
   const args = [
     "-p", opts.prompt,
     ...(opts.resumeSessionId ? ["--resume", opts.resumeSessionId] : []),
     "--output-format", "stream-json",
     "--verbose",
-    // message_delta events carry each API message's exact output token count
-    // (thinking included); without them per-message output is an estimate.
     "--include-partial-messages",
     "--dangerously-skip-permissions",
     "--model", opts.model,
@@ -324,8 +284,6 @@ export async function runClaude(opts: {
     p.stdin.end();
 
     const out = fs.createWriteStream(jsonlPath);
-    // Harness marker: when this session started, so a transcript assembled from
-    // a draft pass and a resumed fix pass shows where agent time resumes.
     out.write(JSON.stringify({ type: "harness", subtype: "session_start", timestamp: new Date().toISOString(), condition: opts.condition, resume: !!opts.resumeSessionId }) + "\n");
     let partial = "";
     let toolCount = 0;
@@ -343,10 +301,6 @@ export async function runClaude(opts: {
 
     let unblockedCallSeen = false;
 
-    // Deadlines count awake time only. A laptop that sleeps mid-run freezes
-    // the agent; a plain setTimeout then fires on wake and kills a run that
-    // had no chance to progress. A 5s tick measures elapsed time and treats
-    // any gap over 30s between ticks as sleep, which does not count.
     let awakeMs = 0;
     let lastTick = Date.now();
     const unblockedDeadlineMs = opts.condition === "unblocked" && !opts.resumeSessionId ? 120_000 : Infinity;
@@ -452,9 +406,6 @@ export async function runClaude(opts: {
 
     p.on("close", (code) => {
       clearInterval(ticker);
-      // Resolve only once the transcript is fully on disk: the last chunk is
-      // the result event with the cost and usage, and reading before the
-      // stream has flushed loses it.
       out.end(() => resolve({ exitCode: code, timedOut, killedReason }));
     });
 
