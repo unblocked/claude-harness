@@ -2,6 +2,7 @@ import fs from "node:fs";
 import type { AttributedTurn, Attribution, AttributionTotals, TurnLabel } from "./types.ts";
 import { costAt, formatCost, formatDuration, log, priceFor } from "./util.ts";
 import { runStructured, VERIFY_CMD } from "./analyst.ts";
+import { parseStreamJson } from "./claude.ts";
 
 interface WalkTool { name: string; args: string; result: string }
 export interface WalkTurn {
@@ -51,34 +52,36 @@ const tsOf = (e: { timestamp?: unknown }): number => typeof e.timestamp === "str
 
 export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[] {
   const events = jsonl.split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-  interface Row extends WalkTurn { id: string; rawCost: number; chars: number; thinkingEst: number; usage: Record<string, number>; cache1h: number; model: string; lastBlockMs: number; lastResultMs: number; segmentStartMs: number; nestedOutput: number }
+  interface Row extends WalkTurn { id: string; rawCost: number; chars: number; thinkingEst: number; usage: Record<string, number>; cache1h: number; model: string; lastBlockMs: number; lastResultMs: number; segmentStartMs: number; nestedOutput: number; cliTurn: number; wakes: boolean; endMs: number }
   const rows: Row[] = [];
   const byId = new Map<string, Row>();
   const pending = new Map<string, { tool: WalkTool; row: Row }>();
   const exactOutput = new Map<string, number>();
   let streamMsgId = "";
-  let totalOutput = 0;
-  let totalThinking = 0;
-  let segOutput = 0, segThinking = 0;
-  const flushSegment = () => { totalOutput += segOutput; totalThinking += segThinking; segOutput = 0; segThinking = 0; };
+  const parsed = parseStreamJson(jsonl, null, true);
+  const totalOutput = parsed.tokenUsage.outputTokens;
+  const totalThinking = Object.values(parsed.tokenUsage.byModel ?? {}).reduce((a, m) => a + (m.thinkingTokens ?? 0), 0);
   let pendingThinking = 0;
   let firstTs = NaN;
   let segmentStartMs = NaN;
   let awaitingFirstEvent = false;
+  let cliTurn = 0;
+  let afterResult = false;
+  let rowsInSegment = 0;
+  const cliTurnMs = new Map<number, number>();
 
   for (const e of events) {
     const t = tsOf(e);
-    if (e.type === "harness" && e.subtype === "session_start") { flushSegment(); awaitingFirstEvent = true; continue; }
-    if (!Number.isNaN(t) && awaitingFirstEvent) { segmentStartMs = t; awaitingFirstEvent = false; }
     if (!Number.isNaN(t) && Number.isNaN(firstTs)) firstTs = t;
+    if (e.type === "harness" && e.subtype === "session_start") {
+      cliTurn++; afterResult = false; rowsInSegment = 0;
+      if (Number.isNaN(t)) awaitingFirstEvent = true; else { segmentStartMs = t; awaitingFirstEvent = false; }
+      continue;
+    }
+    if (!Number.isNaN(t) && awaitingFirstEvent) { segmentStartMs = t; awaitingFirstEvent = false; }
     if (e.type === "result") {
-      let out = 0, think = 0;
-      for (const mu of Object.values((e.modelUsage ?? {}) as Record<string, { outputTokens?: number; thinkingTokens?: number }>)) {
-        out += mu.outputTokens ?? 0;
-        think += mu.thinkingTokens ?? 0;
-      }
-      if (!out && e.usage?.output_tokens) out = e.usage.output_tokens;
-      segOutput = out; segThinking = think;
+      if (typeof e.duration_ms === "number") cliTurnMs.set(cliTurn, e.duration_ms);
+      cliTurn++; afterResult = true;
       continue;
     }
     if (e.type === "system" && e.subtype === "thinking_tokens") { pendingThinking += e.estimated_tokens_delta ?? 0; continue; }
@@ -129,8 +132,9 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
           inputTokens: u.input_tokens ?? 0, cacheWriteTokens: u.cache_creation_input_tokens ?? 0,
           rawCost: 0, chars: 0, thinkingEst: pendingThinking, usage: u, cache1h: u.cache_creation?.ephemeral_1h_input_tokens ?? 0, nestedOutput: 0,
           model: typeof e.message?.model === "string" ? e.message.model : "opus",
-          lastBlockMs: NaN, lastResultMs: NaN, segmentStartMs,
+          lastBlockMs: NaN, lastResultMs: NaN, segmentStartMs, cliTurn, wakes: afterResult && rowsInSegment > 0, endMs: NaN,
         };
+        afterResult = false; rowsInSegment++;
         pendingThinking = 0;
         rows.push(row); byId.set(id, row);
       }
@@ -158,8 +162,6 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
     }
   }
 
-  flushSegment();
-
   let prevEnd = firstTs;
   for (const r of rows) {
     if (!Number.isNaN(r.segmentStartMs) && r.segmentStartMs > prevEnd) prevEnd = r.segmentStartMs;
@@ -169,8 +171,17 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
       r.modelMs = Math.max(0, r.lastBlockMs - prevEnd);
       r.toolMs = Math.max(0, end - r.lastBlockMs);
       r.durationMs = r.modelMs + r.toolMs;
+      r.endMs = end;
       prevEnd = end;
     }
+  }
+  for (const first of rows) {
+    const cli = cliTurnMs.get(first.cliTurn);
+    if (!first.wakes || cli === undefined || !first.startMs) continue;
+    const lastEnd = Math.max(...rows.filter(r => r.cliTurn === first.cliTurn && !Number.isNaN(r.endMs)).map(r => r.endMs));
+    const idle = Math.min(first.modelMs, Math.max(0, lastEnd - first.startMs - cli));
+    first.modelMs -= idle;
+    first.toolMs += idle;
   }
   const typical = median(rows.filter(r => r.modelMs > 0 && r.modelMs <= STALL_MS).map(r => r.modelMs));
   for (const r of rows) {
@@ -206,7 +217,7 @@ export function buildWalk(jsonl: string, totalCostUsd: number | null): WalkTurn[
   const rawSum = rows.reduce((a, r) => a + r.rawCost, 0);
   const scale = totalCostUsd && rawSum > 0 ? totalCostUsd / rawSum : 1;
   for (const r of rows) r.costUsd = r.rawCost * scale;
-  return rows.map(({ id: _id, rawCost: _rc, chars: _c, thinkingEst: _te, usage: _u, cache1h: _h, model: _m, lastBlockMs: _lb, lastResultMs: _lr, segmentStartMs: _ss, nestedOutput: _no, ...t }) => t);
+  return rows.map(({ id: _id, rawCost: _rc, chars: _c, thinkingEst: _te, usage: _u, cache1h: _h, model: _m, lastBlockMs: _lb, lastResultMs: _lr, segmentStartMs: _ss, nestedOutput: _no, cliTurn: _ct, wakes: _w, endMs: _e, ...t }) => t);
 }
 
 function renderWalk(walk: WalkTurn[]): string {

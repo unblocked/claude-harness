@@ -268,7 +268,7 @@ async function runArm(config: Config, condition: Condition, outDir: string, refs
       const fixRun = await runClaude({
         prompt: (condition === "baseline" ? BASELINE_FIX_PREAMBLE : "") + fixPrompt(round, r),
         worktreePath: wtPath, model: config.model, condition, timeoutMs: remainingMs(), outDir,
-        blockUnblocked: condition === "baseline", resumeSessionId: run.sessionId, jsonlName: `${condition}.fix${round}.jsonl`,
+        blockUnblocked: condition === "baseline", resumeSessionId: run.sessionId, priorTranscriptPath: run.jsonlPath, jsonlName: `${condition}.fix${round}.jsonl`,
       });
       spentMs += fixRun.durationMs;
       log(`[${condition}] Fix pass ${round} done: ${formatDuration(fixRun.durationMs)}, ${fixRun.assistantTurns} msgs, exit=${fixRun.exitCode}${fixRun.killedReason ? ` (killed: ${fixRun.killedReason})` : ""}`);

@@ -9,7 +9,7 @@ import { git, tryGit } from "./git.ts";
 
 const BINARY = process.env.CLAUDE_BINARY ?? "claude";
 
-interface ModelUsage {
+export interface ModelUsage {
   inputTokens?: number;
   outputTokens?: number;
   cacheReadInputTokens?: number;
@@ -35,7 +35,11 @@ interface ParsedStream {
   sessionId?: string;
   totalCostUsd: number | null;
   cliDurationMs: number | null;
+  sessionCumulative: SessionCumulative | null;
+  apiError: string | null;
 }
+
+export interface SessionCumulative { modelUsage: Record<string, ModelUsage>; costUsd: number | null }
 
 function parseToolName(name: string): { isMcp: boolean; mcpServer?: string } {
   if (name.startsWith("mcp__")) {
@@ -48,7 +52,7 @@ function parseToolName(name: string): { isMcp: boolean; mcpServer?: string } {
   return { isMcp: false };
 }
 
-export function parseStreamJson(jsonl: string): ParsedStream {
+export function parseStreamJson(jsonl: string, prior: SessionCumulative | null = null, quiet = false): ParsedStream {
   const events = jsonl
     .split("\n")
     .filter(Boolean)
@@ -66,34 +70,38 @@ export function parseStreamJson(jsonl: string): ParsedStream {
 
   let segLast: Record<string, ModelUsage> | null = null;
   let segFallback: TokenUsage | null = null;
-  let segUsage: TokenUsage | null = null;
   let segCost: number | null = null;
+  const segMessageTokens = new Map<string, number>();
+  let cumulative: SessionCumulative | null = prior;
+  let apiError: string | null = null;
+  let messagesSinceResult = false;
   const addFallback = (acc: TokenUsage | null, u: Record<string, number>): TokenUsage => ({
     inputTokens: (acc?.inputTokens ?? 0) + (u.input_tokens ?? 0), outputTokens: (acc?.outputTokens ?? 0) + (u.output_tokens ?? 0),
     cacheReadTokens: (acc?.cacheReadTokens ?? 0) + (u.cache_read_input_tokens ?? 0), cacheCreationTokens: (acc?.cacheCreationTokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
   });
+  const nonOutput = (mu: Record<string, ModelUsage>) => Object.values(mu).reduce((a, m) => a + (m.inputTokens ?? 0) + (m.cacheReadInputTokens ?? 0) + (m.cacheCreationInputTokens ?? 0), 0);
+  const USAGE_FIELDS = ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"] as const;
   const flushSegment = () => {
-    let scale = 1;
-    if (segLast && segUsage) {
-      const sum = (u: TokenUsage) => u.inputTokens + u.outputTokens + u.cacheReadTokens + u.cacheCreationTokens;
-      const modelTotal = Object.values(segLast).reduce((a, mu) => a + (mu.inputTokens ?? 0) + (mu.outputTokens ?? 0) + (mu.cacheReadInputTokens ?? 0) + (mu.cacheCreationInputTokens ?? 0), 0);
-      const top = sum(segUsage);
-      if (modelTotal > 0 && top > 0 && top / modelTotal < 0.8) {
-        scale = top / modelTotal;
-        log(`parse: modelUsage (${Math.round(modelTotal / 1000)}k tokens) exceeds this process's usage (${Math.round(top / 1000)}k); carried over from a resumed session, scaling cost and per-model tokens by ${scale.toFixed(2)}`);
-      }
-    }
     if (segLast) {
+      const before = cumulative;
+      const own = [...segMessageTokens.values()].reduce((a, n) => a + n, 0);
+      const reported = nonOutput(segLast);
+      const base = before ? nonOutput(before.modelUsage) : 0;
+      const covers = !!before && Object.entries(before.modelUsage).every(([model, pm]) => USAGE_FIELDS.every(f => (segLast![model]?.[f] ?? 0) >= (pm[f] ?? 0)));
+      const carried = !!before && base > 0 && covers && Math.abs(reported - base - own) < Math.abs(reported - own);
+      if (carried && !quiet) log(`parse: modelUsage (${Math.round(reported / 1000)}k input-side tokens) is cumulative over the resumed session; subtracting the previous process's ${Math.round(base / 1000)}k${before!.costUsd !== null ? ` and $${before!.costUsd.toFixed(2)}` : ""}`);
+      const delta = (model: string, mu: ModelUsage, f: keyof ModelUsage): number => Math.max(0, (mu[f] ?? 0) - (carried ? before!.modelUsage[model]?.[f] ?? 0 : 0));
       const byModel: Record<string, TokenUsage> = usage.byModel ?? {};
       for (const [model, mu] of Object.entries(segLast)) {
         const m: TokenUsage = {
-          inputTokens: Math.round((mu.inputTokens ?? 0) * scale),
-          outputTokens: Math.round((mu.outputTokens ?? 0) * scale),
-          cacheReadTokens: Math.round((mu.cacheReadInputTokens ?? 0) * scale),
-          cacheCreationTokens: Math.round((mu.cacheCreationInputTokens ?? 0) * scale),
-          ...(typeof mu.costUSD === "number" ? { costUsd: mu.costUSD * scale } : {}),
-          ...(typeof mu.thinkingTokens === "number" ? { thinkingTokens: Math.round(mu.thinkingTokens * scale) } : {}),
+          inputTokens: delta(model, mu, "inputTokens"),
+          outputTokens: delta(model, mu, "outputTokens"),
+          cacheReadTokens: delta(model, mu, "cacheReadInputTokens"),
+          cacheCreationTokens: delta(model, mu, "cacheCreationInputTokens"),
+          ...(typeof mu.costUSD === "number" ? { costUsd: delta(model, mu, "costUSD") } : {}),
+          ...(typeof mu.thinkingTokens === "number" ? { thinkingTokens: delta(model, mu, "thinkingTokens") } : {}),
         };
+        if (carried && !m.inputTokens && !m.outputTokens && !m.cacheReadTokens && !m.cacheCreationTokens) continue;
         const prev = byModel[model];
         byModel[model] = prev ? {
           inputTokens: prev.inputTokens + m.inputTokens, outputTokens: prev.outputTokens + m.outputTokens,
@@ -107,14 +115,18 @@ export function parseStreamJson(jsonl: string): ParsedStream {
         usage.cacheCreationTokens += m.cacheCreationTokens;
       }
       usage.byModel = byModel;
-    } else if (segFallback) {
-      usage.inputTokens += segFallback.inputTokens;
-      usage.outputTokens += segFallback.outputTokens;
-      usage.cacheReadTokens += segFallback.cacheReadTokens;
-      usage.cacheCreationTokens += segFallback.cacheCreationTokens;
+      if (segCost !== null) totalCostUsd = (totalCostUsd ?? 0) + Math.max(0, segCost - (carried ? before!.costUsd ?? 0 : 0));
+      cumulative = { modelUsage: segLast, costUsd: segCost ?? before?.costUsd ?? null };
+    } else {
+      if (segFallback) {
+        usage.inputTokens += segFallback.inputTokens;
+        usage.outputTokens += segFallback.outputTokens;
+        usage.cacheReadTokens += segFallback.cacheReadTokens;
+        usage.cacheCreationTokens += segFallback.cacheCreationTokens;
+      }
+      if (segCost !== null) totalCostUsd = (totalCostUsd ?? 0) + segCost;
     }
-    if (segCost !== null) totalCostUsd = (totalCostUsd ?? 0) + segCost * scale;
-    segLast = null; segFallback = null; segUsage = null; segCost = null;
+    segLast = null; segFallback = null; segCost = null; segMessageTokens.clear();
   };
 
   for (const e of events) {
@@ -138,10 +150,13 @@ export function parseStreamJson(jsonl: string): ParsedStream {
 
     if (e?.type === "assistant") {
       const nested = typeof e.parent_tool_use_id === "string";
-      if (!nested) messageIds.add(String(e.message?.id ?? `evt-${messageIds.size}`));
+      const synthetic = e.message?.model === "<synthetic>";
+      if (!nested) { messageIds.add(String(e.message?.id ?? `evt-${messageIds.size}`)); messagesSinceResult = true; }
+      const mu = e.message?.usage;
+      if (mu && e.message?.id) segMessageTokens.set(String(e.message.id), (mu.input_tokens ?? 0) + (mu.cache_read_input_tokens ?? 0) + (mu.cache_creation_input_tokens ?? 0));
       const content: ContentBlock[] = e.message?.content ?? [];
       for (const block of content) {
-        if (!nested && block.type === "text" && typeof block.text === "string") {
+        if (!nested && !synthetic && block.type === "text" && typeof block.text === "string") {
           finalResponse = block.text;
         }
         if (block.type === "tool_use" && block.name) {
@@ -167,18 +182,21 @@ export function parseStreamJson(jsonl: string): ParsedStream {
       continue;
     }
     if (e?.type === "result") {
-      if (typeof e.result === "string" && e.result.trim()) finalResponse = e.result;
+      const failed = e.is_error === true && typeof e.api_error_status === "number";
+      if (failed) apiError = `API error ${e.api_error_status}: ${String(e.result ?? "").slice(0, 120)}`;
+      else if (typeof e.result === "string" && e.result.trim()) finalResponse = e.result;
+      messagesSinceResult = false;
       if (e.modelUsage && typeof e.modelUsage === "object") segLast = e.modelUsage as Record<string, ModelUsage>;
       else if (e.usage) segFallback = addFallback(segFallback, e.usage);
-      if (e.usage) segUsage = addFallback(segUsage, e.usage);
       if (typeof e.total_cost_usd === "number") segCost = e.total_cost_usd;
       if (typeof e.duration_ms === "number") cliDurationMs = (cliDurationMs ?? 0) + e.duration_ms;
       if (e.session_id) sessionId = e.session_id;
     }
   }
   flushSegment();
+  if (messagesSinceResult) cliDurationMs = null;
 
-  return { tokenUsage: usage, toolCalls, assistantTurns: messageIds.size, finalResponse, sessionId, totalCostUsd, cliDurationMs };
+  return { tokenUsage: usage, toolCalls, assistantTurns: messageIds.size, finalResponse, sessionId, totalCostUsd, cliDurationMs, sessionCumulative: cumulative, apiError };
 }
 
 function isUnblockedTool(name: string): boolean {
@@ -252,6 +270,7 @@ export async function runClaude(opts: {
   outDir: string;
   blockUnblocked: boolean;
   resumeSessionId?: string;
+  priorTranscriptPath?: string;
   jsonlName?: string;
 }): Promise<RunResult> {
   const jsonlPath = path.join(opts.outDir, opts.jsonlName ?? `${opts.condition}.jsonl`);
@@ -413,7 +432,10 @@ export async function runClaude(opts: {
   });
 
   const jsonl = fs.readFileSync(jsonlPath, "utf8");
-  const parsed = parseStreamJson(jsonl);
+  const prior = opts.priorTranscriptPath ? parseStreamJson(fs.readFileSync(opts.priorTranscriptPath, "utf8"), null, true).sessionCumulative : null;
+  const parsed = parseStreamJson(jsonl, prior);
+  const killedReason = result.killedReason ?? (parsed.apiError ? `the CLI stopped on an ${parsed.apiError}` : undefined);
+  if (parsed.apiError && !result.killedReason) log(`[${opts.condition}] ⛔ ${killedReason}; the pass did not run to completion`);
 
   const wallMs = Date.now() - started;
   return {
@@ -426,7 +448,7 @@ export async function runClaude(opts: {
     sessionId: parsed.sessionId,
     exitCode: result.exitCode,
     timedOut: result.timedOut,
-    ...(result.killedReason ? { killedReason: result.killedReason } : {}),
+    ...(killedReason ? { killedReason } : {}),
     jsonlPath,
     worktreePath: opts.worktreePath,
     totalCostUsd: parsed.totalCostUsd,

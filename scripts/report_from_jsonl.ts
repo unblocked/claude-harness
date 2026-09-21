@@ -6,7 +6,7 @@
 // Repo and model fall back to the transcript's init event.
 import fs from "node:fs";
 import path from "node:path";
-import { parseStreamJson } from "../src/claude.ts";
+import { parseStreamJson, type SessionCumulative } from "../src/claude.ts";
 import { printReport, writeHtmlReport, writeJsonResult } from "../src/report.ts";
 import { estimateCost } from "../src/util.ts";
 import { attribute, buildWalk, rollup } from "../src/attribution.ts";
@@ -64,7 +64,7 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
     sessionId: parsed.sessionId,
     exitCode: orig?.run.exitCode ?? 0,
     timedOut: orig?.run.timedOut ?? false,
-    ...(orig?.run.killedReason ? { killedReason: orig.run.killedReason } : {}),
+    ...(orig?.run.killedReason ?? parsed.apiError ? { killedReason: orig?.run.killedReason ?? `the CLI stopped on an ${parsed.apiError}` } : {}),
     jsonlPath: file,
     worktreePath: orig?.run.worktreePath ?? "(from transcript)",
     totalCostUsd: parsed.totalCostUsd,
@@ -84,16 +84,19 @@ function arm(condition: Condition, file: string, model: string, orig?: ArmResult
 
 function reparseReview(review: NonNullable<ArmResult["review"]>, jsonlPath: string, model: string) {
   const dir = path.dirname(jsonlPath), stem = path.basename(jsonlPath, ".jsonl");
+  let prior: SessionCumulative | null = null;
   const price = (file: string) => {
     if (!fs.existsSync(file)) return null;
     const jsonl = fs.readFileSync(file, "utf8");
-    const p = parseStreamJson(jsonl);
+    const p = parseStreamJson(jsonl, prior, true);
+    prior = p.sessionCumulative;
     return { costUsd: p.totalCostUsd ?? estimateCost(model, p.tokenUsage), durationMs: durationMs(jsonl), messages: p.assistantTurns };
   };
   const draft = price(path.join(dir, `${stem}.draft.jsonl`));
+  if (!draft) return review;
   return {
     ...review,
-    draft: draft ? { ...review.draft, ...draft } : review.draft,
+    draft: { ...review.draft, ...draft },
     passes: review.passes.map(pass => {
       if (!pass.fix) return pass;
       const fix = price(path.join(dir, `${stem}.fix${pass.round}.jsonl`)) ?? price(path.join(dir, `${stem}.fix.jsonl`));
