@@ -9,11 +9,13 @@ import { git, tryGit } from "./git.ts";
 
 const BINARY = process.env.CLAUDE_BINARY ?? "claude";
 
-interface ModelUsage {
+export interface ModelUsage {
   inputTokens?: number;
   outputTokens?: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
+  costUSD?: number;
+  thinkingTokens?: number;
 }
 
 interface ContentBlock {
@@ -32,7 +34,12 @@ interface ParsedStream {
   finalResponse: string;
   sessionId?: string;
   totalCostUsd: number | null;
+  cliDurationMs: number | null;
+  sessionCumulative: SessionCumulative | null;
+  apiError: string | null;
 }
+
+export interface SessionCumulative { modelUsage: Record<string, ModelUsage>; costUsd: number | null }
 
 function parseToolName(name: string): { isMcp: boolean; mcpServer?: string } {
   if (name.startsWith("mcp__")) {
@@ -45,7 +52,7 @@ function parseToolName(name: string): { isMcp: boolean; mcpServer?: string } {
   return { isMcp: false };
 }
 
-export function parseStreamJson(jsonl: string): ParsedStream {
+export function parseStreamJson(jsonl: string, prior: SessionCumulative | null = null, quiet = false): ParsedStream {
   const events = jsonl
     .split("\n")
     .filter(Boolean)
@@ -54,12 +61,73 @@ export function parseStreamJson(jsonl: string): ParsedStream {
 
   const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
   const toolCalls: ToolCall[] = [];
-  // tool_use id -> the ToolCall awaiting its tool_result, so we can attribute wall time.
   const pending = new Map<string, ToolCall>();
-  let assistantTurns = 0;
+  const messageIds = new Set<string>();
   let finalResponse = "";
   let sessionId: string | undefined;
   let totalCostUsd: number | null = null;
+  let cliDurationMs: number | null = null;
+
+  let segLast: Record<string, ModelUsage> | null = null;
+  let segFallback: TokenUsage | null = null;
+  let segCost: number | null = null;
+  const segMessageTokens = new Map<string, number>();
+  let cumulative: SessionCumulative | null = prior;
+  let apiError: string | null = null;
+  let messagesSinceResult = false;
+  const addFallback = (acc: TokenUsage | null, u: Record<string, number>): TokenUsage => ({
+    inputTokens: (acc?.inputTokens ?? 0) + (u.input_tokens ?? 0), outputTokens: (acc?.outputTokens ?? 0) + (u.output_tokens ?? 0),
+    cacheReadTokens: (acc?.cacheReadTokens ?? 0) + (u.cache_read_input_tokens ?? 0), cacheCreationTokens: (acc?.cacheCreationTokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
+  });
+  const nonOutput = (mu: Record<string, ModelUsage>) => Object.values(mu).reduce((a, m) => a + (m.inputTokens ?? 0) + (m.cacheReadInputTokens ?? 0) + (m.cacheCreationInputTokens ?? 0), 0);
+  const USAGE_FIELDS = ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"] as const;
+  const flushSegment = () => {
+    if (segLast) {
+      const before = cumulative;
+      const own = [...segMessageTokens.values()].reduce((a, n) => a + n, 0);
+      const reported = nonOutput(segLast);
+      const base = before ? nonOutput(before.modelUsage) : 0;
+      const covers = !!before && Object.entries(before.modelUsage).every(([model, pm]) => USAGE_FIELDS.every(f => (segLast![model]?.[f] ?? 0) >= (pm[f] ?? 0)));
+      const carried = !!before && base > 0 && covers && Math.abs(reported - base - own) < Math.abs(reported - own);
+      if (carried && !quiet) log(`parse: modelUsage (${Math.round(reported / 1000)}k input-side tokens) is cumulative over the resumed session; subtracting the previous process's ${Math.round(base / 1000)}k${before!.costUsd !== null ? ` and $${before!.costUsd.toFixed(2)}` : ""}`);
+      const delta = (model: string, mu: ModelUsage, f: keyof ModelUsage): number => Math.max(0, (mu[f] ?? 0) - (carried ? before!.modelUsage[model]?.[f] ?? 0 : 0));
+      const byModel: Record<string, TokenUsage> = usage.byModel ?? {};
+      for (const [model, mu] of Object.entries(segLast)) {
+        const m: TokenUsage = {
+          inputTokens: delta(model, mu, "inputTokens"),
+          outputTokens: delta(model, mu, "outputTokens"),
+          cacheReadTokens: delta(model, mu, "cacheReadInputTokens"),
+          cacheCreationTokens: delta(model, mu, "cacheCreationInputTokens"),
+          ...(typeof mu.costUSD === "number" ? { costUsd: delta(model, mu, "costUSD") } : {}),
+          ...(typeof mu.thinkingTokens === "number" ? { thinkingTokens: delta(model, mu, "thinkingTokens") } : {}),
+        };
+        if (carried && !m.inputTokens && !m.outputTokens && !m.cacheReadTokens && !m.cacheCreationTokens) continue;
+        const prev = byModel[model];
+        byModel[model] = prev ? {
+          inputTokens: prev.inputTokens + m.inputTokens, outputTokens: prev.outputTokens + m.outputTokens,
+          cacheReadTokens: prev.cacheReadTokens + m.cacheReadTokens, cacheCreationTokens: prev.cacheCreationTokens + m.cacheCreationTokens,
+          ...((prev.costUsd ?? m.costUsd) !== undefined ? { costUsd: (prev.costUsd ?? 0) + (m.costUsd ?? 0) } : {}),
+          ...((prev.thinkingTokens ?? m.thinkingTokens) !== undefined ? { thinkingTokens: (prev.thinkingTokens ?? 0) + (m.thinkingTokens ?? 0) } : {}),
+        } : m;
+        usage.inputTokens += m.inputTokens;
+        usage.outputTokens += m.outputTokens;
+        usage.cacheReadTokens += m.cacheReadTokens;
+        usage.cacheCreationTokens += m.cacheCreationTokens;
+      }
+      usage.byModel = byModel;
+      if (segCost !== null) totalCostUsd = (totalCostUsd ?? 0) + Math.max(0, segCost - (carried ? before!.costUsd ?? 0 : 0));
+      cumulative = { modelUsage: segLast, costUsd: segCost ?? before?.costUsd ?? null };
+    } else {
+      if (segFallback) {
+        usage.inputTokens += segFallback.inputTokens;
+        usage.outputTokens += segFallback.outputTokens;
+        usage.cacheReadTokens += segFallback.cacheReadTokens;
+        usage.cacheCreationTokens += segFallback.cacheCreationTokens;
+      }
+      if (segCost !== null) totalCostUsd = (totalCostUsd ?? 0) + segCost;
+    }
+    segLast = null; segFallback = null; segCost = null; segMessageTokens.clear();
+  };
 
   for (const e of events) {
     const eventMs = typeof e?.timestamp === "string" ? Date.parse(e.timestamp) : NaN;
@@ -68,7 +136,6 @@ export function parseStreamJson(jsonl: string): ParsedStream {
       sessionId = e.session_id;
     }
 
-    // Tool results come back as user messages; close out the matching tool_use.
     if (e?.type === "user" && Array.isArray(e.message?.content)) {
       for (const block of e.message.content as ContentBlock[]) {
         if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") continue;
@@ -82,10 +149,14 @@ export function parseStreamJson(jsonl: string): ParsedStream {
     }
 
     if (e?.type === "assistant") {
-      assistantTurns++;
+      const nested = typeof e.parent_tool_use_id === "string";
+      const synthetic = e.message?.model === "<synthetic>";
+      if (!nested) { messageIds.add(String(e.message?.id ?? `evt-${messageIds.size}`)); messagesSinceResult = true; }
+      const mu = e.message?.usage;
+      if (mu && e.message?.id) segMessageTokens.set(String(e.message.id), (mu.input_tokens ?? 0) + (mu.cache_read_input_tokens ?? 0) + (mu.cache_creation_input_tokens ?? 0));
       const content: ContentBlock[] = e.message?.content ?? [];
       for (const block of content) {
-        if (block.type === "text" && typeof block.text === "string") {
+        if (!nested && !synthetic && block.type === "text" && typeof block.text === "string") {
           finalResponse = block.text;
         }
         if (block.type === "tool_use" && block.name) {
@@ -106,38 +177,26 @@ export function parseStreamJson(jsonl: string): ParsedStream {
       if (e.session_id) sessionId = e.session_id;
     }
 
+    if (e?.type === "harness" && e?.subtype === "session_start") {
+      flushSegment();
+      continue;
+    }
     if (e?.type === "result") {
-      if (e.modelUsage && typeof e.modelUsage === "object") {
-        const byModel: Record<string, TokenUsage> = {};
-        for (const [model, mu] of Object.entries(e.modelUsage as Record<string, ModelUsage>)) {
-          const m: TokenUsage = {
-            inputTokens: mu.inputTokens ?? 0,
-            outputTokens: mu.outputTokens ?? 0,
-            cacheReadTokens: mu.cacheReadInputTokens ?? 0,
-            cacheCreationTokens: mu.cacheCreationInputTokens ?? 0,
-          };
-          byModel[model] = m;
-          usage.inputTokens += m.inputTokens;
-          usage.outputTokens += m.outputTokens;
-          usage.cacheReadTokens += m.cacheReadTokens;
-          usage.cacheCreationTokens += m.cacheCreationTokens;
-        }
-        usage.byModel = byModel;
-      } else if (e.usage) {
-        // Fallback for transcripts without modelUsage: main model only.
-        usage.inputTokens = e.usage.input_tokens ?? 0;
-        usage.outputTokens = e.usage.output_tokens ?? 0;
-        usage.cacheReadTokens = e.usage.cache_read_input_tokens ?? 0;
-        usage.cacheCreationTokens = e.usage.cache_creation_input_tokens ?? 0;
-      }
-      if (typeof e.total_cost_usd === "number") {
-        totalCostUsd = e.total_cost_usd;
-      }
+      const failed = e.is_error === true && typeof e.api_error_status === "number";
+      if (failed) apiError = `API error ${e.api_error_status}: ${String(e.result ?? "").slice(0, 120)}`;
+      else if (typeof e.result === "string" && e.result.trim()) finalResponse = e.result;
+      messagesSinceResult = false;
+      if (e.modelUsage && typeof e.modelUsage === "object") segLast = e.modelUsage as Record<string, ModelUsage>;
+      else if (e.usage) segFallback = addFallback(segFallback, e.usage);
+      if (typeof e.total_cost_usd === "number") segCost = e.total_cost_usd;
+      if (typeof e.duration_ms === "number") cliDurationMs = (cliDurationMs ?? 0) + e.duration_ms;
       if (e.session_id) sessionId = e.session_id;
     }
   }
+  flushSegment();
+  if (messagesSinceResult) cliDurationMs = null;
 
-  return { tokenUsage: usage, toolCalls, assistantTurns, finalResponse, sessionId, totalCostUsd };
+  return { tokenUsage: usage, toolCalls, assistantTurns: messageIds.size, finalResponse, sessionId, totalCostUsd, cliDurationMs, sessionCumulative: cumulative, apiError };
 }
 
 function isUnblockedTool(name: string): boolean {
@@ -161,47 +220,36 @@ export function createWorktree(repoPath: string, name: string, branch: string): 
   const wtPath = worktreePath(repoPath, name);
   fs.mkdirSync(path.dirname(wtPath), { recursive: true });
   git(repoPath, ["worktree", "add", "--detach", wtPath, branch]);
+  if (fs.existsSync(path.join(wtPath, ".gitmodules"))) {
+    if (tryGit(wtPath, ["submodule", "update", "--init", "--recursive"], "initialising submodules in worktree") !== null) log(`Initialised submodules in ${name}`);
+  }
   const baseSha = git(wtPath, ["rev-parse", "HEAD"]).trim();
   return { path: wtPath, baseSha };
 }
 
-// Branch names the worktree's HEAD ever pointed at, from its own reflog
-// ("checkout: moving from A to B"). Read before the worktree is removed, since
-// the reflog goes with it. Only the agent could have moved this HEAD, so this
-// is the set of branches it touched — nothing the user did elsewhere is here.
-function branchesVisitedByWorktree(wtPath: string): Set<string> {
-  const visited = new Set<string>();
-  const out = tryGit(wtPath, ["reflog", "show", "--format=%gs", "HEAD"], "reading worktree reflog for cleanup");
-  for (const line of (out ?? "").split("\n")) {
-    const m = line.match(/^checkout: moving from (\S+) to (\S+)$/);
-    if (m) { visited.add(m[1]); visited.add(m[2]); }
-  }
-  return visited;
-}
-
-// Removes the worktree, then any branch the agent created in it: a branch that
-// did not exist when the run started AND that this worktree's HEAD actually
-// checked out. Both conditions are required, so a branch the user made in their
-// own checkout while the run was in progress is never touched, and neither is
-// a pre-existing branch the agent merely looked at. Runs after the diff is
-// captured. Not called under --keep-worktrees.
-export function removeWorktree(repoPath: string, name: string, refsBefore: Map<string, string> | null): void {
+export function removeWorktree(repoPath: string, name: string, refsBefore: Map<string, string> | null, agentCommits: Set<string>): void {
   const wtPath = worktreePath(repoPath, name);
-  const visited = fs.existsSync(wtPath) ? branchesVisitedByWorktree(wtPath) : new Set<string>();
-
   if (tryGit(repoPath, ["worktree", "remove", "--force", wtPath], `removing worktree ${name}`) === null) {
     tryGit(repoPath, ["worktree", "prune"], "pruning worktrees");
   }
+  if (!refsBefore) { log(`Skipping branch cleanup for ${name}: no ref snapshot from run start`); return; }
+  if (agentCommits.size === 0) return;
 
-  if (!refsBefore) {
-    log(`Skipping branch cleanup for ${name}: no ref snapshot from run start`);
-    return;
-  }
-  for (const b of visited) {
-    if (refsBefore.has(`refs/heads/${b}`)) continue; // existed before the run: not ours to delete
-    if (tryGit(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${b}`], `checking branch ${b}`) === null) continue; // not a local branch (detached sha, or already gone)
-    if (tryGit(repoPath, ["branch", "-D", b], `deleting agent-created branch ${b}`) !== null) {
-      log(`Deleted agent-created branch: ${b}`);
+  const checkedOut = new Set((tryGit(repoPath, ["worktree", "list", "--porcelain"], "listing worktrees") ?? "").split("\n").filter(l => l.startsWith("branch ")).map(l => l.slice(7).trim()));
+  const now = tryGit(repoPath, ["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads"], "listing branches after run") ?? "";
+  for (const line of now.split("\n")) {
+    const sp = line.indexOf(" ");
+    if (sp <= 0) continue;
+    const sha = line.slice(0, sp), ref = line.slice(sp + 1), short = ref.replace(/^refs\/heads\//, "");
+    if (!agentCommits.has(sha)) continue;
+    const before = refsBefore.get(ref);
+    if (before === undefined) {
+      if (tryGit(repoPath, ["branch", "-D", short], `deleting agent-created branch ${short}`) !== null) log(`Deleted agent-created branch ${short} (was ${sha.slice(0, 7)})`);
+    } else if (before !== sha) {
+      if (checkedOut.has(ref)) { log(`Agent moved pre-existing branch ${short} to ${sha.slice(0, 7)}, but it is checked out in another worktree; left as is (pre-run sha ${before.slice(0, 7)})`); continue; }
+      if (tryGit(repoPath, ["update-ref", ref, before, sha], `resetting ${short} to its pre-run sha`) !== null) {
+        log(`Agent moved pre-existing branch ${short} to ${sha.slice(0, 7)}; reset to ${before.slice(0, 7)}. The agent's commit is still reachable by sha for a while.`);
+      }
     }
   }
 }
@@ -221,13 +269,18 @@ export async function runClaude(opts: {
   timeoutMs: number;
   outDir: string;
   blockUnblocked: boolean;
+  resumeSessionId?: string;
+  priorTranscriptPath?: string;
+  jsonlName?: string;
 }): Promise<RunResult> {
-  const jsonlPath = path.join(opts.outDir, `${opts.condition}.jsonl`);
+  const jsonlPath = path.join(opts.outDir, opts.jsonlName ?? `${opts.condition}.jsonl`);
 
   const args = [
-    "-p",
+    "-p", opts.prompt,
+    ...(opts.resumeSessionId ? ["--resume", opts.resumeSessionId] : []),
     "--output-format", "stream-json",
     "--verbose",
+    "--include-partial-messages",
     "--dangerously-skip-permissions",
     "--model", opts.model,
   ];
@@ -241,34 +294,55 @@ export async function runClaude(opts: {
 
   const started = Date.now();
 
-  const result = await new Promise<{ exitCode: number | null; timedOut: boolean }>((resolve, reject) => {
+  const result = await new Promise<{ exitCode: number | null; timedOut: boolean; killedReason?: string }>((resolve, reject) => {
     const p = spawn(BINARY, args, {
       cwd: opts.worktreePath,
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    p.stdin.end(opts.prompt);
+    p.stdin.end();
 
     const out = fs.createWriteStream(jsonlPath);
+    out.write(JSON.stringify({ type: "harness", subtype: "session_start", timestamp: new Date().toISOString(), condition: opts.condition, resume: !!opts.resumeSessionId }) + "\n");
     let partial = "";
     let toolCount = 0;
     let editCount = 0;
     let turnCount = 0;
     const tag = opts.condition;
     let killed = false;
+    let killedReason: string | undefined;
+    const kill = (reason: string) => {
+      killed = true;
+      killedReason = reason;
+      p.kill("SIGTERM");
+      setTimeout(() => p.kill("SIGKILL"), 5_000);
+    };
 
     let unblockedCallSeen = false;
 
-    const unblockedDeadline = opts.condition === "unblocked"
-      ? setTimeout(() => {
-          if (!unblockedCallSeen && !killed) {
-            log(`[${tag}] ⛔ Unblocked not called within 120s — killing run`);
-            killed = true;
-            p.kill("SIGTERM");
-            setTimeout(() => p.kill("SIGKILL"), 5_000);
-          }
-        }, 120_000)
-      : null;
+    let awakeMs = 0;
+    let lastTick = Date.now();
+    const unblockedDeadlineMs = opts.condition === "unblocked" && !opts.resumeSessionId ? 120_000 : Infinity;
+    let unblockedDeadlineFired = false;
+    let timedOut = false;
+    const ticker = setInterval(() => {
+      const now = Date.now();
+      const gap = now - lastTick;
+      lastTick = now;
+      if (gap > 30_000) log(`[${tag}] machine was asleep or stalled for ${Math.round(gap / 1000)}s; not counted against deadlines`);
+      else awakeMs += gap;
+      if (!unblockedDeadlineFired && awakeMs >= unblockedDeadlineMs) {
+        unblockedDeadlineFired = true;
+        if (!unblockedCallSeen && !killed) {
+          log(`[${tag}] ⛔ Unblocked not called within 120s — killing run`);
+          kill("the Unblocked arm made no Unblocked call within 120s");
+        }
+      }
+      if (!timedOut && awakeMs >= opts.timeoutMs) {
+        timedOut = true;
+        if (!killed) kill(`timed out after ${Math.round(opts.timeoutMs / 1000)}s`);
+      }
+    }, 5_000);
 
     p.stdout.on("data", (chunk: Buffer) => {
       out.write(chunk);
@@ -326,14 +400,11 @@ export async function runClaude(opts: {
 
                 if (opts.condition === "baseline" && !killed && (isUbMcp || isUbCli)) {
                   log(`[${tag}] ⛔ CONTAMINATION: baseline called Unblocked — killing run`);
-                  killed = true;
-                  p.kill("SIGTERM");
-                  setTimeout(() => p.kill("SIGKILL"), 5_000);
+                  kill("contamination: the baseline called Unblocked");
                 }
 
                 if (opts.condition === "unblocked" && !unblockedCallSeen && (isUbMcp || isUbCli)) {
                   unblockedCallSeen = true;
-                  if (unblockedDeadline) clearTimeout(unblockedDeadline);
                   log(`[${tag}] ✅ Unblocked call detected`);
                 }
               }
@@ -350,30 +421,26 @@ export async function runClaude(opts: {
       }
     });
 
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      p.kill("SIGTERM");
-      setTimeout(() => p.kill("SIGKILL"), 5_000);
-    }, opts.timeoutMs);
-
     p.stderr.on("data", (d: Buffer) => process.stderr.write(`[claude:${opts.condition}] ${d}`));
 
     p.on("close", (code) => {
-      clearTimeout(timer);
-      if (unblockedDeadline) clearTimeout(unblockedDeadline);
-      out.end();
-      resolve({ exitCode: code, timedOut });
+      clearInterval(ticker);
+      out.end(() => resolve({ exitCode: code, timedOut, killedReason }));
     });
 
     p.on("error", reject);
   });
 
   const jsonl = fs.readFileSync(jsonlPath, "utf8");
-  const parsed = parseStreamJson(jsonl);
+  const prior = opts.priorTranscriptPath ? parseStreamJson(fs.readFileSync(opts.priorTranscriptPath, "utf8"), null, true).sessionCumulative : null;
+  const parsed = parseStreamJson(jsonl, prior);
+  const killedReason = result.killedReason ?? (parsed.apiError ? `the CLI stopped on an ${parsed.apiError}` : undefined);
+  if (parsed.apiError && !result.killedReason) log(`[${opts.condition}] ⛔ ${killedReason}; the pass did not run to completion`);
 
+  const wallMs = Date.now() - started;
   return {
-    durationMs: Date.now() - started,
+    durationMs: parsed.cliDurationMs ?? wallMs,
+    wallMs,
     tokenUsage: parsed.tokenUsage,
     toolCalls: parsed.toolCalls,
     assistantTurns: parsed.assistantTurns,
@@ -381,8 +448,10 @@ export async function runClaude(opts: {
     sessionId: parsed.sessionId,
     exitCode: result.exitCode,
     timedOut: result.timedOut,
+    ...(killedReason ? { killedReason } : {}),
     jsonlPath,
     worktreePath: opts.worktreePath,
     totalCostUsd: parsed.totalCostUsd,
+    ...(parsed.totalCostUsd === null ? { costEstimated: true } : {}),
   };
 }
